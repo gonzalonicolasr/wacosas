@@ -164,7 +164,7 @@
     no leídos, y con `openChatJid` apuntando a un chat sus mensajes entrantes no incrementan unread.
   - depends-on: 3, 5, 6
 
-- [ ] 8. Implementar el ciclo de vida del socket: guards, backoff y máquina de cierre
+- [x] 8. Implementar el ciclo de vida del socket: guards, backoff y máquina de cierre
   - covers: CA-1.2, CA-1.3, CA-1.4, CA-1.8, CA-3.1, CA-3.2, CA-3.3, CA-3.4, CA-15.2, CA-15.3,
     CA-15.4, CA-15.5, CA-15.6, CA-15.7, CA-15.8, RNF-10, RNF-11 (un socket)
   - files: `src/wa/socket.ts`, `src/wa/auth.ts`, `test/socket.test.ts`
@@ -182,6 +182,21 @@
     Además, smoke sin teléfono: `bun run src/index.tsx --no-splash` con `creds/` vacío deja en el log
     `wa.version.ok` y al menos un `wa.qr` y el backoff en 0.
   - depends-on: 2, 3, 7
+
+- [x] 8b. Cerrar tres riesgos del socket que levantó la revisión de la 8
+  - *(tarea insertada por el orquestador — no venía en el plan original)*
+  - files: `src/wa/socket.ts`, `test/socket.test.ts`
+  - detalle: (1) la **rotación del QR le borraba de pantalla el código de emparejamiento** a los ~20 s
+    — baileys sigue rotando el QR aunque hayas pedido pairing code, y en una pane de 24×80 el QR no
+    entra, así que se le borraba al usuario su único camino de vinculación; (2) un **`wipeCreds`
+    fallido** dejaba un loop de reconexión **cada 1,5 s sin backoff** (7 sockets en 6 ciclos,
+    reproducido con `chmod 0500`) — martillar WhatsApp así es el riesgo R2 de ban; ahora frena en
+    `failed` diciendo qué directorio revisar; (3) cuarta acción **`halt`** en `decideOnClose` para
+    **440 `connectionReplaced`** y **403 `forbidden`**: sin reintento, creds intactas, salida por
+    `Ctrl-R`. El 440 es desalojo, no corte: reconectar es ping-pong con el otro cliente y, como cada
+    reconexión exitosa resetea `attempt`, el loop nunca escalaba a 60 s.
+  - done when: los tres con test, cada uno demostrado en rojo antes del fix. ✅ 220 tests, typecheck 0.
+  - depends-on: 8
 
 - [ ] 9. Montar el esqueleto de la TUI y el cableado del entry
   - covers: CA-13.1, CA-13.2, CA-13.3, CA-13.6, CA-13.7, CA-15.1, CA-16.2, CA-16.3, CA-19.1,
@@ -201,6 +216,14 @@
     Al medir el arranque, medilo con una base **poblada**, no vacía, o el número miente. Si no entra,
     la salida es correr el `quick_check` en background después del primer frame en vez de bloquear
     el arranque — pero eso cambia §4.2 y hay que actualizar el diseño, no improvisarlo.
+  - ⚠️ **abierto por la tarea 8b — el motivo de la desconexión no llega a la pantalla**: cuando el
+    socket entra en `halt` (440 = te desalojó otra sesión de WhatsApp Web, 403 = cuenta rechazada) o
+    en `failed`, el texto explicativo viaja en **`link.reason`** con `link.phase` intacto en
+    `"linked"`. Con la bandeja abierta la UI probablemente mire `ui.connBanner`, que **existe en el
+    store (`setBanner`) pero hoy no lo usa nadie** y el diseño no define su semántica ni quién lo
+    limpia. Definila acá: mostrá `link.reason` (o espejalo en el banner) cuando `conn.state ===
+    "offline"`. Si no, el usuario ve "offline" sin enterarse de que lo desalojó otra sesión — y la
+    salida (`Ctrl-R`) no es adivinable.
   - done when: en una pane de 80×24, `bun run src/index.tsx --no-splash` pinta header + dos paneles +
     footer sin layout roto (`tmux capture-pane -p` como evidencia) y la bandeja aparece en **≤ 1 s**
     (medido con `time` hasta el primer frame); achicar a 50 columnas muestra `<TooSmall/>` con el
@@ -234,6 +257,13 @@
     `Tab` código → QR sobre el **mismo socket** y confirmar en el log que sigue llegando un `wa.qr`
     nuevo dentro de los 10 s. **Plan B si no llega:** reciclar el socket al volver a QR
     (`end()` + `connect()`, el mismo camino ya probado del backoff) y dejarlo anotado en el diseño.
+  - ✅ **R2 ya está casi contestado por la revisión de la tarea 8, sin gastar el teléfono**: baileys
+    **sigue rotando el QR aunque hayas pedido pairing code** (`Socket/socket.js:711-723`, `genPairQR`
+    se re-arma cada 20-60 s). O sea que el mismo socket **sí** sigue emitiendo `qr` y el plan B
+    (reciclar) probablemente no haga falta. Lo que queda por confirmar con el teléfono es sólo el
+    end-to-end: que alternar `Tab` código→QR muestre el QR nuevo **en pantalla** dentro de los 10 s.
+    Ojo que el efecto secundario de esa rotación era un bug (el QR le borraba el código al usuario a
+    los ~20 s) y se arregló en la tarea 8b — verificá que el arreglo no haya roto el camino inverso.
   - done when: los dos métodos terminan en la bandeja **sin reiniciar el proceso**, las creds quedan
     en `~/.local/share/wacosas/creds/` con `0600`, el cierre 515 posterior al escaneo reconecta solo
     (log `wa.restart_required` seguido de `wa.open`, sin pedir QR de nuevo), y el resultado de R2
@@ -411,7 +441,27 @@
     CA-9.4, CA-9.5, CA-11.2, CA-11.6, CA-14.3, CA-14.4, CA-15.1, CA-15.3, CA-15.4, CA-15.5,
     CA-19.6, RNF-12 (aviso), R7 (LID)
   - files: `README.md` (versión final), `.sdd/wa-tui/design.md` (§12: corregir la trazabilidad de
-    CA-12.1 y CA-6.8 a lo recortado)
+    CA-12.1 y CA-6.8 a lo recortado), `.sdd/wa-tui/requirements.md` (enmienda de CA-15.2)
+  - ⚠️ **deuda de documentación acumulada — sincronizar los artefactos con lo que realmente se
+    construyó** (cada punto salió de una revisión y está justificado en el código):
+    · **§5.4 y §8.4 del diseño siguen equivocadas en el revoke**: dicen que `mapMessage` devuelve
+      fila, y en realidad devuelve `null` para todo `protocolMessage` porque un revoke *actualiza*,
+      no inserta (si insertara, el `ON CONFLICT DO NOTHING` se comería el borrado). `isRevoke()` va
+      aparte y se llama en **las dos** ramas.
+    · **§5.5 nunca definió `SearchSnapshot`** aunque §6.4 ya hacía `markDirty("search")`. Se definió
+      en la tarea 6 como `{query, hits, chats}`.
+    · **§5.7/D4 dicen sólo "400 filas" por tick**: falta `MAX_MS_PER_TICK`. El corte por tiempo es
+      obligatorio, no una optimización — 400 filas solas se van a 34,7 ms sobre base poblada porque
+      el commit dispara un merge del índice FTS.
+    · **CA-15.2 hay que enmendarla**: hoy dice textual que todo código distinto de `loggedOut`,
+      `badSession` y `restartRequired` va a backoff. Se agregaron dos excepciones con acción `halt`
+      (tarea 8b): **440 `connectionReplaced`** (otra sesión de WhatsApp Web tomó el slot; reconectar
+      es ping-pong con el otro cliente, y como cada reconexión exitosa resetea `attempt`, el loop
+      queda pegado en 2 s para siempre sin escalar nunca) y **403 `forbidden`**. Sumar el CA nuevo
+      del mensaje en pantalla, en la historia 16.
+    · **El prior art de `wa-worker` está mal y conviene dejarlo escrito**: `fetchLatestBaileysVersion`
+      **nunca rechaza** — atrapa todo y devuelve la versión bundleada con un `error` adentro, y
+      descarta el `signal`. Un `try/catch` alrededor es código muerto. Hay que mirar `r.error`.
   - detalle: **segunda y última vez que se le pide el teléfono al usuario.** Guion, corriendo desde
     `~/.local/bin/wacosas` (no desde el repo, así se valida CA-19.6): enviar a un chat 1:1 y a un
     grupo, con y sin salto de línea; mandarse uno desde el teléfono y ver que entra como propio;

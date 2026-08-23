@@ -69,7 +69,34 @@ pero cualquiera que entre con tu usuario puede leer el historial.`);
 // CA-13.7 — lo va a consumir <Splash/> cuando la TUI se monte (tarea 9).
 const noSplash = argv.includes("--no-splash");
 
+// ── cableado PROVISORIO de la tarea 8 ───────────────────────────────────────
+// El orden definitivo (lock → db → store.bootstrap → renderer → render →
+// wa.start()) lo arman las tareas 9 y 17. Esto es el mínimo para que el socket
+// exista y corra de verdad: base + cola de ingest + controlador. Sin TUI todavía
+// —lo único que se ve es el log—, pero ya vincula, sincroniza y reconecta.
+const { openDb } = await import("./db/open");
+const { createRepo } = await import("./db/repo");
+const { store } = await import("./state/store");
+const { createIngest } = await import("./wa/ingest");
+const { createWaController } = await import("./wa/socket");
+
+const repo = createRepo(openDb(paths.dbPath));
+store.bootstrap(repo);
+
+let wa: import("./wa/socket").WaController;
+const ingest = createIngest({
+  repo,
+  store,
+  log,
+  selfJid: () => wa?.selfJid() ?? "",
+  openChatJid: () => store.openChatJid(),
+});
+wa = createWaController({ ingest, store, log, credsDir: paths.credsDir });
+wa.start();
+
+log.info("boot.listo", { version, splash: !noSplash, db: paths.dbPath });
 console.log(
-  `wacosas ${version} — andamio listo (splash: ${noSplash ? "salteado" : "activado"}).\n` +
-    `La interfaz se monta en la tarea 9 del plan SDD. Mientras tanto: wacosas --help`,
+  `wacosas ${version} — conectando a WhatsApp (splash: ${noSplash ? "salteado" : "activado"}).\n` +
+    `La interfaz se monta en la tarea 9 del plan SDD; por ahora el estado se sigue por el log:\n` +
+    `  tail -f ${paths.logPath}`,
 );
