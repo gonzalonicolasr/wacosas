@@ -97,7 +97,7 @@
     `reconnectDelayMs` da 2/4/8/16/32/60/60 s; el limitador respeta 1 s de gap y corta a 20 en 60 s.
   - depends-on: 1
 
-- [ ] 5. Implementar `wa/map.ts` (mapeo puro de mensajes) con fixtures de cada tipo
+- [x] 5. Implementar `wa/map.ts` (mapeo puro de mensajes) con fixtures de cada tipo
   - covers: CA-14.1, CA-7.1, CA-7.2, CA-7.5, CA-6.9 (detección de revoke), CA-4.5, CA-9.5, CA-4.8
   - files: `src/wa/map.ts`, `test/map.test.ts`, `test/fixtures/messages.ts`
   - detalle: `mapMessage` devuelve `null` (descarta sin persistir) para `status@broadcast`,
@@ -117,7 +117,7 @@
     mensaje propio del eco (`fromMe`), timestamp ausente ⇒ `now`.
   - depends-on: 3, 4
 
-- [ ] 6. Implementar el store externo con notificación coalescida
+- [x] 6. Implementar el store externo con notificación coalescida
   - covers: RNF-5, CA-4.3 (mecanismo), CA-13.1 (bootstrap sincrónico), CA-19.5 (toast)
   - files: `src/state/store.ts`, `src/state/hooks.ts`, `test/store.test.ts`
   - detalle: slices `link|conn|inbox|convo|search|ui`; `getSnapshot` **cacheado** (misma identidad
@@ -137,6 +137,27 @@
     (se descartan los `history` más viejos, nunca los `notify`); orden del §6.2: `upsertChat` →
     `insertMessage` → `if (!inserted) continue` → `touchChatActivity` → unread; `drainNow()` para el
     cierre.
+  - ⚠️ **abierto por la tarea 5 — el diseño está MAL acá, no lo sigas al pie de la letra**:
+    (a) **§5.4 se contradice con §8.4 en el revoke.** Un revoke NO inserta, *actualiza*
+    (`repo.revokeMessage`). Si `mapMessage` devolviera fila, el `ON CONFLICT DO NOTHING` se la comería
+    y el borrado nunca se aplicaría. Por eso `mapMessage` devuelve `null` para **todo**
+    `protocolMessage`, y el ingest tiene que llamar **`isRevoke()`** por separado.
+    (b) **El revoke real no tiene la forma de §5.4.** Verificado en el fuente de baileys
+    (`lib/Utils/process-message.js:298`): se reemite como **`messages.update`** con `message: null`,
+    `messageStubType: REVOKE` y el id de la víctima **ya en `key.id`**. En la rama `msg-updates` hay
+    que invocarlo como `isRevoke({ ...u.update, key: u.key })` — **ese orden y no el inverso**: al
+    revés, `u.update.key` pisa con el id del *protocolMessage* en vez del de la víctima.
+    (b2) **`isRevoke` va en LAS DOS ramas, no sólo en `messages.update`** (lo levantó la revisión de
+    la tarea 5). La forma cruda también llega por `messages.upsert` (`Socket/chats.js:918` emite el
+    sobre entero, `protocolMessage` incluido) y un revoke del history sync entra como stub por ahí.
+    En esa rama `mapMessage` devuelve `null`, así que **si nadie llama `isRevoke` el borrado se
+    pierde para siempre** — nadie más produce `kind:'revoked'`.
+    (c) **Decidir qué hacer con los sobres sin contenido renderizable** (`messageStubType` de "se unió
+    al grupo", `CIPHERTEXT`, `senderKeyDistributionMessage` solo): hoy caen en `unsupported` y **se
+    persisten**, así que se quedan con el preview de la bandeja y suman no leídos con un "❔ mensaje
+    no soportado". O los filtra el ingest, o `map` pasa a emitir `system`. Hoy `system` no tiene
+    productor. (d) Candidato a sumar al descarte: `encReactionMessage`, misma familia que
+    `reactionMessage` pero hoy persiste como `unsupported`.
   - done when: `bun test test/ingest.test.ts` verde: 5.000 mensajes sintéticos quedan persistidos una
     sola vez, ningún tick del drenador bloquea más de **20 ms** (medido con `performance.now()`
     alrededor de cada vuelta), re-empujar los mismos 5.000 no inserta nada ni mueve los contadores de
@@ -260,6 +281,15 @@
     posición y aparece el badge; un mensaje `revoked` se ve `🚫 mensaje eliminado`; los adjuntos se
     ven con su placeholder + caption debajo; `grep -rn "downloadMediaMessage\|writeFile" src/` no
     devuelve nada en el camino de mensajes (CA-7.4).
+  - ⚠️ **abierto por la revisión de la tarea 6 — el ancla es pegajosa y te congela la conversación**:
+    `store.ts:337` guarda `ancla` y `construirConvo` la usa en **todos** los flush siguientes, no sólo
+    en el salto. Reproducido: chat de 900 mensajes, abrís desde un resultado de búsqueda con
+    `anchorId` viejo, llega un mensaje nuevo ⇒ la bandeja se actualiza pero **el mensaje nuevo nunca
+    entra en la ventana**. Acá hay que **soltar el ancla** (`setOpenChat(jid)` sin ancla) al volver al
+    final o al primer mensaje entrante. El diseño no dice cuándo se suelta — decidilo y anotalo.
+    Además: por el camino anclado, `hasMoreAbove` miente (`messagesAround` devolvió 252 filas ⇒
+    `false` aunque había ~650 mensajes arriba), así que **no te apoyes en ese flag** para el
+    indicador "hay más arriba".
   - depends-on: 12
 
 - [ ] 14. Implementar el composer y la cola de envío con rate limit y reintentos
@@ -279,6 +309,8 @@
     `{ok:false}` sin insertar nada. Y a ojo: `Ctrl-E` enfoca el campo, `⏎` con texto envía y limpia,
     `⏎` con espacios no hace nada, `Alt-⏎` mete un salto de línea, `Esc` vuelve a la bandeja con el
     borrador intacto y volver al chat lo restaura.
+  - ⚠️ **abierto por la revisión de la tarea 6**: `UiSnapshot` **no tiene campo de borradores** y el
+    diseño tampoco los define. Agregalo acá, en el slice `ui`, que es donde el done-when los pide.
   - depends-on: 13
 
 - [ ] 15. Implementar marcar como leído, recibos de lectura y contadores
@@ -333,6 +365,10 @@
     código 0 y el prompt queda usable **sin `reset`** (cursor visible, sin mouse tracking, fuera de
     la pantalla alternativa); `kill -TERM` hace lo mismo; matar la primera con `-9` y arrancar de
     nuevo funciona; después de salir, `creds/` y el `.sqlite` siguen ahí.
+  - ⚠️ **abierto por la revisión de la tarea 6 — orden del apagado**: después de `store.stop()`, un
+    `markDirty` **vuelve a armar un timer** (medido: 1 timer, 1 notify). Así que `store.stop()` va
+    **al final**, después de parar el drenador de ingest y el worker de envío; al revés te queda un
+    timer de 33 ms en vuelo que impide que el proceso muera.
   - depends-on: 9, 14
 
 - [ ] 18. **[PRUEBA MANUAL — cuenta real de WhatsApp]** Recorrido end-to-end y documentación final

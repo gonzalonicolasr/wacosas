@@ -27,10 +27,14 @@ const NO_SOPORTADO = "❔ mensaje no soportado";
  * capa de datos.
  *
  * `text` va vacío porque un mensaje de texto no tiene placeholder: se muestra el
- * cuerpo. Los tipos que no están en la tabla caen en `NO_SOPORTADO`.
+ * cuerpo. `system` va vacío por lo mismo: un aviso de WhatsApp ("cambió el
+ * código de seguridad") ES su texto, y sin esta clave caía en `NO_SOPORTADO` y
+ * se leía "❔ mensaje no soportado" en vez del aviso. Los tipos que no están en
+ * la tabla caen en `NO_SOPORTADO`.
  */
 const ETIQUETAS: Record<string, string> = {
   text: "",
+  system: "",
   image: "📷 imagen",
   video: "🎬 video",
   audio: "🎤 audio",

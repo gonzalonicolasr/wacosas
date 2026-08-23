@@ -1,0 +1,381 @@
+// Store externo: el límite entre el dominio "máquina" (Baileys + SQLite) y el
+// dominio "ojo" (React + OpenTUI). Es el corazón de D1, D2 y D3 del diseño.
+//
+// Las tres reglas que lo definen:
+//
+//  1. NO hay una segunda copia de los datos (D2). Los slices `inbox`, `convo` y
+//     `search` son PROYECCIONES: cuando el ingest escribe, marca sucio el slice y
+//     en el flush se vuelve a consultar la base. Así nunca puede pasar que la
+//     base diga A y la pantalla diga B (CA-14.3).
+//  2. La notificación es COALESCIDA (D3): el primer `markDirty` agenda el flush
+//     con `max(0, 33 - (ahora - últimoFlush))` y los que vienen después sólo
+//     suman slices. Una ráfaga de 500 mensajes del sync inicial se convierte en
+//     UN render, no en 500 (RNF-5, CA-4.3).
+//  3. `getSnapshot` está CACHEADO: devuelve exactamente el mismo objeto hasta el
+//     próximo flush que toque ese slice. No es cosmético: si le devolviera un
+//     objeto nuevo en cada llamada, `useSyncExternalStore` entraría en loop
+//     infinito de renders ("getSnapshot should be cached").
+//
+// El reloj y el agendado se INYECTAN (mismo criterio que `lib/ratelimit.ts`, que
+// recibe el `now`): así el test mide la tasa de notify de diez segundos de
+// tráfico en microsegundos, sin esperar diez segundos de verdad.
+import { VENTANA_DEFAULT, type Counts, type Repo } from "../db/repo";
+import type { ChatRow, MessageRow, SearchHit } from "../db/types";
+import { buildFtsQuery } from "../lib/fts";
+
+/** Techo de renders: como mucho uno cada 33 ms ≈ 30 fps (D3). */
+export const FRAME_MS = 33;
+/** Vida de un aviso efímero. CA-19.5 pide ≤ 3 s; el diseño fijó 2,6 s. */
+export const TOAST_MS = 2_600;
+/** Tope de resultados de la búsqueda global (design §6.4). */
+export const LIMITE_HITS = 200;
+/** Tope de chats que la búsqueda global muestra arriba de los mensajes (§6.4). */
+export const LIMITE_CHATS_HIT = 20;
+
+// ── snapshots (design §5.5) ─────────────────────────────────────────────────
+
+export type ConnSnapshot = {
+  state: "offline" | "connecting" | "open" | "reconnecting" | "unlinked";
+  attempt: number;
+  nextAttemptAt: number | null;
+  lastCode: number | null;
+  selfPhone: string | null;
+};
+
+export type LinkPhase =
+  | "checking"
+  | "need-link"
+  | "qr-waiting"
+  | "qr-shown"
+  | "pairing-phone"
+  | "pairing-requesting"
+  | "pairing-shown"
+  | "restarting"
+  | "linked"
+  | "failed";
+
+export type LinkSnapshot = {
+  phase: LinkPhase;
+  method: "qr" | "code";
+  /** `true` cuando el usuario eligió el método con `Tab`: deja de recalcularse solo (CA-2.6). */
+  methodForced: boolean;
+  qr: string | null;
+  pairingCode: string | null;
+  pairingRequestedAt: number | null;
+  /** Texto para la pantalla: por qué se pide vincular, por qué falló (CA-1.4/3.1/2.4). */
+  reason: string | null;
+};
+
+export type InboxSnapshot = { chats: ChatRow[]; counts: Counts };
+
+export type ConvoSnapshot = {
+  jid: string | null;
+  messages: MessageRow[];
+  hasMoreAbove: boolean;
+  anchorId: number | null;
+};
+
+/**
+ * Búsqueda global (Ctrl-G). `query` es el texto crudo del usuario; los mensajes
+ * salen por FTS5 y los chats por `fold`+`includes` (R1: no existe `chats_fts`).
+ */
+export type SearchSnapshot = { query: string; hits: SearchHit[]; chats: ChatRow[] };
+
+export type UiSnapshot = { toast: { text: string; at: number } | null; connBanner: string | null };
+
+/** El mapa slice → snapshot. De acá salen `Slice` y `SnapshotOf`. */
+export type Snapshots = {
+  link: LinkSnapshot;
+  conn: ConnSnapshot;
+  inbox: InboxSnapshot;
+  convo: ConvoSnapshot;
+  search: SearchSnapshot;
+  ui: UiSnapshot;
+};
+
+export type Slice = keyof Snapshots;
+export type SnapshotOf<S extends Slice> = Snapshots[S];
+
+export const SLICES: Slice[] = ["link", "conn", "inbox", "convo", "search", "ui"];
+
+// ── inyección de tiempo ─────────────────────────────────────────────────────
+
+/** Lo que devuelve `schedule`: cancela el timer que acaba de agendar. */
+export type Cancelar = () => void;
+
+export type StoreOpts = {
+  /** Reloj en ms. Default `Date.now`. */
+  now?: () => number;
+  /** Agendador. Default `setTimeout`. El test le pasa uno virtual. */
+  schedule?: (fn: () => void, ms: number) => Cancelar;
+};
+
+const agendarReal = (fn: () => void, ms: number): Cancelar => {
+  const t = setTimeout(fn, ms);
+  return () => clearTimeout(t);
+};
+
+// ── contrato ────────────────────────────────────────────────────────────────
+
+export type Store = {
+  /** Suscribe al slice. Devuelve la baja. Es el `subscribe` de `useSyncExternalStore`. */
+  subscribe(slice: Slice, cb: () => void): () => void;
+  /** Snapshot vigente. MISMA identidad hasta el próximo flush de ese slice. */
+  getSnapshot<S extends Slice>(s: S): Snapshots[S];
+  /** Marca slices sucios y agenda el flush coalescido (D3). Los `null` se ignoran. */
+  markDirty(...slices: Array<Slice | null | undefined>): void;
+  /** Primer llenado, SINCRÓNICO y antes del primer frame (CA-13.1). */
+  bootstrap(repo: Repo): void;
+  /** Aviso efímero que se limpia solo (CA-19.5). */
+  toast(text: string): void;
+  setConn(patch: Partial<ConnSnapshot>): void;
+  setLink(patch: Partial<LinkSnapshot>): void;
+  setBanner(text: string | null): void;
+  /** Chat abierto: define la ventana del slice `convo` y a quién no sumarle no leídos. */
+  setOpenChat(jid: string | null, opts?: { anchorId?: number | null }): void;
+  openChatJid(): string | null;
+  /** Texto de la búsqueda global; el flush la resuelve contra la base. */
+  setSearchQuery(query: string): void;
+  /** Publica ya lo que esté sucio, sin esperar el frame (cierre ordenado y tests). */
+  flushNow(): void;
+  /** Cancela los timers pendientes. Lo llama el cierre ordenado (CA-17.*). */
+  stop(): void;
+};
+
+// ── implementación ──────────────────────────────────────────────────────────
+
+export function createStore(opts: StoreOpts = {}): Store {
+  const ahora = opts.now ?? Date.now;
+  const agendar = opts.schedule ?? agendarReal;
+
+  /** Null hasta el `bootstrap`: antes de abrir la base los slices van vacíos. */
+  let repo: Repo | null = null;
+
+  // Estado mutable del dominio máquina. NO se publica nunca tal cual: lo que se
+  // publica es la copia que arma `construir`, para que la identidad del snapshot
+  // sólo cambie en el flush.
+  const conn: ConnSnapshot = {
+    state: "offline",
+    attempt: 0,
+    nextAttemptAt: null,
+    lastCode: null,
+    selfPhone: null,
+  };
+  const link: LinkSnapshot = {
+    phase: "checking",
+    method: "qr",
+    methodForced: false,
+    qr: null,
+    pairingCode: null,
+    pairingRequestedAt: null,
+    reason: null,
+  };
+  const ui: UiSnapshot = { toast: null, connBanner: null };
+  let abierto: string | null = null;
+  let ancla: number | null = null;
+  let consulta = "";
+
+  const cache = new Map<Slice, Snapshots[Slice]>();
+  const sucios = new Set<Slice>();
+  const oyentes: Record<Slice, Set<() => void>> = {
+    link: new Set(),
+    conn: new Set(),
+    inbox: new Set(),
+    convo: new Set(),
+    search: new Set(),
+    ui: new Set(),
+  };
+
+  let cancelarFlush: Cancelar | null = null;
+  let cancelarToast: Cancelar | null = null;
+  /** `-Infinity` ⇒ el primer `markDirty` agenda el flush con 0 ms de espera. */
+  let ultimoFlush = -Infinity;
+
+  // ── proyecciones ──────────────────────────────────────────────────────────
+
+  function construirInbox(): InboxSnapshot {
+    if (!repo) return { chats: [], counts: { all: 0, unread: 0, groups: 0 } };
+    // Sin límite: `chats` es una tabla chica por naturaleza (cientos de filas) y
+    // recortarla escondería chats viejos que la bandeja tiene que poder listar.
+    return { chats: repo.listChats(), counts: repo.countsByFilter() };
+  }
+
+  function construirConvo(): ConvoSnapshot {
+    if (!repo || abierto === null) {
+      return { jid: abierto, messages: [], hasMoreAbove: false, anchorId: ancla };
+    }
+    const messages =
+      ancla === null
+        ? repo.lastMessages(abierto, VENTANA_DEFAULT)
+        : repo.messagesAround(abierto, ancla, VENTANA_DEFAULT);
+    // Con R2 (ventana fija de 500, sin carga incremental) nadie va a pedir más:
+    // es sólo el dato para avisar en pantalla que el historial sigue más arriba.
+    return {
+      jid: abierto,
+      messages,
+      hasMoreAbove: messages.length >= VENTANA_DEFAULT,
+      anchorId: ancla,
+    };
+  }
+
+  function construirSearch(): SearchSnapshot {
+    const match = repo ? buildFtsQuery(consulta) : "";
+    if (!repo || match === "") return { query: consulta, hits: [], chats: [] };
+    return {
+      query: consulta,
+      hits: repo.searchMessages(match, LIMITE_HITS),
+      chats: repo.searchChats(consulta, LIMITE_CHATS_HIT),
+    };
+  }
+
+  function construir(s: Slice): Snapshots[Slice] {
+    switch (s) {
+      case "inbox":
+        return construirInbox();
+      case "convo":
+        return construirConvo();
+      case "search":
+        return construirSearch();
+      case "conn":
+        return { ...conn };
+      case "link":
+        return { ...link };
+      case "ui":
+        return { ...ui };
+    }
+  }
+
+  // ── flush coalescido (D3) ─────────────────────────────────────────────────
+
+  function flush(): void {
+    cancelarFlush = null;
+    ultimoFlush = ahora();
+    if (sucios.size === 0) return;
+
+    const lote = [...sucios];
+    sucios.clear();
+
+    // Primero se reconstruyen TODOS los sucios y recién después se notifica: un
+    // listener que lea otro slice tiene que ver el mundo ya publicado, no medio.
+    for (const s of lote) cache.set(s, construir(s));
+    for (const s of lote) {
+      // Copia: un listener puede darse de baja adentro del propio callback.
+      for (const cb of [...oyentes[s]]) cb();
+    }
+  }
+
+  function markDirty(...slices: Array<Slice | null | undefined>): void {
+    let hay = false;
+    for (const s of slices) {
+      if (!s) continue; // el flujo §6.2 pasa `null` cuando el chat no está abierto
+      sucios.add(s);
+      hay = true;
+    }
+    if (!hay || cancelarFlush) return;
+    cancelarFlush = agendar(flush, Math.max(0, FRAME_MS - (ahora() - ultimoFlush)));
+  }
+
+  // ── API ───────────────────────────────────────────────────────────────────
+
+  return {
+    subscribe(slice, cb) {
+      oyentes[slice].add(cb);
+      return () => {
+        oyentes[slice].delete(cb);
+      };
+    },
+
+    getSnapshot<S extends Slice>(s: S): Snapshots[S] {
+      let v = cache.get(s);
+      if (v === undefined) {
+        v = construir(s);
+        cache.set(s, v);
+      }
+      return v as Snapshots[S];
+    },
+
+    markDirty,
+
+    // Sincrónico a propósito: corre antes del primer frame, así la bandeja se
+    // pinta con datos reales de entrada y no aparece vacía y después llena.
+    bootstrap(r) {
+      repo = r;
+      sucios.clear();
+      cache.clear();
+      for (const s of SLICES) cache.set(s, construir(s));
+      ultimoFlush = ahora();
+    },
+
+    toast(text) {
+      const t = { text, at: ahora() };
+      ui.toast = t;
+      markDirty("ui");
+      cancelarToast?.();
+      cancelarToast = agendar(() => {
+        cancelarToast = null;
+        if (ui.toast !== t) return; // ya lo pisó un toast más nuevo
+        ui.toast = null;
+        markDirty("ui");
+      }, TOAST_MS);
+    },
+
+    setConn(patch) {
+      Object.assign(conn, patch);
+      markDirty("conn");
+    },
+
+    setLink(patch) {
+      Object.assign(link, patch);
+      markDirty("link");
+    },
+
+    setBanner(text) {
+      ui.connBanner = text;
+      markDirty("ui");
+    },
+
+    setOpenChat(jid, o = {}) {
+      abierto = jid;
+      ancla = jid === null ? null : (o.anchorId ?? null);
+      markDirty("convo");
+    },
+
+    openChatJid() {
+      return abierto;
+    },
+
+    setSearchQuery(query) {
+      consulta = query;
+      markDirty("search");
+    },
+
+    flushNow() {
+      cancelarFlush?.();
+      cancelarFlush = null;
+      flush();
+    },
+
+    stop() {
+      cancelarFlush?.();
+      cancelarFlush = null;
+      cancelarToast?.();
+      cancelarToast = null;
+      sucios.clear();
+    },
+  };
+}
+
+/**
+ * El store del proceso. Hay uno solo (una cuenta, un socket, una base): lo usan
+ * `state/hooks.ts`, `state/commands.ts` y el ingest. Los tests se arman el suyo
+ * con `createStore()` para poder inyectarle un reloj falso.
+ */
+export const store: Store = createStore();
+
+// Las funciones sueltas de design §5.5. Son closures del `store` de arriba (no
+// usan `this`), así que desestructurarlas es seguro.
+export const subscribe = store.subscribe;
+export const getSnapshot = store.getSnapshot;
+export const markDirty = store.markDirty;
+export const bootstrap = store.bootstrap;
+export const toast = store.toast;

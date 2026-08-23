@@ -103,6 +103,9 @@ test("un mensaje de texto no tiene placeholder y un revoke tiene el suyo (CA-6.9
   expect(placeholderFor("text")).toBe("");
   expect(placeholderFor("text", { filename: "no-va.pdf" })).toBe("");
   expect(placeholderFor("revoked")).toBe("🚫 mensaje eliminado");
+  // `system` va sin placeholder, igual que `text`: un aviso de WhatsApp ES su
+  // texto y no puede mostrarse como "no soportado" (decidido en la tarea 5).
+  expect(placeholderFor("system")).toBe("");
 });
 
 test("el nombre de archivo se aplasta a una línea: la fila no puede crecer (CA-4.6)", () => {
