@@ -67,7 +67,7 @@
     que reproduce el escape del revisor y verifica que el secreto NO llega al log.
   - depends-on: 2
 
-- [ ] 3. Crear la capa de datos: esquema, apertura y repositorio
+- [x] 3. Crear la capa de datos: esquema, apertura y repositorio
   - covers: CA-13.4, CA-13.5, CA-13.6, CA-14.1, CA-14.2, CA-14.4, CA-12.6, CA-12.7, CA-4.2, CA-6.1,
     CA-10.5, CA-12.1 (mitad de mensajes), RNF-6 (índices)
   - files: `src/db/schema.ts`, `src/db/open.ts`, `src/db/repo.ts`, `src/db/types.ts`,
@@ -85,7 +85,7 @@
     `body` sí; `countsByFilter()` da los tres números; base corrupta a mano ⇒ `DbCorruptError`.
   - depends-on: 1
 
-- [ ] 4. Implementar los módulos puros de `lib/` con sus tests
+- [x] 4. Implementar los módulos puros de `lib/` con sus tests
   - covers: CA-7.1, CA-7.3, CA-12.5, CA-5.2 (fold sin acentos ni mayúsculas), CA-4.6 (clip),
     CA-15.2, RNF-8, RNF-9
   - files: `src/lib/fmt.ts`, `src/lib/fts.ts`, `src/lib/placeholder.ts`, `src/lib/backoff.ts`,
@@ -104,6 +104,13 @@
     newsletters, `protocolMessage` que no sea revoke, `reactionMessage` y mensajes sin `remoteJid`;
     tipo desconocido ⇒ `kind:"unsupported"` y **se persiste igual**. `resolveChatName` con la
     precedencia de §5.4.
+  - ⚠️ **abierto por la revisión de la tarea 4**: `ETIQUETAS` de `src/lib/placeholder.ts` **no tiene
+    la clave `system`**, que sí existe en `MessageKind` (design.md:486). Hoy `placeholderFor("system")`
+    devuelve `"❔ mensaje no soportado"`, así que un mensaje de sistema se mostraría como "no
+    soportado" en vez de su cuerpo. Decidilo acá: lo más probable es `system: ""` (mismo trato que
+    `text`, o sea que se muestre el `body`). Además, ahora que `db/types.ts` existe, evaluá angostar
+    la firma `placeholderFor(kind: string)` a `MessageKind` — era `string` sólo porque en la tarea 4
+    todavía no existía el tipo.
   - done when: `bun test test/map.test.ts` verde con un fixture por caso: texto, texto extendido,
     imagen con caption, audio con y sin `seconds`, documento con y sin `fileName`, sticker,
     ubicación, contacto, revoke, tipo inventado, mensaje de grupo (`sender_jid` = `participant`),
@@ -167,6 +174,12 @@
     renderer con `exitOnCtrlC:false` y `exitSignals:[]`; layouts `wide`/`compact`/`mini` de §7.2;
     `commands.ts` arranca con `openChat`/`closeChat`/`markRead` local/`reconnectNow`/`quit` (los de
     envío y pairing los agregan las tareas 10 y 14).
+  - ⚠️ **abierto por la revisión de la tarea 3 — afecta directo al ≤ 1 s de CA-13.1**: `PRAGMA
+    quick_check` corre en **cada** apertura (lo manda design §4.2) y escala lineal: medido en **48 ms
+    sobre 50.000 mensajes / 16 MB**, o sea ~0,5 s a 500 k mensajes, que se come medio presupuesto.
+    Al medir el arranque, medilo con una base **poblada**, no vacía, o el número miente. Si no entra,
+    la salida es correr el `quick_check` en background después del primer frame en vez de bloquear
+    el arranque — pero eso cambia §4.2 y hay que actualizar el diseño, no improvisarlo.
   - done when: en una pane de 80×24, `bun run src/index.tsx --no-splash` pinta header + dos paneles +
     footer sin layout roto (`tmux capture-pane -p` como evidencia) y la bandeja aparece en **≤ 1 s**
     (medido con `time` hasta el primer frame); achicar a 50 columnas muestra `<TooSmall/>` con el
@@ -216,6 +229,12 @@
     con `fold()` sobre nombre y número (acá vive la mitad de CA-12.1 que perdió `chats_fts`);
     `Tab` cicla `Todos`/`No leídos`/`Grupos`; doble click < 350 ms abre; rueda mueve la selección;
     estado vacío "esperando la sincronización inicial".
+  - ⚠️ **abierto por la revisión de la tarea 3 (aplica también a la 16)**: (a) sembrar 50.000 mensajes
+    con `test/fixtures/seed.ts` tarda **~3,4 s** (~3,2 s son los triggers del FTS) y el default de
+    `bun test` son **5 s por test** → los tests de volumen necesitan su **propio `timeout`**. (b)
+    `refrescarChats` en `seed.ts:101-108` hace un `UPDATE` **sin `WHERE`**: recalcula actividad y
+    preview de *todos* los chats de la base, no sólo los sembrados. Hoy no molesta porque siempre se
+    siembra sobre una base fresca; si acá sembrás encima de una base ya poblada, te va a morder.
   - done when: con la base ya poblada por la tarea 11 y **sin conexión** (modo avión), la bandeja
     lista los chats ordenados por actividad con preview, fecha relativa y badge de no leídos; escribir
     `mañana` y `manana` filtran igual; `Tab` cicla los tres filtros y el header muestra los tres
