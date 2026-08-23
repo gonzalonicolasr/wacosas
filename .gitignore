@@ -1,0 +1,14 @@
+node_modules/
+*.log
+
+# Datos locales: base SQLite + sidecars WAL, credenciales y lock.
+# Nunca se commitean (son datos personales de WhatsApp).
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+creds/
+wacosas.lock
+
+# Basura del sistema / editor
+.DS_Store
+*.swp

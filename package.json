@@ -1,0 +1,22 @@
+{
+  "name": "wacosas",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.tsx",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@opentui/core": "0.4.2",
+    "@opentui/react": "0.4.2",
+    "react": "19.2.8",
+    "baileys": "7.0.0-rc14",
+    "qrcode": "1.5.4",
+    "pino": "9.14.0"
+  },
+  "devDependencies": {
+    "@types/qrcode": "1.5.6",
+    "@types/react": "19.2.18"
+  }
+}
