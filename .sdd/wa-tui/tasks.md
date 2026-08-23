@@ -54,6 +54,19 @@
     conserva como máximo un anterior).
   - depends-on: 1
 
+- [x] 2b. Montar el typecheck y cerrar el escape del denylist del logger
+  - *(tarea insertada por el orquestador tras las revisiones de 1 y 2 — no venía en el plan original)*
+  - covers: CA-14.7 (cierre en runtime, no solo en el tipo) + infraestructura de calidad para 3-18
+  - files: `package.json`, `tsconfig.json`, `src/boot/log.ts`, `test/log.test.ts`
+  - detalle: **D12 se relee como "cero deps de runtime"** — `typescript` + tipos de Bun entran como
+    `devDependencies` y aparece el script `bun run typecheck`. `strict` NO se toca (sigue en `false`
+    por decisión del diseño). Además, el denylist de `Fields` hoy solo frena **literales**: un
+    `Record<string,string>` con `body` adentro compila y se escribe al log. Se filtra también en
+    runtime, case-insensitive, dejando marca de cuántas claves se omitieron.
+  - done when: `bun run typecheck` en **verde** (cero errores); `bun test` sigue verde; hay un test
+    que reproduce el escape del revisor y verifica que el secreto NO llega al log.
+  - depends-on: 2
+
 - [ ] 3. Crear la capa de datos: esquema, apertura y repositorio
   - covers: CA-13.4, CA-13.5, CA-13.6, CA-14.1, CA-14.2, CA-14.4, CA-12.6, CA-12.7, CA-4.2, CA-6.1,
     CA-10.5, CA-12.1 (mitad de mensajes), RNF-6 (índices)

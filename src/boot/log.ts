@@ -1,6 +1,17 @@
 // Logger de archivo: una línea por evento, con timestamp (CA-16.1), rotación a
 // los 5 MB conservando como máximo un anterior (CA-16.4) y campos acotados a
-// escalares para que sea imposible filtrar cuerpos ni credenciales (CA-14.7).
+// escalares, con una lista de nombres prohibidos que frena cuerpos y material de
+// sesión (CA-14.7).
+//
+// La protección es de DOS capas y conviene saber hasta dónde llega:
+//   1. el tipo `Fields` rechaza los nombres prohibidos y todo lo que no sea
+//      escalar → el error salta en el editor, pero SÓLO con objetos literales;
+//   2. `fmtLinea` vuelve a filtrar en runtime (case-insensitive) → tapa el
+//      agujero de pasar un `Record<string, string>` armado en otro lado, que el
+//      chequeo de tipos deja entrar sin chistar.
+// Lo que NO puede garantizar: es una lista de NOMBRES, no un detector de
+// contenido. Si alguien mete el cuerpo de un mensaje en un campo `motivo`, va a
+// parar al log. La regla sigue siendo no pasarle cuerpos al logger.
 //
 // Sin deps (D12): son treinta líneas contra un `appendFileSync`. Escribe al MISMO
 // archivo al que apunta el fd 2 redirigido por `boot/stderr.ts`, en modo append:
@@ -12,26 +23,33 @@ export type Scalar = string | number | boolean | null;
 
 /**
  * Nombres de campo prohibidos: son los que arrastrarían el cuerpo de un mensaje
- * o material de sesión al log. Van tipados como `never` para que el error salte
- * en el editor, no en una revisión (CA-14.7).
+ * o material de sesión al log (CA-14.7). Una sola lista para las dos capas —el
+ * tipo `Fields` y el filtro de `fmtLinea`— así no se desincronizan. Todo en
+ * minúscula: la comparación en runtime es case-insensitive.
  */
-type Prohibido =
-  | "body"
-  | "text"
-  | "caption"
-  | "content"
-  | "message"
-  | "msg"
-  | "payload"
-  | "creds"
-  | "credentials"
-  | "key"
-  | "keys"
-  | "secret"
-  | "token"
-  | "password"
-  | "auth"
-  | "qr";
+const PROHIBIDOS = [
+  "body",
+  "text",
+  "caption",
+  "content",
+  "message",
+  "msg",
+  "payload",
+  "creds",
+  "credentials",
+  "key",
+  "keys",
+  "secret",
+  "token",
+  "password",
+  "auth",
+  "qr",
+] as const;
+
+/** Los mismos nombres como unión, para tiparlos `never` en `Fields`. */
+type Prohibido = (typeof PROHIBIDOS)[number];
+
+const PROHIBIDOS_SET: ReadonlySet<string> = new Set(PROHIBIDOS);
 
 /**
  * Campos de una línea de log: sólo escalares (nada de objetos, así no se cuela
@@ -62,13 +80,31 @@ function fmtValor(v: Scalar): string {
   return s === "" || NECESITA_COMILLAS.test(s) ? JSON.stringify(s) : s;
 }
 
+/** Lo único que `fmtValor` sabe imprimir sin arrastrar sorpresas. */
+function esEscalar(v: unknown): v is Scalar {
+  return v === null || typeof v === "string" || typeof v === "number" || typeof v === "boolean";
+}
+
+/**
+ * Arma la línea filtrando de nuevo en runtime (CA-14.7): el denylist del tipo
+ * `Fields` sólo alcanza a los objetos literales, y un `Record<string, string>`
+ * con `body` adentro compila igual. Se descarta por nombre —sin importar
+ * mayúsculas— y cualquier valor que no sea escalar. Lo omitido deja rastro en
+ * `omitidos=N`: borrar en silencio es peor para debuggear que borrar a la vista.
+ */
 function fmtLinea(nivel: string, ev: string, f?: Fields): string {
   let linea = `[${new Date().toISOString()}] ${nivel.padEnd(5)} ${ev}`;
   if (f) {
+    let omitidos = 0;
     for (const [k, v] of Object.entries(f)) {
       if (v === undefined) continue;
-      linea += ` ${k}=${fmtValor(v as Scalar)}`;
+      if (PROHIBIDOS_SET.has(k.toLowerCase()) || !esEscalar(v)) {
+        omitidos++;
+        continue;
+      }
+      linea += ` ${k}=${fmtValor(v)}`;
     }
+    if (omitidos > 0) linea += ` omitidos=${omitidos}`;
   }
   return `${linea}\n`;
 }

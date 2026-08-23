@@ -8,6 +8,12 @@
 // evaluarían antes del `umask`, que tiene que correr primero sí o sí (CA-14.6), y
 // antes del dup2 de stderr, que va antes de tocar baileys / ws / OpenTUI (D9).
 // Sin lib de CLI args (D12): alcanza con `argv`.
+//
+// El `export {}` es puro trámite para TypeScript: sin un import/export ESTÁTICO,
+// TS no considera módulo a este archivo y los `await` de arriba de todo dan
+// TS1375. No emite nada ni cambia el orden de ejecución.
+export {};
+
 process.umask(0o077);
 
 const { resolvePaths } = await import("./boot/paths");

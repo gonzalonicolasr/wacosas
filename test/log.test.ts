@@ -68,6 +68,64 @@ test("un string largo se recorta: red de seguridad de CA-14.7", () => {
   expect(linea).toContain("…");
 });
 
+test("un campo prohibido que esquiva el tipo igual se filtra en runtime (CA-14.7)", () => {
+  const p = nuevoLog("denylist-runtime");
+  const log = createLogger(p);
+
+  // El agujero real: `Fields` sólo frena objetos LITERALES. Este `Record` compila
+  // sin chistar (probalo: `bun run typecheck` pasa) y antes escribía el secreto.
+  const r: Record<string, string> = { body: "HOLA-SECRETO" };
+  log.info("msg.in", r);
+
+  const [linea] = lineas(p);
+  expect(readFileSync(p, "utf8")).not.toContain("HOLA-SECRETO");
+  expect(linea).not.toContain("body");
+  expect(linea).toEndWith(" msg.in omitidos=1");
+});
+
+test("el denylist no distingue mayúsculas y deja pasar el resto de los campos", () => {
+  const p = nuevoLog("denylist-mayusculas");
+  const log = createLogger(p);
+
+  const r: Record<string, string> = {
+    BODY: "SECRETO-A",
+    Body: "SECRETO-B",
+    QR: "SECRETO-C",
+    Token: "SECRETO-D",
+    jid: "54911@s.whatsapp.net",
+  };
+  log.info("msg.in", r);
+
+  const contenido = readFileSync(p, "utf8");
+  for (const s of ["SECRETO-A", "SECRETO-B", "SECRETO-C", "SECRETO-D"]) {
+    expect(contenido).not.toContain(s);
+  }
+  // Lo que no está prohibido sigue saliendo, y el faltante queda a la vista.
+  expect(lineas(p)[0]).toEndWith(" msg.in jid=54911@s.whatsapp.net omitidos=4");
+});
+
+test("un valor que no es escalar tampoco se imprime (CA-14.7)", () => {
+  const p = nuevoLog("denylist-objetos");
+  const log = createLogger(p);
+
+  // `Fields` tipa los valores como escalares, pero un `Record` armado en otro
+  // lado se los saltea igual que con las claves: un array serializa su contenido.
+  const r: Record<string, unknown> = { motivo: ["HOLA-SECRETO"], code: 515 };
+  log.info("wa.close", r as Record<string, string>);
+
+  expect(readFileSync(p, "utf8")).not.toContain("HOLA-SECRETO");
+  expect(lineas(p)[0]).toEndWith(" wa.close code=515 omitidos=1");
+});
+
+test("sin campos omitidos no aparece el contador", () => {
+  const p = nuevoLog("denylist-sin-omitidos");
+  const log = createLogger(p);
+
+  log.info("wa.open", { code: 200 });
+
+  expect(lineas(p)[0]).toEndWith(" wa.open code=200");
+});
+
 test("el archivo queda 0600 aunque ya existiera en 0644 (RNF-12)", () => {
   const p = nuevoLog("permisos");
   // Lo que deja el `2>>` del wrapper con el umask de la shell del usuario.
