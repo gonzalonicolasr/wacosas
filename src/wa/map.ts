@@ -93,7 +93,17 @@ const SLACK_FUTURO_SEG = 86_400;
 function tsSeguro(crudo: WAMessage["messageTimestamp"], nowSec: number): number {
   const ahora =
     Number.isFinite(nowSec) && nowSec > 0 ? Math.floor(nowSec) : Math.floor(Date.now() / 1000);
-  const n = Number(toNumber(crudo as never));
+  // `toNumber` es el ÚNICO punto de este módulo que puede lanzar: baileys hace
+  // `t.toNumber()` sin chequear que sea función (`Utils/generics.js:72`), así que
+  // un `{ toNumber: 5 }` propagaría la excepción. Hoy no es alcanzable desde la
+  // red (protobufjs decodifica un uint64 a `number` o a `Long`, nunca a eso),
+  // pero `mapMessage` no puede lanzar NUNCA: cuelga de un handler del socket.
+  let n: number;
+  try {
+    n = Number(toNumber(crudo as never));
+  } catch {
+    return ahora;
+  }
   if (!Number.isFinite(n) || n <= 0 || n > TS_MAX_SEG) return ahora;
   const seg = Math.floor(n);
   return seg > ahora + SLACK_FUTURO_SEG ? ahora : seg;

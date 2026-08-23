@@ -239,6 +239,17 @@ test("el ts siempre es un entero positivo, aunque venga con decimales", () => {
   expect(Number.isInteger(fila.ts)).toBe(true);
 });
 
+test("un timestamp que hace lanzar a toNumber ⇒ now: mapMessage nunca lanza", () => {
+  // `toNumber` de baileys hace `t.toNumber()` sin chequear que sea función
+  // (`Utils/generics.js:72`): con esto adentro, un `toNumber` que no lo es
+  // propagaba la excepción hasta el handler del socket.
+  const explosivo = [{ toNumber: 5 }, { toNumber: null }, { low: 1, toNumber: "no soy función" }];
+  for (const ts of explosivo) {
+    const fila = mapear({ ...textoPlano, messageTimestamp: ts as never });
+    expect(fila.ts).toBe(AHORA);
+  }
+});
+
 // ── descartes ───────────────────────────────────────────────────────────────
 
 test("revoke: mapMessage no persiste fila e isRevoke apunta al mensaje borrado (CA-6.9)", () => {

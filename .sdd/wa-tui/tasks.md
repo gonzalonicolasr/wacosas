@@ -129,7 +129,7 @@
     el medio devuelven la **misma referencia**; con marcado continuo la tasa de notify queda ≤ 31/s.
   - depends-on: 3
 
-- [ ] 7. Implementar la cola de ingest serializada con escritura chunkeada
+- [x] 7. Implementar la cola de ingest serializada con escritura chunkeada
   - covers: CA-4.3, CA-10.1, CA-11.7, CA-14.2, CA-14.4, CA-12.7, RNF-5, RNF-6
   - files: `src/wa/ingest.ts`, `test/ingest.test.ts`
   - detalle: `push()` es O(1), nunca async, nunca lanza; drenador con `setTimeout(0)`,
@@ -250,6 +250,24 @@
     con `fold()` sobre nombre y número (acá vive la mitad de CA-12.1 que perdió `chats_fts`);
     `Tab` cicla `Todos`/`No leídos`/`Grupos`; doble click < 350 ms abre; rueda mueve la selección;
     estado vacío "esperando la sincronización inicial".
+  - ⚠️ **abierto por la tarea 7 — la fila puede venir sin nombre**: un chat creado por un mensaje
+    **saliente** queda con `name: ""` (el ingest no toca `name` en un `fromMe`, porque el `pushName`
+    de un eco propio sos vos y renombraba el chat con tu propio nombre). Un grupo sin subject
+    también. Así que la bandeja **tiene que caer al número/jid formateado cuando `name` está vacío**,
+    o vas a ver filas en blanco. Segundo: la tabla `contacts` se llena pero **nadie la lee**, así que
+    el `contactName` de la precedencia de `resolveChatName` hoy no se usa nunca y el nombre de un 1:1
+    sale siempre del `pushName`. El arreglo obvio (upsertear el chat al llegar el contacto) **crearía
+    un chat por cada contacto de la agenda** — si lo resolvés, que sea leyendo `contacts` al pintar
+    la fila, no escribiendo `chats`.
+  - ⚠️ **LID — revisar la decisión antes de codear** (lo levantó la revisión de la tarea 7 con
+    información nueva). La decisión original del orquestador fue "v1 **no** fusiona `@lid` /
+    `@s.whatsapp.net`, si aparecen duplicados se documenta". Pero ahora sabemos que: baileys 7.x usa
+    `chatId = from`, que **puede ser un lid** (`decode-wa-message.js:179`), `jidNormalizedUser`
+    conserva el `@lid`, y **al lado viene `remoteJidAlt`** con la otra identidad. O sea que el mismo
+    interlocutor puede aparecerte como **dos chats separados** en la bandeja — que para un cliente de
+    WhatsApp es feo de verdad —, y existe un campo que da la equivalencia gratis. **Evaluá el costo
+    real de normalizar con `remoteJidAlt`**: si sale barato, hacelo; si no, documentalo como
+    limitación conocida en el README. El diseño no menciona LID en ninguna parte.
   - ⚠️ **abierto por la revisión de la tarea 3 (aplica también a la 16)**: (a) sembrar 50.000 mensajes
     con `test/fixtures/seed.ts` tarda **~3,4 s** (~3,2 s son los triggers del FTS) y el default de
     `bun test` son **5 s por test** → los tests de volumen necesitan su **propio `timeout`**. (b)
@@ -311,6 +329,13 @@
     borrador intacto y volver al chat lo restaura.
   - ⚠️ **abierto por la revisión de la tarea 6**: `UiSnapshot` **no tiene campo de borradores** y el
     diseño tampoco los define. Agregalo acá, en el slice `ui`, que es donde el done-when los pide.
+  - ⚠️ **abierto por la tarea 7 — el estado de entrega puede retroceder**: la rama `msg-updates` del
+    ingest aplica el status **sin guarda de rango**, así que un `SERVER_ACK` que llega fuera de orden
+    puede **degradar un mensaje ya leído** (doble tilde azul → un tilde). El estado sólo puede
+    avanzar `pending → sent → delivered → read`, nunca al revés. Para arreglarlo hace falta un getter
+    por `wa_id` que `repo.ts` **hoy no tiene** — agregalo acá. Relacionado: el ingest sólo aplica los
+    recibos de tipo `read` a propósito, porque en un grupo el recibo de *entrega* de un integrante
+    llega después del "leído" de otro y bajaría el estado.
   - depends-on: 13
 
 - [ ] 15. Implementar marcar como leído, recibos de lectura y contadores
@@ -327,6 +352,16 @@
     `chats.update` con `unreadCount:0` pone el contador local en 0. Y a ojo: abrir un chat con no
     leídos lo pone en 0, `Ctrl-L` hace lo mismo sin abrirlo, y al reiniciar el proceso los
     contadores quedan como estaban (CA-14.3).
+  - ⚠️ **abierto por la tarea 7 — el `unreadCount` positivo es un DELTA, no un absoluto**: el ingest
+    ya aplica `chats.update` con `unreadCount === 0 → setUnread(jid, 0)` y **a propósito ignora los
+    positivos**, porque `process-message.js:196` emite `+1` por mensaje. Si acá tomás un positivo
+    como absoluto, pisás el contador con basura. Segundo: los mensajes con `source: "history"` **no**
+    suman no leídos (el `chats` del mismo `messaging-history.set` trae el contador absoluto del
+    servidor y sumar de a uno lo contaba doble ⇒ en el primer arranque todo el historial aparecía sin
+    leer); `notify` y `append` sí suman. Tercero: `pushReadReceipt` del §6.2 todavía **no existe** —
+    es tuyo, y va a necesitar un hook nuevo en `IngestDeps`. Cuarto (revisión de la 7, roza CA-11.7):
+    el `unreadCount` absoluto del history sync se aplica **también al chat abierto**, así que si
+    estabas parado en un chat mientras entra el sync te queda en 7 en vez de 0. Reproducido.
   - depends-on: 14
 
 - [ ] 16. Construir la búsqueda global full-text
