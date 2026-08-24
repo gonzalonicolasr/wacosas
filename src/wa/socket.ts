@@ -39,7 +39,6 @@ import type {
   WAVersion,
   proto,
 } from "baileys";
-import pino from "pino";
 
 import type { Logger } from "../boot/log";
 import { reconnectDelayMs } from "../lib/backoff";
@@ -75,7 +74,67 @@ const EVENTOS = [
   "chats.update",
   "contacts.upsert",
   "contacts.update",
+  "groups.upsert",
+  "groups.update",
 ] as const satisfies readonly (keyof BaileysEventMap)[];
+
+// ── logger de Baileys ───────────────────────────────────────────────────────
+
+/** La forma que Baileys le pide al logger (su `ILogger`, que no re-exporta). */
+type BaileysLogger = NonNullable<UserFacingSocketConfig["logger"]>;
+
+/**
+ * Nivel del logger de Baileys. **`warn`, no `silent`** — y eso tiene historia:
+ * con `pino({level:"silent"})` (copiado del prior art) nos perdimos el aviso que
+ * decía textualmente qué estaba roto en la configuración del historial
+ * (`Socket/socket.js:33-37`, ver el comentario de `shouldSyncHistoryMessage` más
+ * abajo). Un canal de diagnóstico apagado no es "menos ruido": es un bug que
+ * tarda semanas en encontrarse.
+ *
+ * `trace`/`debug` quedan afuera a propósito: Baileys compara `logger.level`
+ * contra esos dos valores para decidir si serializa nodos binarios enteros
+ * (`Socket/socket.js:75,450,466`), o sea que subirlo cuesta CPU **y** volcaría
+ * contenido de mensajes al log (CA-14.7).
+ */
+export const NIVEL_BAILEYS = "warn";
+
+/**
+ * Adaptador del logger de Baileys a nuestro logger de archivo (CA-16.2, CA-14.7).
+ *
+ * Por qué no es un `pino` con destino a un archivo: pino escribiría por su
+ * cuenta a un fd, y lo único que no puede pasar acá es que algo toque stdout o
+ * stderr crudo —la TUI está pintando ahí y una línea suelta le rompe el frame—.
+ * El `ILogger` de Baileys son seis métodos; implementarlos contra
+ * `boot/log.ts` es menos código que configurar un transport, y garantiza que
+ * TODO pase por el filtro de campos prohibidos.
+ *
+ * Del aviso se queda **sólo el mensaje**: Baileys llama de las dos formas
+ * (`warn("texto")` y `warn(obj, "texto")`) y ese `obj` puede traer un sobre
+ * entero, con cuerpo y claves adentro. Se descarta sin mirarlo. El texto viaja
+ * en el campo `aviso`, que `fmtLinea` además recorta a 200 caracteres.
+ */
+export function createBaileysLogger(log: Logger, level: string = NIVEL_BAILEYS): BaileysLogger {
+  const escribir =
+    (nivel: "warn" | "error") =>
+    (obj: unknown, msg?: string): void => {
+      const texto = typeof msg === "string" ? msg : typeof obj === "string" ? obj : "";
+      log[nivel]("baileys", { aviso: texto || "(aviso sin texto)" });
+    };
+  const nada = (): void => {};
+
+  const logger: BaileysLogger = {
+    level,
+    // Baileys hace `logger.child({class:"..."})` en varias capas. Devolver el
+    // mismo objeto alcanza: el contexto del hijo iría al `obj` que igual se tira.
+    child: () => logger,
+    trace: nada,
+    debug: nada,
+    info: nada,
+    warn: escribir("warn"),
+    error: escribir("error"),
+  };
+  return logger;
+}
 
 // ── máquina de cierre (pura) ────────────────────────────────────────────────
 
@@ -402,14 +461,59 @@ export function createWaController(deps: WaDeps): WaController {
       // El `stop()` pudo llegar mientras se resolvía la versión: no abrir nada.
       if (detenido) return;
 
+      // ── opciones del socket ────────────────────────────────────────────────
+      //
+      // ⚠️ **`shouldSyncHistoryMessage` NO se overridea.** El diseño (§5.6) y el
+      // prior art traían `shouldSyncHistoryMessage: () => false`, y eso dejaba la
+      // bandeja VACÍA para siempre: 0 chats, 0 mensajes, 0 contactos con la
+      // sesión conectada de verdad. Por qué, en el fuente:
+      //
+      //   · `Socket/chats.js:931-934` — `shouldProcessHistoryMsg =
+      //     shouldSyncHistoryMessage(historyMsg) && PROCESSABLE_HISTORY_TYPES
+      //     .includes(...)`. Con `() => false` el `&&` corta SIEMPRE, así que
+      //     `messaging-history.set` no se emite NUNCA y el ingest no recibe un
+      //     solo job. Y ese evento no es "mensajes viejos": el
+      //     `INITIAL_BOOTSTRAP` es literalmente la lista de chats.
+      //   · `Socket/socket.js:33-37` — Baileys detecta esta configuración y avisa
+      //     ("DANGER: DISABLING ALL SYNC ... PREVENTS BAILEYS FROM ACCESSING
+      //     INITIAL LID MAPPINGS"). El aviso estaba: lo tapaba el
+      //     `pino({level:"silent"})` (ver `createBaileysLogger`).
+      //   · `Defaults/index.js:65-67` — el default de Baileys es
+      //     `({syncType}) => syncType !== HistorySyncType.FULL`, o sea: aceptá
+      //     `INITIAL_BOOTSTRAP`, `RECENT` y `PUSH_NAME`, y dejá afuera sólo el
+      //     volcado completo. Es exactamente lo que queremos ⇒ **no se overridea**.
+      //
+      // **De dónde salió**: la config se copió de `concesionaria-api/wa-worker/
+      // worker.mjs`, que es un **bot** — sólo le importan los mensajes nuevos
+      // entrantes y el historial le sobra. wacosas es un **cliente**: sin
+      // historial no tiene nada que mostrar. No lo "optimices" de vuelta
+      // copiando el worker.
+      //
+      // **Los dos parámetros del historial NO son el mismo**, y por eso uno se
+      // queda y el otro se va:
+      //
+      //   · `syncFullHistory` es lo que **pedimos**: viaja como `requireFullSync`
+      //     en el nodo de registro (`Utils/validate-connection.js:86`).
+      //   · `shouldSyncHistoryMessage` es lo que **aceptamos** de lo que llega
+      //     (`Socket/chats.js:931`).
+      //
+      // `syncFullHistory: false` es una **decisión tomada** (del usuario, no un
+      // default olvidado): "reciente, no todo" — todos los chats con sus mensajes
+      // recientes, que es lo que WhatsApp manda al vincular, sin el volcado
+      // completo (que tarda mucho y engorda la base). Sin tope artificial nuestro
+      // de chats: se evaluó y se descartó. Si algún día se activa el volcado
+      // completo, hay que acordarse de que llega con `syncType: FULL`
+      // (`Utils/history.js:50-53`) y que ENTONCES sí haría falta un
+      // `shouldSyncHistoryMessage` propio que lo acepte — con el default se
+      // descargaría y se tiraría (`Utils/process-message.js:244`).
       const s = crearSocket({
         ...(version ? { version } : {}),
         auth: state,
         browser: Browsers.ubuntu("Chrome"), // WA rechaza clientes sin browser
-        logger: pino({ level: "silent" }), // CA-16.2: ni una línea a la terminal
+        // CA-16.2: nada a la terminal — pero sus avisos SÍ van a nuestro log.
+        logger: createBaileysLogger(log),
         markOnlineOnConnect: false, // CA-15.8
         syncFullHistory: false,
-        shouldSyncHistoryMessage: () => false,
         generateHighQualityLinkPreview: false,
         getMessage, // §8.6
       });
@@ -502,6 +606,28 @@ export function createWaController(deps: WaDeps): WaController {
         guardado("contacts.update", (contacts: BaileysEventMap["contacts.update"]) => {
           // `contacts.update` trae parciales; el ingest ya ignora lo que no sirve.
           ingest.push({ kind: "contacts", contacts: contacts as BaileysEventMap["contacts.upsert"] });
+        }),
+      );
+
+      // El subject de un grupo. Sin estos dos, un grupo que aparece EN VIVO —o
+      // que se renombra con la app abierta— se queda como "grupo sin nombre"
+      // para siempre: `messaging-history.set` sólo trae el subject de los grupos
+      // que entraron por la sincronización inicial.
+      //   · `groups.upsert` — te acaban de meter en un grupo nuevo
+      //     (`Socket/messages-recv.js:607`).
+      //   · `groups.update` — cambió el asunto, o alguien pidió los metadatos
+      //     (`Utils/process-message.js:485`, `Socket/groups.js:56`).
+      s.ev.on(
+        "groups.upsert",
+        guardado("groups.upsert", (groups: BaileysEventMap["groups.upsert"]) => {
+          ingest.push({ kind: "groups", groups });
+        }),
+      );
+
+      s.ev.on(
+        "groups.update",
+        guardado("groups.update", (groups: BaileysEventMap["groups.update"]) => {
+          ingest.push({ kind: "groups", groups });
         }),
       );
     } catch (e) {

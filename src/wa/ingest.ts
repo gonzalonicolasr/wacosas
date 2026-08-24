@@ -43,6 +43,7 @@ import type {
   Chat,
   ChatUpdate,
   Contact,
+  GroupMetadata,
   MessageUserReceiptUpdate,
   WAMessage,
   WAMessageUpdate,
@@ -90,7 +91,13 @@ export type IngestJob =
   | { kind: "contacts"; contacts: Contact[] }
   | { kind: "chat-updates"; updates: ChatUpdate[] }
   | { kind: "msg-updates"; updates: WAMessageUpdate[] }
-  | { kind: "receipts"; receipts: MessageUserReceiptUpdate[] };
+  | { kind: "receipts"; receipts: MessageUserReceiptUpdate[] }
+  /**
+   * `groups.upsert` / `groups.update`, y la respuesta del `groupMetadata` a
+   * demanda. Lo único que se aprovecha hoy es el **subject**: es el nombre del
+   * grupo, y sin él la bandeja muestra "grupo sin nombre" (CA-4.8).
+   */
+  | { kind: "groups"; groups: Partial<GroupMetadata>[] };
 
 export type Ingest = {
   /** Encola. O(1), nunca async, nunca lanza. */
@@ -109,6 +116,18 @@ export type IngestDeps = {
   selfJid(): string;
   /** Chat abierto: define a quién NO sumarle no leídos (CA-11.7). */
   openChatJid(): string | null;
+  /**
+   * Subject de un grupo, a demanda (`sock.groupMetadata`). Es el ÚLTIMO recurso
+   * para el grupo que aparece por un mensaje en vivo y nunca pasó por el
+   * `messaging-history.set`: sin esto se queda como "grupo sin nombre" para
+   * siempre. Opcional — sin ella el ingest funciona igual, sólo que sin fallback.
+   *
+   * Es una llamada de RED, así que el contrato es estricto: se pide **fuera** de
+   * la transacción, **una sola vez por grupo** (también si falla: martillar a
+   * WhatsApp por cada mensaje es el riesgo de ban R2/R8) y **nunca** puede
+   * lanzar hacia adentro del drenador.
+   */
+  groupSubject?(jid: string): Promise<string>;
   /** Reloj en ms. Default `Date.now` (mismo criterio que `state/store.ts`). */
   now?: () => number;
   /** Agendador del drenador. Default `setTimeout`; el test le pasa uno manual. */
@@ -151,6 +170,8 @@ function itemsDe(job: IngestJob): readonly unknown[] {
       return lista(job.updates);
     case "receipts":
       return lista(job.receipts);
+    case "groups":
+      return lista(job.groups);
     default:
       return [];
   }
@@ -243,6 +264,7 @@ export function createIngest(deps: IngestDeps): Ingest {
   const { repo, store, log, selfJid, openChatJid } = deps;
   const ahora = deps.now ?? Date.now;
   const agendar = deps.schedule ?? agendarReal;
+  const pedirSubjectRemoto = deps.groupSubject;
 
   /** Trabajos, consumidos por índice: `shift()` sería O(n) por trabajo. */
   let cola: Entrada[] = [];
@@ -268,6 +290,15 @@ export function createIngest(deps: IngestDeps): Ingest {
   let cancelarTick: Cancelar | null = null;
   /** Contexto de mapeo de la vuelta en curso (se rearma en cada `vuelta`). */
   let ctx: MapCtx = { selfJid: "", nowSec: 0 };
+
+  /**
+   * Grupos que ya no hay que volver a preguntar: o se les vio el nombre, o ya se
+   * pidió el `groupMetadata` (haya salido bien o mal). Sin esta memoria, un grupo
+   * sin subject dispararía una llamada de red **por cada mensaje** que llegue.
+   */
+  const gruposResueltos = new Set<string>();
+  /** Grupos a preguntar cuando cierre la transacción de la vuelta en curso. */
+  let subjectsPendientes: string[] = [];
 
   // Slices a marcar sucios. Se juntan durante la vuelta y se avisan UNA vez, ya
   // cerrada la transacción: el store coalesce igual (D3), pero así el flush
@@ -326,6 +357,10 @@ export function createIngest(deps: IngestDeps): Ingest {
       isGroup: !!isJidGroup(fila.chatJid),
       ...(nombre ? { name: nombre } : {}),
     });
+    // Un grupo que entra por un mensaje EN VIVO no pasó por el
+    // `messaging-history.set`, así que nadie le trajo el subject: se anota para
+    // preguntarlo al cerrar la transacción.
+    anotarGrupoSinNombre(fila.chatJid);
 
     const { inserted, id } = repo.insertMessage(fila);
     // Ya estaba: re-sync o eco de un envío propio. NO se vuelve a tocar la
@@ -364,6 +399,27 @@ export function createIngest(deps: IngestDeps): Ingest {
       // sync de historial no suman de a uno: se contarían dos veces.
       ...(noLeidos !== null ? { unreadCount: noLeidos } : {}),
     });
+    sucioInbox = true;
+  }
+
+  /**
+   * `groups.upsert` / `groups.update` (y la respuesta del `groupMetadata`): lo
+   * único que se usa es el **subject**.
+   *
+   * Un `groups.update` de participantes o de settings viene SIN subject: eso no
+   * es "el grupo se quedó sin nombre", es "este evento no habla del nombre" ⇒ se
+   * ignora. Mandar `name: ""` al upsert borraría el nombre bueno, que es el mismo
+   * cuidado que ya tienen `aplicarChat` y `aplicarMensaje`.
+   */
+  function aplicarGrupo(g: Partial<GroupMetadata>): void {
+    const jid = jidNormalizedUser(g?.id ?? undefined);
+    if (!jid || !isJidGroup(jid)) return;
+    const subject = oneLine(texto(g?.subject));
+    if (!subject) return;
+
+    repo.upsertChat({ jid, isGroup: true, name: subject });
+    // Ya tiene nombre: no hay nada que preguntarle a WhatsApp nunca más.
+    gruposResueltos.add(jid);
     sucioInbox = true;
   }
 
@@ -447,7 +503,68 @@ export function createIngest(deps: IngestDeps): Ingest {
         return aplicarMsgUpdate(item as WAMessageUpdate);
       case "receipts":
         return aplicarRecibo(item as MessageUserReceiptUpdate);
+      case "groups":
+        return aplicarGrupo(item as Partial<GroupMetadata>);
     }
+  }
+
+  // ── subject de grupo a demanda (`sock.groupMetadata`) ─────────────────────
+
+  /**
+   * Anota un grupo cuyo nombre todavía no conocemos. Corre DENTRO de la
+   * transacción (por eso sólo lee la base y empuja a una lista): el pedido de red
+   * lo dispara `pedirSubjects()` recién cuando el chunk cerró.
+   *
+   * El `Set` se marca acá y no cuando vuelve la respuesta: así el grupo se
+   * pregunta **una sola vez** aunque entren diez mensajes seguidos, y también
+   * aunque la llamada falle.
+   *
+   * Y se dispara SÓLO desde `aplicarMensaje`, nunca desde `aplicarChat`: los
+   * grupos del `messaging-history.set` ya vienen con su subject, y preguntarle a
+   * WhatsApp por cada uno sería una ráfaga de decenas de consultas al vincular —
+   * justo el ritmo que el diseño evita por el riesgo de ban (R2/R8).
+   */
+  function anotarGrupoSinNombre(jid: string): void {
+    if (!pedirSubjectRemoto || gruposResueltos.has(jid) || !isJidGroup(jid)) return;
+    gruposResueltos.add(jid);
+    // El chat lo acaba de escribir `aplicarMensaje`: si ya trae nombre (vino por
+    // el historial o por un `groups.update` anterior) no hay nada que pedir.
+    if (repo.getChat(jid)?.name) return;
+    subjectsPendientes.push(jid);
+  }
+
+  /**
+   * Dispara los pedidos anotados. **Fuera** de la transacción y sin `await`: el
+   * drenador no espera a la red, y la respuesta vuelve a entrar por la cola como
+   * un job `groups` cualquiera —un solo camino de escritura—.
+   */
+  function pedirSubjects(): void {
+    if (subjectsPendientes.length === 0) return;
+    const jids = subjectsPendientes;
+    subjectsPendientes = [];
+    for (const jid of jids) pedirSubject(jid);
+  }
+
+  function pedirSubject(jid: string): void {
+    const pedir = pedirSubjectRemoto;
+    if (!pedir) return;
+    let pendiente: Promise<string>;
+    try {
+      // El `try` cubre la función que LANZA en vez de rechazar (un socket que ya
+      // no está, por ejemplo): esto cuelga del drenador y no puede tirarlo.
+      pendiente = Promise.resolve(pedir(jid));
+    } catch (e) {
+      log.warn("ingest.group_subject_fallido", { jid, motivo: motivo(e) });
+      return;
+    }
+    pendiente.then(
+      (subject) => {
+        const nombre = oneLine(texto(subject));
+        if (!nombre) return;
+        encolar({ kind: "groups", groups: [{ id: jid, subject: nombre }] });
+      },
+      (e: unknown) => log.warn("ingest.group_subject_fallido", { jid, motivo: motivo(e) }),
+    );
   }
 
   // ── drenador ──────────────────────────────────────────────────────────────
@@ -520,12 +637,23 @@ export function createIngest(deps: IngestDeps): Ingest {
       cabeza = 0;
     }
 
+    // La red va DESPUÉS de la transacción, siempre (ver `pedirSubjects`).
+    pedirSubjects();
+
     if (fallos > 0) log.warn("ingest.items_fallidos", { fallos, motivo: primerFallo });
     // Los avisos de la cola llena se juntan y salen acá: `push` no puede pagar
     // un `appendFileSync` por evento.
-    if (descartadas > 0 || desbordes > 0) {
-      log.warn("ingest.cola_llena", { descartadas, desbordes, pendientes: filas });
+    //
+    // El descarte tiene evento PROPIO y nivel `error`: lo que se tira son
+    // mensajes del historial, y esos **no vuelven** —WhatsApp los mandó una vez—.
+    // Mezclarlo con el desborde genérico en un `warn` hacía que una pérdida de
+    // datos real pasara por "la cola se llenó un rato".
+    if (descartadas > 0) {
+      log.error("ingest.historial_descartado", { filas: descartadas, pendientes: filas });
       descartadas = 0;
+    }
+    if (desbordes > 0) {
+      log.warn("ingest.cola_llena", { desbordes, pendientes: filas });
       desbordes = 0;
     }
 
@@ -597,24 +725,27 @@ export function createIngest(deps: IngestDeps): Ingest {
     desbordes++;
   }
 
+  /** El `push` del contrato. Con nombre porque el fallback de subject lo reusa. */
+  function encolar(job: IngestJob): void {
+    try {
+      const largo = itemsDe(job).length;
+      if (largo === 0) return;
+      if (cola.length - cabeza >= MAX_QUEUE_JOBS) descartarViejo();
+      cola.push({ job, largo });
+      filas += largo;
+      // Trabajo nuevo = ventana de reintentos nueva: si el drenador ya se
+      // había dado por vencido, este `push` lo vuelve a poner a intentar.
+      trabada = 0;
+      agendarTick();
+    } catch (e) {
+      // Último seguro: `push` cuelga de un handler del socket y una excepción
+      // acá se lleva puesta la conexión. Mejor perder un evento que el socket.
+      log.error("ingest.push_fallido", { motivo: motivo(e) });
+    }
+  }
+
   return {
-    push(job) {
-      try {
-        const largo = itemsDe(job).length;
-        if (largo === 0) return;
-        if (cola.length - cabeza >= MAX_QUEUE_JOBS) descartarViejo();
-        cola.push({ job, largo });
-        filas += largo;
-        // Trabajo nuevo = ventana de reintentos nueva: si el drenador ya se
-        // había dado por vencido, este `push` lo vuelve a poner a intentar.
-        trabada = 0;
-        agendarTick();
-      } catch (e) {
-        // Último seguro: `push` cuelga de un handler del socket y una excepción
-        // acá se lleva puesta la conexión. Mejor perder un evento que el socket.
-        log.error("ingest.push_fallido", { motivo: motivo(e) });
-      }
-    },
+    push: encolar,
 
     drainNow() {
       cancelarTick?.();

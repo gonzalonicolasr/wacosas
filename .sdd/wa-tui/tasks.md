@@ -315,6 +315,18 @@
     WhatsApp es feo de verdad —, y existe un campo que da la equivalencia gratis. **Evaluá el costo
     real de normalizar con `remoteJidAlt`**: si sale barato, hacelo; si no, documentalo como
     limitación conocida en el README. El diseño no menciona LID en ninguna parte.
+  - ⚠️ **RE-EVALUAR el LID cuando Gon vuelva a vincular** (abierto por el arreglo de la bandeja
+    vacía). Los chats duplicados `@lid` / `@s.whatsapp.net` documentados como limitación conocida en
+    el README (riesgo R7) **pueden haber sido consecuencia de otro bug, ya arreglado**: teníamos
+    `shouldSyncHistoryMessage: () => false`, y baileys avisa textualmente que eso *"PREVENTS BAILEYS
+    FROM ACCESSING INITIAL LID MAPPINGS, LEADING TO INSTABILITY AND SESSION ERRORS"*
+    (`Socket/socket.js:33-37`). Los mapeos LID↔teléfono viajan en el `messaging-history.set`
+    (`Utils/history.js:45`, `phoneNumberToLidMappings` + el `pnJid` de cada conversación) y ese
+    evento **no se emitía nunca**. Con el override sacado, baileys ahora sí los recibe y los guarda
+    (`Utils/process-message.js:266` → `signalRepository.lidMapping.storeLIDPNMappings`).
+    **NO se tocó el README**: hasta que Gon no vincule y mire la bandeja, esto es una hipótesis. Si
+    los duplicados desaparecen, sacar la sección "Un mismo contacto puede aparecerte como dos chats"
+    y bajar R7; si siguen, la limitación queda como está y este párrafo se borra.
   - ⚠️ **abierto por la revisión de la tarea 3 (aplica también a la 16)**: (a) sembrar 50.000 mensajes
     con `test/fixtures/seed.ts` tarda **~3,4 s** (~3,2 s son los triggers del FTS) y el default de
     `bun test` son **5 s por test** → los tests de volumen necesitan su **propio `timeout`**. (b)

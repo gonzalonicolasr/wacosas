@@ -24,7 +24,13 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { Browsers } from "baileys";
+import {
+  Browsers,
+  DEFAULT_CONNECTION_CONFIG,
+  makeWASocket as makeWASocketReal,
+  PROCESSABLE_HISTORY_TYPES,
+  proto,
+} from "baileys";
 import type { BaileysEventMap, UserFacingSocketConfig, WAMessage, WASocket, WAVersion } from "baileys";
 
 import { createLogger } from "../src/boot/log";
@@ -32,9 +38,11 @@ import { openDb } from "../src/db/open";
 import { createRepo } from "../src/db/repo";
 import { RECONNECT_MAX_MS } from "../src/lib/backoff";
 import { createStore } from "../src/state/store";
+import { loadAuth } from "../src/wa/auth";
 import { createIngest, type Ingest, type IngestJob } from "../src/wa/ingest";
 import {
   COOLDOWN_WIPE_MS,
+  createBaileysLogger,
   createWaController,
   decideOnClose,
   MOTIVO_BAD_SESSION,
@@ -44,10 +52,11 @@ import {
   MOTIVO_QR_EN_RECONEXION,
   MOTIVO_VERSION,
   motivoWipeFallido,
+  NIVEL_BAILEYS,
   VERSION_TIMEOUT_MS,
   type WaController,
 } from "../src/wa/socket";
-import { JID_CONTACTO, SELF_JID } from "./fixtures/messages";
+import { JID_CONTACTO, JID_GRUPO, SELF_JID } from "./fixtures/messages";
 
 const tmp = mkdtempSync(join(tmpdir(), "wacosas-socket-"));
 afterAll(() => rmSync(tmp, { recursive: true, force: true }));
@@ -385,14 +394,116 @@ test("las opciones del socket son las del prior art (§5.6)", async () => {
 
   expect(cfg.browser).toEqual(Browsers.ubuntu("Chrome"));
   expect(cfg.markOnlineOnConnect).toBe(false); // CA-15.8
+  // "Reciente, no todo": decisión del usuario, no un default olvidado.
   expect(cfg.syncFullHistory).toBe(false);
-  expect(cfg.shouldSyncHistoryMessage?.(undefined as never)).toBe(false);
   expect(cfg.generateHighQualityLinkPreview).toBe(false);
   expect(typeof cfg.getMessage).toBe("function"); // §8.6
   expect(cfg.auth).toBeTruthy();
-  // CA-16.2: el logger de baileys no puede escribir NADA en la terminal.
-  expect((cfg.logger as { level?: string } | undefined)?.level).toBe("silent");
+  // CA-16.2: el logger de baileys no puede escribir NADA en la terminal, pero
+  // tampoco puede estar mudo (ver los tests del historial más abajo).
+  expect((cfg.logger as { level?: string } | undefined)?.level).toBe(NIVEL_BAILEYS);
   b.cerrar();
+});
+
+// ── sincronización del historial (la bandeja vacía) ─────────────────────────
+//
+// El bug: `shouldSyncHistoryMessage: () => false`, copiado del prior art —que es
+// un BOT y no quiere historial—. Con eso baileys no emite `messaging-history.set`
+// ni una vez, y el `INITIAL_BOOTSTRAP` (que ES la lista de chats) se descarta:
+// sesión conectada, bandeja con 0 chats, 0 mensajes y 0 contactos.
+
+/**
+ * El MISMO cálculo que hace baileys en `Socket/socket.js:33-34` para decidir si
+ * te avisa que apagaste el sync entero. Se arma con sus constantes reales
+ * (`PROCESSABLE_HISTORY_TYPES`) y con su default (`DEFAULT_CONNECTION_CONFIG`),
+ * así que si baileys cambia el criterio, este test cambia con él.
+ */
+function syncDesactivado(cfg: UserFacingSocketConfig): boolean {
+  const fn = cfg.shouldSyncHistoryMessage ?? DEFAULT_CONNECTION_CONFIG.shouldSyncHistoryMessage;
+  return (
+    PROCESSABLE_HISTORY_TYPES.map((syncType) => fn({ syncType })).filter((x) => x === false).length ===
+    PROCESSABLE_HISTORY_TYPES.length
+  );
+}
+
+test("la config del socket NO apaga el sync de historial (bandeja vacía, socket.js:33)", async () => {
+  const b = banco();
+  const { cfg } = await arrancar(b);
+
+  // Sin override: rige el default de baileys (`Defaults/index.js:65-67`).
+  expect(cfg.shouldSyncHistoryMessage).toBeUndefined();
+  expect(syncDesactivado(cfg)).toBe(false);
+
+  // Control positivo: si alguien vuelve a copiar la config del bot, esto salta.
+  expect(syncDesactivado({ ...cfg, shouldSyncHistoryMessage: () => false })).toBe(true);
+
+  // Y el criterio efectivo es el que queremos: todo menos el volcado completo.
+  const fn = cfg.shouldSyncHistoryMessage ?? DEFAULT_CONNECTION_CONFIG.shouldSyncHistoryMessage;
+  const T = proto.HistorySync.HistorySyncType;
+  expect(fn({ syncType: T.INITIAL_BOOTSTRAP })).toBe(true); // la lista de chats
+  expect(fn({ syncType: T.RECENT })).toBe(true);
+  expect(fn({ syncType: T.PUSH_NAME })).toBe(true);
+  expect(fn({ syncType: T.FULL })).toBe(false); // `syncFullHistory: false`
+  b.cerrar();
+});
+
+test("el aviso de baileys termina en NUESTRO log, no en la terminal (CA-16.2, CA-14.7)", async () => {
+  // Acá se usa el `makeWASocket` DE VERDAD: es el único que puede probar que el
+  // aviso viaja de baileys a nuestro archivo. El ws apunta a un puerto muerto
+  // (127.0.0.1:1) para no hablarle a WhatsApp: el aviso se emite en
+  // `Socket/socket.js:36`, antes del `ws.connect()` de la línea 55.
+  const dir = mkdtempSync(join(tmp, "aviso-"));
+  const logPath = join(dir, "wa.log");
+  const log = createLogger(logPath);
+  const { state } = await loadAuth(join(dir, "creds"));
+
+  const comun = {
+    auth: state,
+    logger: createBaileysLogger(log),
+    waWebSocketUrl: new URL("ws://127.0.0.1:1"),
+  } satisfies UserFacingSocketConfig;
+
+  // 1. La configuración ROTA: baileys avisa y el aviso queda en el archivo.
+  const roto = makeWASocketReal({ ...comun, shouldSyncHistoryMessage: () => false });
+  await roto.end(undefined).catch(() => {});
+  const conAviso = readFileSync(logPath, "utf8");
+  expect(conAviso).toContain("WARN  baileys");
+  expect(conAviso).toContain("DANGER: DISABLING ALL SYNC");
+  // El aviso viaja como campo `aviso`, escalar: nada del objeto de pino entero.
+  expect(conAviso).toContain('aviso="⚠️ DANGER');
+
+  // 2. La NUESTRA (sin override): mismo camino, y baileys no tiene nada que decir.
+  const bueno = makeWASocketReal({ ...comun, syncFullHistory: false });
+  await bueno.end(undefined).catch(() => {});
+  const despues = readFileSync(logPath, "utf8").slice(conAviso.length);
+  expect(despues).not.toContain("DANGER: DISABLING ALL SYNC");
+});
+
+test("el logger de baileys se queda con el mensaje y tira el objeto (CA-14.7)", () => {
+  const dir = mkdtempSync(join(tmp, "balog-"));
+  const logPath = join(dir, "wa.log");
+  const bl = createBaileysLogger(createLogger(logPath));
+
+  // Las DOS formas de llamar que usa baileys: `warn(msg)` y `warn(obj, msg)`.
+  bl.warn("aviso suelto");
+  bl.error({ msg: { conversation: "secreto" }, creds: "no" }, "algo falló");
+  // Un hijo escribe al mismo lado, y por debajo del nivel no sale nada.
+  bl.child({ class: "baileys" }).warn("desde el hijo");
+  bl.info({}, "esto no se loguea");
+  bl.debug({}, "esto tampoco");
+  bl.trace({}, "esto menos");
+
+  const texto = readFileSync(logPath, "utf8");
+  expect(texto).toContain("aviso suelto");
+  expect(texto).toContain("algo falló");
+  expect(texto).toContain("desde el hijo");
+  expect(texto).not.toContain("secreto");
+  expect(texto).not.toContain("esto no se loguea");
+  expect(texto).not.toContain("esto tampoco");
+  expect(bl.level).toBe(NIVEL_BAILEYS);
+  // `trace`/`debug` harían que baileys serialice nodos binarios enteros.
+  expect(NIVEL_BAILEYS).not.toBe("trace");
+  expect(NIVEL_BAILEYS).not.toBe("debug");
 });
 
 test("si la versión no se puede resolver sigue con la bundleada y lo loguea (CA-1.3)", async () => {
@@ -474,6 +585,8 @@ test("descartar un socket lo deja sin handlers y cerrado (D5)", async () => {
   const s1 = await arrancar(b);
   expect(s1.oyentes("messages.upsert")).toBe(1);
   expect(s1.oyentes("connection.update")).toBe(1);
+  expect(s1.oyentes("groups.update")).toBe(1);
+  expect(s1.oyentes("groups.upsert")).toBe(1);
 
   b.wa.reconnectNow();
   await asentar();
@@ -482,6 +595,8 @@ test("descartar un socket lo deja sin handlers y cerrado (D5)", async () => {
   expect(s1.oyentes("messages.upsert")).toBe(0);
   expect(s1.oyentes("connection.update")).toBe(0);
   expect(s1.oyentes("creds.update")).toBe(0);
+  expect(s1.oyentes("groups.update")).toBe(0);
+  expect(s1.oyentes("groups.upsert")).toBe(0);
   b.cerrar();
 });
 
@@ -514,6 +629,8 @@ test("un socket viejo no escribe NADA: ni mensajes en la base ni credenciales en
   viejo.emitir("creds.update", {});
   viejo.emitir("messages.upsert", upsert(msg("VIEJO-1")));
   viejo.emitir("messages.update", [{ key: { remoteJid: JID_CONTACTO, id: "VIEJO-1" }, update: { status: 4 } }]);
+  viejo.emitir("groups.upsert", [{ id: JID_GRUPO, subject: "VIEJO" }] as never);
+  viejo.emitir("groups.update", [{ id: JID_GRUPO, subject: "VIEJO" }] as never);
   viejo.emitir("connection.update", { connection: "open" });
   viejo.emitir("connection.update", cierre(401));
   await asentar();
@@ -543,12 +660,17 @@ test("el socket vigente alimenta la cola de ingest con todos los eventos", async
   s.emitir("chats.update", [{ id: JID_CONTACTO, unreadCount: 0 }] as never);
   s.emitir("message-receipt.update", [] as never);
   s.emitir("messaging-history.set", { chats: [], contacts: [], messages: [msg("H1")] } as never);
+  // El subject de un grupo que nace o se renombra con la app abierta: sin estos
+  // dos eventos la bandeja lo muestra como "grupo sin nombre" para siempre.
+  s.emitir("groups.upsert", [{ id: JID_GRUPO, subject: "Asado del viernes" }] as never);
+  s.emitir("groups.update", [{ id: JID_GRUPO, subject: "Asado del sábado" }] as never);
 
   const kinds = b.jobs.map((j) => j.kind);
   expect(kinds).toContain("messages");
   expect(kinds).toContain("chats");
   expect(kinds).toContain("contacts");
   expect(kinds).toContain("chat-updates");
+  expect(kinds.filter((k) => k === "groups").length).toBe(2);
   // El history entra marcado como tal: no puede sumar no leídos (§6.2).
   expect(b.jobs.some((j) => j.kind === "messages" && j.source === "history")).toBe(true);
 

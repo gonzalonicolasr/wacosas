@@ -225,6 +225,11 @@ const ingest = createIngest({
   log,
   selfJid: () => wa?.selfJid() ?? "",
   openChatJid: () => store.openChatJid(),
+  // Último recurso para el nombre de un grupo que apareció por un mensaje en
+  // vivo (el ingest se encarga de pedirlo una sola vez y de no bloquear). Se lee
+  // por función, como `selfJid`: cuando esto se define el controlador todavía no
+  // existe. Sin socket devuelve "" y el grupo queda como estaba.
+  groupSubject: async (jid) => (await wa?.socket()?.groupMetadata(jid))?.subject ?? "",
 });
 // La cola de envío y el controlador se necesitan MUTUAMENTE (la cola le pide el
 // socket; el socket le pide el `getMessage` de §8.6), así que la cola lo lee a

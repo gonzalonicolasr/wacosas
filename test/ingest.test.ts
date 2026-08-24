@@ -22,7 +22,7 @@ import type { Database } from "bun:sqlite";
 import { proto } from "baileys";
 import type { WAMessage, WAMessageUpdate } from "baileys";
 
-import { createLogger, type Logger } from "../src/boot/log";
+import { createLogger, type Fields, type Logger } from "../src/boot/log";
 import { openDb } from "../src/db/open";
 import { createRepo, type Repo } from "../src/db/repo";
 import { buildFtsQuery } from "../src/lib/fts";
@@ -112,7 +112,14 @@ type Banco = {
   cerrar(): void;
 };
 
-function banco(opts: { repo?: (base: Repo) => Repo; log?: (base: Logger) => Logger } = {}): Banco {
+function banco(
+  opts: {
+    repo?: (base: Repo) => Repo;
+    log?: (base: Logger) => Logger;
+    /** El `sock.groupMetadata` de producción. Sin esto no hay fallback a demanda. */
+    groupSubject?: (jid: string) => Promise<string>;
+  } = {},
+): Banco {
   const db = openDb(join(tmp, `ingest-${nBase++}.sqlite`));
   const repo = opts.repo ? opts.repo(createRepo(db)) : createRepo(db);
   const logBase = createLogger(join(tmp, "ingest.log"));
@@ -142,6 +149,7 @@ function banco(opts: { repo?: (base: Repo) => Repo; log?: (base: Logger) => Logg
     openChatJid: () => store.openChatJid(),
     now: () => AHORA * 1000,
     schedule: agenda.schedule,
+    ...(opts.groupSubject ? { groupSubject: opts.groupSubject } : {}),
   });
 
   const contarFilas = db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM messages");
@@ -532,6 +540,151 @@ test("un mensaje de grupo no rebautiza el grupo con el nombre del que escribió 
   b.cerrar();
 });
 
+// ── el nombre del grupo (`groups.*` + `groupMetadata` a demanda) ────────────
+//
+// `resolveChatName` devuelve `""` para un grupo a propósito (CA-4.8): sin eso, el
+// grupo se rebautizaría con el `pushName` del último que habló. El problema real
+// era que el subject NO llegaba por ningún camino cuando el grupo aparecía por un
+// mensaje EN VIVO — la bandeja lo mostraba como "grupo sin nombre" para siempre.
+
+/** Un mensaje de grupo con la forma real (participante incluido). */
+const enGrupo = (id: string, ts = TS_BASE): WAMessage => ({
+  key: { remoteJid: JID_GRUPO, fromMe: false, id, participant: JID_PARTICIPANTE },
+  message: { conversation: `mensaje ${id} del grupo` },
+  messageTimestamp: ts,
+  pushName: "Beto",
+});
+
+/** Deja correr los `.then` del fallback, que sale del drenador sin `await`. */
+async function asentar(vueltas = 4): Promise<void> {
+  for (let i = 0; i < vueltas; i++) await new Promise((r) => setTimeout(r, 0));
+}
+
+test("un grupo sin nombre lo aprende con un `groups.update` (renombrado en vivo)", () => {
+  const b = banco();
+  // El grupo entra por un mensaje en vivo: nadie le trajo el subject.
+  b.ingest.push(lote([enGrupo("G1")]));
+  b.drenar();
+  expect(b.repo.getChat(JID_GRUPO)!.name).toBe("");
+
+  b.ingest.push({ kind: "groups", groups: [{ id: JID_GRUPO, subject: "Asado del viernes" }] });
+  b.drenar();
+  expect(b.repo.getChat(JID_GRUPO)!.name).toBe("Asado del viernes");
+  expect(b.repo.getChat(JID_GRUPO)!.isGroup).toBe(true);
+  // La bandeja tiene que enterarse: si no, el nombre aparece recién al próximo
+  // mensaje.
+  expect(b.marcados.at(-1)).toContain("inbox");
+
+  // Un `groups.update` de participantes/settings NO trae subject: eso no puede
+  // borrar el nombre bueno.
+  b.ingest.push({ kind: "groups", groups: [{ id: JID_GRUPO, desc: "sin asunto" }] });
+  b.drenar();
+  expect(b.repo.getChat(JID_GRUPO)!.name).toBe("Asado del viernes");
+  b.cerrar();
+});
+
+test("el subject a demanda se pide UNA sola vez aunque entren diez mensajes", async () => {
+  const pedidos: string[] = [];
+  const b = banco({
+    groupSubject: async (jid) => {
+      pedidos.push(jid);
+      return "Los pibes";
+    },
+  });
+
+  // Diez mensajes del mismo grupo, en jobs distintos (o sea, varias vueltas).
+  for (let i = 0; i < 10; i++) b.ingest.push(lote([enGrupo(`G${i}`, TS_BASE + i)]));
+  b.drenar();
+  await asentar();
+  b.drenar();
+
+  // Una sola llamada de red: martillar a WhatsApp por mensaje es el riesgo de ban.
+  expect(pedidos).toEqual([JID_GRUPO]);
+  expect(b.repo.getChat(JID_GRUPO)!.name).toBe("Los pibes");
+  expect(b.filas()).toBe(10);
+
+  // Y ya con nombre no se vuelve a preguntar nunca.
+  b.ingest.push(lote([enGrupo("G99", TS_BASE + 99)]));
+  b.drenar();
+  await asentar();
+  expect(pedidos.length).toBe(1);
+  b.cerrar();
+});
+
+test("no se pide el subject de un grupo que ya llegó con nombre por el historial", async () => {
+  const pedidos: string[] = [];
+  const b = banco({
+    groupSubject: async (jid) => {
+      pedidos.push(jid);
+      return "no debería pedirse";
+    },
+  });
+
+  b.ingest.push({ kind: "chats", chats: [{ id: JID_GRUPO, name: "Asado del sábado" }] });
+  b.ingest.push(lote([enGrupo("G1")]));
+  b.drenar();
+  await asentar();
+
+  expect(pedidos).toEqual([]);
+  expect(b.repo.getChat(JID_GRUPO)!.name).toBe("Asado del sábado");
+  b.cerrar();
+});
+
+test("un `groupMetadata` que falla no rompe el ingest ni se reintenta en loop", async () => {
+  const eventos: string[] = [];
+  const pedidos: string[] = [];
+  const b = banco({
+    log: (base) => ({ ...base, warn: (ev, f) => (eventos.push(ev), base.warn(ev, f)) }),
+    groupSubject: async (jid) => {
+      pedidos.push(jid);
+      throw new Error("sin conexión con WhatsApp");
+    },
+  });
+
+  b.ingest.push(lote([enGrupo("G1")]));
+  b.drenar();
+  await asentar();
+  b.drenar();
+
+  expect(pedidos).toEqual([JID_GRUPO]);
+  expect(eventos).toContain("ingest.group_subject_fallido");
+  // El grupo se queda sin nombre (la bandeja cae a "grupo sin nombre"), pero el
+  // mensaje está persistido y la cola sigue viva.
+  expect(b.repo.getChat(JID_GRUPO)!.name).toBe("");
+  expect(b.filas()).toBe(1);
+
+  // Y NO se reintenta: un fallo también consume el único pedido del grupo.
+  for (let i = 0; i < 5; i++) b.ingest.push(lote([enGrupo(`R${i}`, TS_BASE + 10 + i)]));
+  b.drenar();
+  await asentar();
+  expect(pedidos.length).toBe(1);
+  expect(b.filas()).toBe(6);
+  b.cerrar();
+});
+
+test("una función de subject que LANZA en vez de rechazar tampoco tira el drenador", async () => {
+  const b = banco({
+    groupSubject: (() => {
+      throw new Error("el socket ya no existe");
+    }) as (jid: string) => Promise<string>,
+  });
+
+  b.ingest.push(lote([enGrupo("G1")]));
+  expect(() => b.drenar()).not.toThrow();
+  await asentar();
+  expect(b.filas()).toBe(1);
+  b.cerrar();
+});
+
+test("sin `groupSubject` el ingest anda igual: no hay fallback y no explota nada", () => {
+  const b = banco();
+  b.ingest.push(lote([enGrupo("G1")]));
+  b.drenar();
+  expect(b.repo.getChat(JID_GRUPO)!.name).toBe("");
+  expect(b.filas()).toBe(1);
+  b.cerrar();
+});
+
 test("un mensaje entrante sin pushName no rebautiza el chat con el número (CA-4.8)", () => {
   const b = banco();
   // 1. el `messaging-history.set` trae el chat ya con su nombre resuelto.
@@ -737,7 +890,12 @@ test("después de una vuelta fallida la cola se reintenta sola, sin un push nuev
 });
 
 test("la cola llena descarta el historial más viejo y nunca lo que llegó en vivo", () => {
-  const b = banco();
+  // Lo descartado es historial: WhatsApp ya lo mandó y NO vuelve. Tiene que
+  // quedar constancia con la cuenta, o es una pérdida de datos invisible.
+  const errores: { ev: string; f?: Fields }[] = [];
+  const b = banco({
+    log: (base) => ({ ...base, error: (ev, f) => (errores.push({ ev, f }), base.error(ev, f)) }),
+  });
   // Se llena SIN drenar: la cola queda al tope con historial y un notify en el
   // medio, que es el que no se puede perder.
   for (let i = 0; i < MAX_QUEUE_JOBS; i++) {
@@ -762,6 +920,11 @@ test("la cola llena descarta el historial más viejo y nunca lo que llegó en vi
   for (let i = 0; i < 6; i++) expect(ids.has(`H${i}_0`)).toBe(false);
   expect(ids.has("H6_0")).toBe(true);
   expect(filas.length).toBe(antes);
+
+  // Y quedó dicho: evento propio, nivel `error` y la cuenta exacta de lo perdido.
+  const perdido = errores.filter((e) => e.ev === "ingest.historial_descartado");
+  expect(perdido.length).toBeGreaterThan(0);
+  expect(perdido.reduce((n, e) => n + Number(e.f?.filas ?? 0), 0)).toBe(6);
   b.cerrar();
 });
 
