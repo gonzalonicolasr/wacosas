@@ -198,9 +198,14 @@
   - done when: los tres con test, cada uno demostrado en rojo antes del fix. ✅ 220 tests, typecheck 0.
   - depends-on: 8
 
-- [ ] 9. Montar el esqueleto de la TUI y el cableado del entry
-  - covers: CA-13.1, CA-13.2, CA-13.3, CA-13.6, CA-13.7, CA-15.1, CA-16.2, CA-16.3, CA-19.1,
-    CA-19.2, CA-19.3, CA-19.4, CA-19.5, CA-6.6, CA-10.5, RNF-1, RNF-2, RNF-14
+- [x] 9. Montar el esqueleto de la TUI y el cableado del entry
+  - covers: CA-13.1, CA-13.2, CA-13.3, CA-13.6, CA-13.7, CA-15.1, CA-16.2, CA-16.3,
+    CA-19.1 *(sólo la mitad de "2 paneles + header + pie")*, CA-19.2, CA-19.3, CA-19.4, CA-19.5,
+    CA-6.6, RNF-1, RNF-2, RNF-14
+    — **CA-10.5 y la mitad "filtros con contadores" de CA-19.1 se MOVIERON a la tarea 12** por
+    decisión del orquestador tras la revisión: la 12 es la dueña de los tabs, los contadores y la
+    fila real, y reemplaza entera la lista mínima que dejó esta tarea. Construir acá un contador
+    provisorio que la 12 va a tirar no aporta.
   - files: `src/index.tsx` (orden obligatorio: umask → paths → stderr → args → db → `store.bootstrap`
     → renderer → `root.render(<App/>)` → `wa.start()`), `src/ui/App.tsx`, `src/ui/theme.ts`,
     `src/ui/Brand.tsx`, `src/ui/Splash.tsx`, `src/ui/Header.tsx`, `src/ui/Footer.tsx`,
@@ -235,7 +240,10 @@
 - [ ] 10. Construir la pantalla de vinculación: QR nativo y código de emparejamiento
   - covers: CA-1.1, CA-1.5, CA-1.6, CA-1.9, CA-2.1, CA-2.2, CA-2.3, CA-2.4, CA-2.5, CA-2.6, RNF-3
   - files: `src/wa/qr.ts`, `src/ui/Login.tsx`, `src/ui/QrView.tsx`, `src/ui/PairingView.tsx`,
-    `src/state/commands.ts` (agrega `chooseLinkMethod` y `requestPairing`), `test/qr.test.ts`
+    `src/state/commands.ts` (agrega `chooseLinkMethod` y `requestPairing`), `test/qr.test.ts`,
+    **`src/ui/App.tsx`** *(agregado por el orquestador: sin tocarlo no hay dónde colgar el
+    `link.phase !== "linked"` ⇒ `<Login/>`. La tarea 9 dejó el hueco marcado con un comentario y hoy,
+    sin creds, la app muestra la bandeja vacía en vez de la pantalla de vinculación.)*
   - detalle: QR dibujado **nativo** desde `QRCode.create().modules` con half-blocks y quiet zone 1,
     `fg` negro sobre `bg` blanco fijos (nunca del tema, D10); `fitsQr(w,h,qr)` = umbral fijo
     `h>=36 && w>=69` **y** además la matriz real; `<QrView key={qr}>` para que la rotación reemplace
@@ -289,6 +297,11 @@
     sale siempre del `pushName`. El arreglo obvio (upsertear el chat al llegar el contacto) **crearía
     un chat por cada contacto de la agenda** — si lo resolvés, que sea leyendo `contacts` al pintar
     la fila, no escribiendo `chats`.
+  - ⚠️ **CA-10.5 y los contadores de CA-19.1 se movieron acá desde la tarea 9** (revisión de la 9):
+    `store.bootstrap()` ya deja `inbox.counts = {all, unread, groups}` **sincrónico antes del primer
+    frame**, o sea que el mecanismo está y sólo falta pintarlo. Hoy, con 29 chats sin leer y 71
+    mensajes, la pantalla no muestra un solo contador. Los tabs `Todos`/`No leídos`/`Grupos` llevan
+    su número, y las filas su badge.
   - ⚠️ **LID — revisar la decisión antes de codear** (lo levantó la revisión de la tarea 7 con
     información nueva). La decisión original del orquestador fue "v1 **no** fusiona `@lid` /
     `@s.whatsapp.net`, si aparecen duplicados se documenta". Pero ahora sabemos que: baileys 7.x usa
