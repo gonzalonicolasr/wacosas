@@ -97,6 +97,20 @@ export type UiSnapshot = {
    * el cursor sobre otro chat.
    */
   selectedJid: string | null;
+  /**
+   * Borradores sin enviar, por jid (CA-8.6). ⚠️ El diseño no los definía: son de
+   * la tarea 14 y van acá, en el slice `ui`, porque son estado del OJO —lo que
+   * el usuario dejó escrito— y no de la máquina.
+   *
+   * **Sólo en memoria, a propósito**: mueren con el proceso, que es exactamente
+   * lo que pide CA-8.6 ("dentro de la misma sesión del proceso"). Persistirlos
+   * significaría escribir en disco, sin cifrar, texto que el usuario decidió no
+   * mandar.
+   *
+   * Un borrador vacío NO deja entrada: el mapa tiene tantas claves como chats con
+   * algo escrito, casi siempre una.
+   */
+  drafts: Record<string, string>;
 };
 
 /** El mapa slice → snapshot. De acá salen `Slice` y `SnapshotOf`. */
@@ -161,6 +175,15 @@ export type Store = {
    * leerían las dos el mismo valor viejo y la segunda se perdería.
    */
   inboxUi(): Pick<UiSnapshot, "inboxFilter" | "inboxQuery" | "selectedJid">;
+  /** Guarda (o borra, con `""`) el borrador de un chat (CA-8.6). */
+  setDraft(jid: string | null, text: string): void;
+  /**
+   * El borrador EN VIVO, sin pasar por el snapshot cacheado. Mismo motivo que
+   * `inboxUi()`/`openChatJid()`: el composer lo lee al MONTARSE —justo después
+   * de un cambio de chat— y el snapshot todavía puede ser el del chat anterior
+   * (hasta 33 ms de atraso, D3).
+   */
+  draft(jid: string | null): string;
   /** Chat abierto: define la ventana del slice `convo` y a quién no sumarle no leídos. */
   setOpenChat(jid: string | null, opts?: { anchorId?: number | null }): void;
   openChatJid(): string | null;
@@ -206,6 +229,7 @@ export function createStore(opts: StoreOpts = {}): Store {
     inboxFilter: "all",
     inboxQuery: "",
     selectedJid: null,
+    drafts: {},
   };
   let abierto: string | null = null;
   let ancla: number | null = null;
@@ -378,6 +402,25 @@ export function createStore(opts: StoreOpts = {}): Store {
     inboxUi() {
       const { inboxFilter, inboxQuery, selectedJid } = ui;
       return { inboxFilter, inboxQuery, selectedJid };
+    },
+
+    setDraft(jid, text) {
+      if (!jid) return;
+      const valor = typeof text === "string" ? text : "";
+      if ((ui.drafts[jid] ?? "") === valor) return;
+      // Objeto NUEVO y no mutación: `construir("ui")` publica una copia
+      // SUPERFICIAL, así que mutando el mapa el snapshot ya publicado cambiaría
+      // por debajo y quien compare por identidad no vería nada (regla 3 del
+      // encabezado). Es un objeto de una o dos claves: copiarlo no cuesta nada.
+      const drafts = { ...ui.drafts };
+      if (valor === "") delete drafts[jid];
+      else drafts[jid] = valor;
+      ui.drafts = drafts;
+      markDirty("ui");
+    },
+
+    draft(jid) {
+      return jid ? (ui.drafts[jid] ?? "") : "";
     },
 
     setOpenChat(jid, o = {}) {

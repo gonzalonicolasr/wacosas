@@ -18,7 +18,7 @@ import { createRepo, VENTANA_DEFAULT, type Repo } from "../src/db/repo";
 import type { MessageRow } from "../src/db/types";
 import { commands, configureCommands, type CommandDeps } from "../src/state/commands";
 import { store } from "../src/state/store";
-import { Conversation, hayMasArriba } from "../src/ui/Conversation";
+import { Conversation, hayMasArriba, lejosDelFinal } from "../src/ui/Conversation";
 import { autorDe, estadoDe } from "../src/ui/MessageRow";
 
 const LOG = { info() {}, warn() {}, error() {}, path: "/tmp/wacosas-test.log" };
@@ -158,6 +158,29 @@ describe("autor de la fila (CA-6.2, CA-6.3)", () => {
   });
 });
 
+describe("a qué distancia del final quiso quedar el usuario (13b)", () => {
+  test("con el pin arriba del scroll manda lo que el usuario movió, no el hueco al final", () => {
+    // El caso medido: el lote entró (el contenido pasó de 50 a 98 líneas) y la
+    // tecla se aplicó sobre la posición VIEJA —33 → 30—. La cuenta ingenua
+    // diría 81-30 = 51 líneas, o sea 48 mensajes de regalo; lo que el usuario
+    // pidió fueron 3.
+    expect(lejosDelFinal(33, 30, 81)).toBe(3);
+  });
+
+  test("si scrolleó DESPUÉS del layout, el pin viejo queda abajo y vale la distancia al final", () => {
+    // Mismo lote, pero la tecla llegó con el layout ya hecho: el sticky lo había
+    // dejado en 81 y de ahí se movió tres líneas.
+    expect(lejosDelFinal(33, 78, 81)).toBe(3);
+  });
+
+  test("sin carrera las dos lecturas dan lo mismo, y nunca da negativo", () => {
+    expect(lejosDelFinal(40, 35, 40)).toBe(5);
+    // Scrolleó hacia ABAJO desde el pin (o el pin quedó viejo): nada que reponer.
+    expect(lejosDelFinal(40, 40, 40)).toBe(0);
+    expect(lejosDelFinal(0, 50, 40)).toBe(0);
+  });
+});
+
 describe("glifo de entrega", () => {
   test("sólo el ciclo de vida de un envío propio tiene glifo", () => {
     expect(estadoDe("received")).toBeNull();
@@ -249,6 +272,34 @@ async function esperar(ms: number) {
   });
 }
 
+/**
+ * Espera a que la conversación termine de montarse por LOTES (tarea 13b).
+ *
+ * El panel monta primero la cola —lo único que se ve— y deja entrar el resto de
+ * a `LOTE` filas con un `setTimeout(0)` en el medio, así que un `pintar()` solo
+ * deja la lista a medio montar. Los tests que tocan el scroll tienen que
+ * esperar a que esté entera: con el montaje en curso, la vuelta siguiente los ve
+ * "scrolleados" y dispara el rescate, que mueve la posición A PROPÓSITO.
+ *
+ * Se espera hasta que dejen de aparecer filas en vez de un tiempo fijo: los
+ * lotes son `setTimeout(0)` encadenados y cuánto tarda cada vuelta depende de la
+ * máquina (~13 ms acá). El `pintar` del final es para que el layout mida lo que
+ * entró.
+ */
+async function montarTodo(
+  t: { renderOnce: () => Promise<void> },
+  caja: RefObject<ScrollBoxRenderable | null>,
+) {
+  let previo = -1;
+  for (let i = 0; i < 40; i++) {
+    const n = caja.current?.getChildren().length ?? 0;
+    if (n === previo) break;
+    previo = n;
+    await esperar(30);
+  }
+  await pintar(t, 2);
+}
+
 const ANCHO = 46;
 const ALTO = 16;
 
@@ -319,6 +370,138 @@ describe("render de la conversación", () => {
     t.renderer.destroy();
   });
 
+  // ── montaje por lotes (tarea 13b) ─────────────────────────────────────────
+
+  test("abre montando SÓLO la cola y el resto entra por lotes, sin mover la vista", async () => {
+    // El costo de abrir un chat es el commit de React creando renderables: 500
+    // filas de un saque son ~700 ms en la aplicación real, y el 97 % es eso. Se
+    // monta la cola —lo único que se ve— y el resto entra después.
+    sembrar(repo, ANTO, 620);
+    store.markDirty("inbox");
+    commands.openChat(ANTO);
+    store.flushNow();
+    const t = await montar();
+
+    const montadas = () => (caja.current as ScrollBoxRenderable).getChildren().length;
+    // Un puñado de filas, no las 500 de la ventana.
+    expect(montadas()).toBeLessThan(VENTANA_DEFAULT / 2);
+    const primerFrame = filasDeMensaje(t.captureCharFrame());
+    expect(primerFrame[primerFrame.length - 1]).toContain("m número 619");
+    expect(alFinal()).toBe(true);
+
+    await montarTodo(t, caja);
+
+    // Ya está todo: las 500 filas + el aviso de arriba de la ventana, que
+    // aparece recién ahora —mientras entraban los lotes habría estado mintiendo
+    // ("lo anterior no se carga" justo cuando lo anterior está entrando)—.
+    expect(montadas()).toBe(VENTANA_DEFAULT + 1);
+    // Y la vista no se movió ni una línea: mismas filas, y sigue al final.
+    expect(filasDeMensaje(t.captureCharFrame())).toEqual(primerFrame);
+    expect(alFinal()).toBe(true);
+    t.renderer.destroy();
+  });
+
+  test("mientras se monta NO se prende el aviso de mensajes nuevos", async () => {
+    // El montaje hace crecer `scrollHeight` hacia arriba sin que llegue nada:
+    // sin la guarda, el muestreo lo lee como "el usuario se fue del final" y
+    // prende el badge de la nada.
+    sembrar(repo, ANTO, 620);
+    store.markDirty("inbox");
+    commands.openChat(ANTO);
+    store.flushNow();
+    const t = await montar();
+
+    // Se pinta y se deja correr el muestreo (200 ms) con los lotes entrando.
+    for (let i = 0; i < 4; i++) {
+      await pintar(t, 1);
+      await esperar(70);
+      expect(t.captureCharFrame()).not.toContain("mensajes nuevos");
+    }
+    await montarTodo(t, caja);
+    await esperar(260);
+    await pintar(t);
+
+    expect(t.captureCharFrame()).not.toContain("mensajes nuevos");
+    expect(alFinal()).toBe(true);
+    t.renderer.destroy();
+  });
+
+  test("si el usuario scrollea EN MEDIO del montaje, lo dejan donde pidió", async () => {
+    // Sin rescate, cada lote que entra arriba le corre la lectura hacia atrás:
+    // en la aplicación real, tres `⇧↑` a los 150 ms de abrir terminaban 400
+    // mensajes más arriba. El panel tiene que montar el resto de un saque y
+    // devolverlo a las tres líneas del final que pidió.
+    sembrar(repo, ANTO, 620);
+    store.markDirty("inbox");
+    commands.openChat(ANTO);
+    store.flushNow();
+    const t = await montar();
+    const c = caja.current as ScrollBoxRenderable;
+    expect(c.getChildren().length).toBeLessThan(VENTANA_DEFAULT);
+
+    // Tres `⇧↑`: es lo que hace `App` con la caja (§7.3), sin pasar por React.
+    c.scrollBy(-3);
+    // El rescate son tres pasos con un frame de espera entre medio, y el layout
+    // sólo corre cuando se pinta.
+    for (let i = 0; i < 12; i++) {
+      await esperar(30);
+      await pintar(t, 1);
+    }
+
+    expect(c.getChildren().length).toBe(VENTANA_DEFAULT + 1);
+    // Tres líneas del final, ni una más: ni pegado abajo ni 48 filas más arriba.
+    expect(Math.max(0, c.scrollHeight - c.viewport.height) - c.scrollTop).toBe(3);
+    expect(alFinal()).toBe(false);
+    // Y no llegó nada, así que tampoco hay aviso que mostrar.
+    expect(t.captureCharFrame()).not.toContain("mensajes nuevos");
+    t.renderer.destroy();
+  });
+
+  test("un mensaje que llega EN MEDIO del montaje entra igual y queda a la vista", async () => {
+    // Las filas montadas se cuentan desde el PRINCIPIO de la lista justamente
+    // por esto: lo que llega se appendea, y con un contador desde el final cada
+    // entrante le comería una fila al borde de arriba de lo montado.
+    sembrar(repo, ANTO, 620);
+    store.markDirty("inbox");
+    commands.openChat(ANTO);
+    store.flushNow();
+    const t = await montar();
+
+    entra(repo, ANTO, "en-medio", "llegó mientras montaba", 1_700_000_000 + 620 * 60);
+    await pintar(t);
+    await montarTodo(t, caja);
+    await esperar(260);
+    await pintar(t);
+
+    const frame = t.captureCharFrame();
+    expect(frame).toContain("llegó mientras montaba");
+    expect(frame).not.toContain("mensajes nuevos");
+    expect(alFinal()).toBe(true);
+    t.renderer.destroy();
+  });
+
+  test("con ancla NO se lotea: la ventana entra entera de una", async () => {
+    // Con ancla el `stickyScroll` va apagado (si no, el primer layout se come el
+    // salto), así que meter filas arriba SÍ correría la vista; y al soltarla hay
+    // un `scrollChildIntoView` a una fila vieja que tiene que existir.
+    sembrar(repo, ANTO, 900);
+    const ancla = repo.lastMessages(ANTO, 900)[300] as MessageRow;
+    store.markDirty("inbox");
+    commands.openChat(ANTO, { anchorId: ancla.id });
+    store.flushNow();
+    const t = await montar();
+
+    const ventana = store.getSnapshot("convo").messages.length;
+    expect(ventana).toBeGreaterThan(200);
+    expect((caja.current as ScrollBoxRenderable).getChildren().length).toBe(ventana + 1);
+    await esperar(80);
+    await pintar(t);
+    // El salto quedó donde tenía que quedar y el ancla no se soltó sola.
+    expect(t.captureCharFrame()).toContain(`m número ${300}`);
+    expect(store.getSnapshot("convo").anchorId).toBe(ancla.id);
+    t.renderer.destroy();
+  });
+
   test("al angostar la terminal las filas RE-ENVUELVEN (CA-19.4)", async () => {
     // Regresión: `MessageRow` está memoizada por CAMPOS y el comparador no
     // miraba `ancho`, así que al redimensionar el panel se re-maquetaba pero las
@@ -371,6 +554,7 @@ describe("render de la conversación", () => {
     commands.openChat(ANTO);
     store.flushNow();
     const t = await montar();
+    await montarTodo(t, caja); // 13b: el scroll de abajo tiene que ser del usuario, no del lote
 
     // Scroll bien arriba en el primer chat.
     caja.current?.scrollTo(0);
@@ -397,6 +581,7 @@ describe("render de la conversación", () => {
     commands.openChat(ANTO);
     store.flushNow();
     const t = await montar();
+    await montarTodo(t, caja); // 13b: con el montaje en curso, scrollear dispara el rescate
 
     caja.current?.scrollTo(20);
     await pintar(t);
@@ -425,6 +610,7 @@ describe("render de la conversación", () => {
     commands.openChat(ANTO);
     store.flushNow();
     const t = await montar();
+    await montarTodo(t, caja); // 13b: con el montaje en curso, scrollear dispara el rescate
 
     caja.current?.scrollTo(30);
     await pintar(t);
@@ -465,6 +651,7 @@ describe("render de la conversación", () => {
     commands.openChat(ANTO);
     store.flushNow();
     const t = await montar();
+    await montarTodo(t, caja); // 13b: con el montaje en curso, scrollear dispara el rescate
 
     caja.current?.scrollTo(30);
     await pintar(t);
@@ -708,6 +895,7 @@ describe("render de la conversación", () => {
     commands.openChat(ANTO);
     store.flushNow();
     const t = await montar();
+    await montarTodo(t, caja); // 13b: con el montaje en curso, scrollear dispara el rescate
     const abajo = caja.current?.scrollTop as number;
 
     await act(async () => {

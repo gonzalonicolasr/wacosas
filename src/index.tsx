@@ -215,6 +215,7 @@ if (qrPngPath) {
 
 // ── máquina (después del render: baileys tarda en cargar) ────────────────────
 const { createIngest } = await import("./wa/ingest");
+const { createSendQueue } = await import("./wa/send");
 const { createWaController } = await import("./wa/socket");
 
 let wa: import("./wa/socket").WaController;
@@ -225,9 +226,29 @@ const ingest = createIngest({
   selfJid: () => wa?.selfJid() ?? "",
   openChatJid: () => store.openChatJid(),
 });
-wa = createWaController({ ingest, store, log, credsDir: paths.credsDir });
+// La cola de envío y el controlador se necesitan MUTUAMENTE (la cola le pide el
+// socket; el socket le pide el `getMessage` de §8.6), así que la cola lo lee a
+// través de funciones —el mismo patrón que ya usa el ingest con `selfJid`— y no
+// se queda con una referencia que todavía no existe.
+const send = createSendQueue({
+  repo,
+  store,
+  log,
+  wa: {
+    isOpen: () => wa?.isOpen() ?? false,
+    socket: () => wa?.socket() ?? null,
+    selfJid: () => wa?.selfJid() ?? "",
+  },
+});
+wa = createWaController({
+  ingest,
+  store,
+  log,
+  credsDir: paths.credsDir,
+  getMessage: send.getMessage,
+});
 
-configureCommands({ repo, wa, store, log, shutdown });
+configureCommands({ repo, wa, store, log, send, shutdown });
 
 log.info("boot.listo", { version, db: paths.dbPath, ms: Math.round(performance.now()) });
 wa.start();

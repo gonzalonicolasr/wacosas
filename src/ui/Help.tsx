@@ -42,12 +42,14 @@ const ATAJOS_BANDEJA: Array<[string, string]> = [
   ["Esc", "limpiar el buscador"],
 ];
 
-// Una sola fila, apretada a propósito: cada atajo nuevo empuja la ayuda un
-// renglón más allá del alto de una terminal chica, y a 80×19 dos filas la
-// habrían mandado al scroll. La columna de teclas mide 16 (`COL`) y
-// `⇧↑↓ ⇧PgUp/PgDn` entra justo.
+// Dos filas, apretadas a propósito: cada atajo nuevo empuja la ayuda un renglón
+// más allá del alto de una terminal chica. La columna de teclas mide 16 (`COL`) y
+// `⇧↑↓ ⇧PgUp/PgDn` entra justo. Las cinco teclas de redacción (tarea 14) van
+// JUNTAS en un renglón por lo mismo: sumarlas de a una habría mandado la ayuda al
+// scroll también a 80×20.
 const ATAJOS_CONVO: Array<[string, string]> = [
   ["⇧↑↓ ⇧PgUp/PgDn", "scrollear el chat · ⇧Inicio ⇧Fin a las puntas"],
+  ["^E ⏎ Alt-⏎ ^Y", "escribir · enviar · salto de línea · reintentar"],
 ];
 
 const ATAJOS_MINI: Array<[string, string]> = [

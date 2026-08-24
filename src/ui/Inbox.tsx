@@ -170,7 +170,19 @@ function Vacio({ texto, ancho }: { texto: string; ancho: number }) {
   );
 }
 
-export function Inbox({ ancho, alto }: { ancho: number; alto: number }) {
+export function Inbox({
+  ancho,
+  alto,
+  // El buscador está enfocado SIEMPRE (CA-5.1) menos cuando el foco se lo lleva
+  // el campo de redacción (tarea 14): OpenTUI tiene un solo renderable enfocado,
+  // y como el reconciliador sólo aplica `focused` cuando la prop CAMBIA, tener
+  // acá un `true` fijo dejaba a la bandeja sin foco al volver de redactar.
+  enfocado = true,
+}: {
+  ancho: number;
+  alto: number;
+  enfocado?: boolean;
+}) {
   const inbox = useSlice("inbox");
   const ui = useSlice("ui");
   const campo = useRef<InputRenderable | null>(null);
@@ -269,7 +281,7 @@ export function Inbox({ ancho, alto }: { ancho: number; alto: number }) {
         <box flexGrow={1} flexShrink={1}>
           <input
             ref={campo}
-            focused
+            focused={enfocado}
             placeholder="filtrar…"
             keyBindings={SIN_CTRL_K}
             backgroundColor={ELEVATED}

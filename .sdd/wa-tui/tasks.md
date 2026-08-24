@@ -448,6 +448,17 @@
   - depends-on: 13
 
 - [ ] 17. Implementar instancia única y cierre ordenado
+  - ⚠️ **abierto por la tarea 14 — el foco se lo roba el mouse sin que `App` se entere**: el renderer
+    se crea con `autoFocus` (default `true`), así que un click izquierdo enfoca el primer ancestro
+    focusable. El `<scrollbox>` de la conversación **es** focusable ⇒ **clickear la conversación le
+    saca el foco al buscador de la bandeja y al composer**, y el modo sigue diciendo `compose` con el
+    campo muerto hasta apretar `Ctrl-E` de nuevo. Ya pasaba antes de la 14 con el buscador. Se
+    arregla con `autoFocus:false` en el renderer (que es tuyo, `index.tsx`) o con un listener del
+    evento `blurred`.
+  - ⚠️ **también de la 14**: `SendQueue` **no tiene `stop()`** (§5.8 no lo define). Para el apagado
+    ordenado necesitás que el worker deje de aceptar trabajo: agregalo, o usá `inFlight()` + marcar
+    `failed` como dice §6.6. Y acordate del orden: `store.stop()` va **al final**, después de parar
+    el drenador del ingest y este worker.
   - covers: CA-17.1, CA-17.2, CA-17.3, CA-17.4, CA-17.5, CA-17.6, CA-17.7, CA-18.1, CA-18.2,
     CA-18.3, CA-18.4, RNF-11 (un proceso por directorio de datos)
   - files: `src/boot/lock.ts`, `src/boot/shutdown.ts`, `src/index.tsx` (acquire antes de abrir el

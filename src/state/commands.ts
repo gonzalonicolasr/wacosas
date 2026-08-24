@@ -8,13 +8,14 @@
 // Ningún comando lanza: la interfaz no tiene dónde atajar una excepción y una que
 // se escape en un handler de teclado se lleva puesto el render.
 //
-// Hoy están los del esqueleto (tarea 9), los de vinculación (tarea 10) y los de
-// la bandeja —selección, filtro y buscador— (tarea 12). Los de envío (`send`,
-// `retrySend`) los agrega la tarea 14 y la búsqueda global la 16.
+// Hoy están los del esqueleto (tarea 9), los de vinculación (tarea 10), los de
+// la bandeja —selección, filtro y buscador— (tarea 12) y los de envío (tarea
+// 14). La búsqueda global la agrega la 16.
 import type { Logger } from "../boot/log";
 import type { Repo } from "../db/repo";
 import type { ChatRow } from "../db/types";
 import { fold } from "../lib/fmt";
+import type { SendQueue } from "../wa/send";
 import type { WaController } from "../wa/socket";
 import type { InboxFilter, LinkSnapshot, Store } from "./store";
 
@@ -23,6 +24,12 @@ export type CommandDeps = {
   wa: WaController;
   store: Store;
   log: Logger;
+  /**
+   * Cola de envío (tarea 14). Es opcional para que los tests de interfaz que no
+   * mandan nada no tengan que armar una: sin ella, `send` avisa en vez de
+   * romper. En producción SIEMPRE viene (la cablea el entry).
+   */
+  send?: SendQueue;
   /**
    * Cierre del proceso. Hoy es el mínimo que deja la terminal usable; la tarea 17
    * lo reemplaza por el apagado ordenado de §6.6 sin tocar a los llamadores.
@@ -199,6 +206,17 @@ export type Commands = {
   openSelectedChat(): void;
   /** Marca leído SOLO en local; el recibo a WhatsApp lo agrega la tarea 15 (CA-11.3). */
   markRead(jid: string): void;
+  /**
+   * Manda un texto al chat (CA-8.2). Devuelve el motivo cuando NO se mandó, para
+   * que el composer sepa que tiene que conservar el texto (CA-8.7).
+   */
+  send(jid: string, text: string): Resultado;
+  /**
+   * Reintenta un envío fallado (`Ctrl-Y`, CA-9.3). Sin argumentos toma el ÚLTIMO
+   * `failed` del chat abierto, que es lo que hace la tecla: la interfaz no tiene
+   * por qué salir a buscar cuál era.
+   */
+  retrySend(chatJid?: string, waId?: string): Resultado;
   /** Pone el cursor sobre un chat (click, CA-5.6). */
   selectChat(jid: string): void;
   /** Mueve el cursor `delta` filas dentro de la lista VISIBLE, sin dar la vuelta (CA-5.3, CA-5.7). */
@@ -329,6 +347,52 @@ export const commands: Commands = {
     const ultimo = deps.repo.lastMessages(jid, 1)[0];
     deps.repo.clearUnread(jid, ultimo ? ultimo.id : chat.lastReadId);
     deps.store.markDirty("inbox");
+  },
+
+  send(jid, text) {
+    const d = deps;
+    if (!d) return { ok: false, reason: "todavía no arrancó la aplicación" };
+    if (!d.send) return { ok: false, reason: "el envío todavía no está disponible" };
+    const r = d.send.enqueue(jid, text);
+    if (r.ok) {
+      // El borrador se suelta recién cuando el mensaje YA está en la base: si el
+      // envío se rechaza (CA-8.7), el texto tiene que seguir en el campo.
+      d.store.setDraft(jid, "");
+      return { ok: true };
+    }
+    // CA-8.7: el rechazo se AVISA. Sin esto, apretar `⏎` sin conexión no hace
+    // nada visible y parece que la tecla no anduvo.
+    d.store.toast(r.reason);
+    d.log.warn("send.rechazado", { motivo: r.reason });
+    return { ok: false, reason: r.reason };
+  },
+
+  retrySend(chatJid, waId) {
+    const d = deps;
+    if (!d) return { ok: false, reason: "todavía no arrancó la aplicación" };
+    // TODOS los caminos avisan por el pie, incluidos los de "no había nada que
+    // reintentar": una tecla que a veces no hace NADA visible parece rota.
+    const avisar = (motivo: string): Resultado => {
+      d.store.toast(motivo);
+      return { ok: false, reason: motivo };
+    };
+    if (!d.send) return avisar("el envío todavía no está disponible");
+    const jid = chatJid || d.store.openChatJid();
+    if (!jid) return avisar("no hay ningún chat abierto");
+    // Sin `waId` explícito: el último fallado de ese chat. `openSends` sale del
+    // índice parcial de `status IN ('pending','failed')`, así que es una lista
+    // corta aunque la base tenga 50.000 mensajes.
+    let id = waId ?? "";
+    if (!id) {
+      for (const m of d.repo.openSends()) {
+        if (m.chatJid === jid && m.status === "failed") id = m.waId;
+      }
+    }
+    if (!id) return avisar("no hay ningún envío fallado en este chat");
+    const r = d.send.retry(jid, id);
+    if (!r.ok) return avisar(r.reason);
+    d.store.toast("reintentando el envío…");
+    return { ok: true };
   },
 
   reconnectNow() {

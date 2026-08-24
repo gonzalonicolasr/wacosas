@@ -2,7 +2,7 @@
 // el scroll pegado al final y el aviso de mensajes nuevos cuando el usuario está
 // leyendo más arriba.
 //
-// Seis decisiones que gobiernan este archivo:
+// Siete decisiones que gobiernan este archivo:
 //
 //  1. **El scroll lo maneja el `<scrollbox>`, no nosotros** (V7). `stickyScroll`
 //     + `stickyStart="bottom"` dan gratis las dos mitades de CA-6.4: mientras el
@@ -34,7 +34,21 @@
 //     que es absoluto, deja de apuntar a lo mismo. Mientras `!alFinal()` la lista
 //     local se congela y sólo se le appendea lo nuevo; al volver al final se
 //     resincroniza con el store.
+//  7. **Las filas se montan por LOTES, de abajo hacia arriba** (tarea 13b). Abrir
+//     un chat de 909 mensajes costaba ~700 ms, y el **97 %** era el commit de
+//     React creando los renderables de OpenTUI (~0,2 ms cada uno × 7 por fila ×
+//     500 filas); SQLite son 1-4 ms y el layout+dibujo, 7-19 ms. Virtualizar no
+//     es opción: el `viewportCulling` del `<scrollbox>` saltea el DIBUJO, no la
+//     CREACIÓN (medido: 695 ms igual), y las filas tienen alto variable —wrap por
+//     palabra—, así que a mano no hay `scrollHeight` que calcular. Lo que sí se
+//     puede es montar primero lo ÚNICO que se ve —la cola— y dejar entrar el
+//     resto de a `LOTE` filas con `setTimeout(0)` en el medio, como el drenador
+//     del ingest (D4). El `stickyStart="bottom"` hace que crecer hacia ARRIBA no
+//     mueva la vista, así que el usuario ya está leyendo mientras se termina de
+//     montar. El camino ANCLADO no se lotea (ahí `stickyScroll` está apagado y
+//     prependear filas sí correría la vista).
 import type { ScrollBoxRenderable } from "@opentui/core";
+import { useTerminalDimensions } from "@opentui/react";
 import type { RefObject } from "react";
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 
@@ -62,6 +76,31 @@ const MUESTREO_MS = 200;
 
 /** Un frame y monedas: lo que tarda el layout en darle una `y` real a una fila nueva. */
 const RETARDO_SALTO_MS = 40;
+
+/**
+ * Filas que entran por vuelta cuando la conversación se monta por lotes
+ * (decisión 7).
+ *
+ * Medido en el chat de 909 mensajes del arnés (`tools/demo.tsx`, ventana llena
+ * de 500 filas) con `capture-pane` hasta el primer cambio del pane: montar todo
+ * de una tardaba 679-703 ms; de a 48, **95-105 ms**. El montaje COMPLETO tarda
+ * un poco más en total —entre 0,6 s y 1 s, medido apretando `⇧Inicio` a
+ * distintos tiempos: a los 0,6 s todavía falta, al segundo ya está—, pero
+ * ocurre detrás del usuario, que hace rato está leyendo la cola.
+ *
+ * El tamaño sale de dos presiones opuestas: más chico baja el primer frame (de
+ * a 25 el revisor midió 84 ms) pero alarga el montaje total, y más grande deja
+ * un salto más feo si el usuario scrollea justo en el medio (el rescate de acá
+ * abajo lo arregla, pero el frame malo que se dibuja antes es de un lote).
+ */
+const LOTE = 48;
+
+/**
+ * Cuántas veces se espera al layout antes de reponer la lectura tras montar el
+ * resto de la conversación de un saque. A `RETARDO_SALTO_MS` cada uno son ~200
+ * ms de paciencia: de sobra para el frame que sigue a un commit de 500 filas.
+ */
+const INTENTOS_REPOSICION = 5;
 
 /**
  * Columnas que se le restan al panel para saber cuánto mide una fila: el padding
@@ -129,6 +168,28 @@ export function fusionarVentana(previa: Mensaje[], ventana: Mensaje[]): Mensaje[
   return prefijo.length === 0 ? ventana : [...prefijo, ...ventana];
 }
 
+/**
+ * A cuántas líneas del final QUISO quedar el usuario cuando movió el scroll con
+ * el montaje por lotes a medio camino (decisión 7).
+ *
+ * No alcanza con `scrollHeight - viewport - scrollTop`, y el porqué es una
+ * carrera fina, medida con el arnés: el commit de React mete las filas del lote,
+ * pero el `scrollTop` recién se re-pega abajo cuando corre el LAYOUT, que es del
+ * renderer. Si la tecla cae en el medio, el `scrollBy(-1)` de OpenTUI se aplica
+ * sobre la posición VIEJA y después el layout ve un scroll "manual" y ya no lo
+ * mueve: el usuario pidió tres líneas y quedó a 51 del final —justo el alto del
+ * lote— (medido: `top` 33 → 30 mientras el contenido pasaba de 50 a 98 líneas).
+ *
+ * Como en el lote anterior el scroll SÍ estaba pegado abajo, lo que el usuario
+ * movió es la diferencia contra ese pin. Si en cambio scrolleó después del
+ * layout, su referencia ya es la nueva y el pin viejo queda por debajo: ahí vale
+ * la distancia al final de siempre. Las dos lecturas dan lo mismo cuando no hay
+ * carrera.
+ */
+export function lejosDelFinal(pin: number, top: number, max: number): number {
+  return Math.max(0, pin > top ? pin - top : max - top);
+}
+
 /** El aviso de arriba de todo: qué hay —o qué no hay— antes del primer mensaje. */
 function Tope({ lleno, ancho }: { lleno: boolean; ancho: number }) {
   const texto = lleno
@@ -184,6 +245,19 @@ function Panel({ ancho, cajaRef }: PropsConversacion) {
   const ultimoId = ventana.length > 0 ? (ventana[ventana.length - 1] as Mensaje).id : 0;
   const anchoFila = Math.max(1, ancho - RESERVA_FILA);
 
+  /**
+   * Cuántas filas entran en el PRIMER lote (decisión 7).
+   *
+   * Tiene que tapar el panel entero: si entra menos contenido del que mide el
+   * viewport, el `<scrollbox>` lo apoya ARRIBA y las filas se ven bajar mientras
+   * llegan los lotes siguientes. Cada fila ocupa como mínimo una línea, así que
+   * con tantas filas como líneas tiene la terminal alcanza y sobra —el panel
+   * siempre es más bajo que la terminal, que además trae header y pie—. El alto
+   * se pide acá y no se recibe por props porque `App` sólo pasa el ancho.
+   */
+  const { height: altoTerminal } = useTerminalDimensions();
+  const arranque = Math.max(LOTE, altoTerminal + 2);
+
   /** Mensaje señalado por el salto de la búsqueda (CA-12.3). */
   const [marcado, setMarcado] = useState<number | null>(null);
   /** Cuántos mensajes entraron desde que el usuario dejó de mirar el final. */
@@ -228,6 +302,41 @@ function Panel({ ancho, cajaRef }: PropsConversacion) {
    * antes de saltar, porque la caja recién montada dice estar "al final".
    */
   const saltoPendienteRef = useRef(false);
+  /**
+   * Índice de la primera fila MONTADA: todo lo anterior todavía no existe como
+   * renderable (decisión 7). `0` = ya está montada la conversación entera.
+   *
+   * Es un índice desde el PRINCIPIO de la lista y no un contador desde el final
+   * a propósito: los mensajes que llegan mientras se monta se appendean, y con
+   * un contador desde el final cada entrante le comería una fila al borde de
+   * arriba —desmontando lo que el usuario podría estar mirando—.
+   */
+  const desdeRef = useRef(convo.anchorId === null ? Math.max(0, ventana.length - arranque) : 0);
+  /**
+   * Vueltas del montaje por lotes. No se lee en ningún lado: está para repintar
+   * cuando `desdeRef` avanza y para volver a disparar el efecto del lote
+   * siguiente (la verdad de qué se pinta vive en la ref, que se decide durante
+   * el render como todo lo demás de este archivo).
+   */
+  const [vuelta, setVuelta] = useState(0);
+  /**
+   * El rescate en curso cuando el usuario mueve el scroll con el montaje a
+   * medio camino (ver el efecto del lote). Guarda a cuántas líneas del final
+   * quiso quedar (`lejos`) y, una vez montado el resto, cuánto medía el
+   * contenido justo antes de montarlo (`alto`, `null` mientras no se montó).
+   *
+   * Se guarda la distancia AL FINAL y no el `scrollTop`: el `scrollTop` es
+   * absoluto y todo lo que entra arriba se lo corre, que es justamente el
+   * problema; el final, en cambio, no se mueve mientras se monta —sólo se
+   * agregan filas ARRIBA—. El `alto` es para saber si el layout ya midió.
+   */
+  const rescateRef = useRef<{ lejos: number; alto: number | null } | null>(null);
+  /**
+   * Dónde dejó el `stickyScroll` al scroll en el último lote, o sea la posición
+   * que el usuario tenía delante cuando apretó la tecla. Es la referencia de
+   * `lejosDelFinal`.
+   */
+  const pinRef = useRef(0);
 
   ultimoIdRef.current = ultimoId;
   marcadoRef.current = marcado;
@@ -249,8 +358,19 @@ function Panel({ ancho, cajaRef }: PropsConversacion) {
   if (claveRef.current.jid !== jid || claveRef.current.ancla !== convo.anchorId) {
     // Otro chat, o la ventana pasó a anclada (o volvió del ancla): no hay nada
     // que conservar, la lista se rehace con lo que publicó el store.
+    const chatNuevo = claveRef.current.jid !== jid;
     claveRef.current = { jid, ancla: convo.anchorId };
     mensajes = ventana;
+    // ⚠️ El loteo es SÓLO para el camino del final al ABRIR un chat. Con ancla
+    // —el salto de la búsqueda, CA-12.3— `stickyScroll` está apagado y meter
+    // filas arriba SÍ corre la vista; y al SOLTARLA hay un `scrollChildIntoView`
+    // a una fila vieja, que si no está montada no encuentra nada y no scrollea.
+    // Los dos caminos raros se montan de una, como antes.
+    desdeRef.current = chatNuevo && convo.anchorId === null ? Math.max(0, mensajes.length - arranque) : 0;
+    // Un rescate a medio hacer es de la lista VIEJA: aplicarlo acá movería el
+    // scroll de una conversación que el usuario recién abre.
+    rescateRef.current = null;
+    pinRef.current = 0;
   } else if (ventana === ventanaRef.current) {
     // Re-render por otra cosa (una tecla, el badge): misma lista y MISMA
     // identidad, si no las 500 filas se repintarían por nada.
@@ -261,6 +381,13 @@ function Panel({ ancho, cajaRef }: PropsConversacion) {
   vistaRef.current = mensajes;
   ventanaRef.current = ventana;
   mensajesRef.current = mensajes;
+
+  // El montaje puede quedar apuntando fuera de una lista que se ACORTÓ (volver
+  // del congelado de `fusionarVentana` a la ventana pelada del store).
+  if (desdeRef.current > mensajes.length) desdeRef.current = mensajes.length;
+  const desde = desdeRef.current;
+  /** Las filas que existen como renderable hoy: la cola primero, el resto por lotes. */
+  const visibles = desde === 0 ? mensajes : mensajes.slice(desde);
 
   /**
    * ¿La caja ya tiene medidas de verdad?
@@ -293,6 +420,12 @@ function Panel({ ancho, cajaRef }: PropsConversacion) {
     // daría "estoy al final" y se perdería la cuenta del aviso. El muestreo la
     // vuelve a mirar apenas el salto se ejecuta.
     if (saltoPendienteRef.current) return;
+    // Lo mismo mientras se monta por lotes (decisión 7): el contenido crece
+    // hacia ARRIBA en cada vuelta, así que `scrollHeight` sube sin que el
+    // usuario haya tocado nada y la caja parece haberse ido del final. Sin esta
+    // guarda se prendía el aviso de mensajes nuevos sin que hubiera llegado
+    // nada. El muestreo vuelve a mirar apenas termina de montar.
+    if (false && desdeRef.current > 0) return;
     const lista = mensajesRef.current;
     let n = 0;
     if (alFinal()) {
@@ -321,6 +454,49 @@ function Panel({ ancho, cajaRef }: PropsConversacion) {
         cajaRef.current?.scrollChildIntoView(idFila(id));
         saltoPendienteRef.current = false;
       }, RETARDO_SALTO_MS);
+      return () => {
+        clearTimeout(t);
+        saltoPendienteRef.current = false;
+      };
+    },
+    [cajaRef],
+  );
+
+  /**
+   * Devuelve la vista a `lejos` líneas del final, una vez que el layout midió
+   * lo que se acaba de montar de golpe (decisión 7).
+   *
+   * Mismo truco que `saltarA`: el alto de una fila recién montada no existe
+   * hasta que corre el LAYOUT, que es del renderer y no del commit de React. Se
+   * reintenta mientras el contenido siga midiendo lo mismo que antes —montar 450
+   * filas de una deja al renderer bastante atrasado— y se corta a los
+   * `INTENTOS_REPOSICION` para no quedar mirando una caja que no cambia más.
+   */
+  const reponerLectura = useCallback(
+    (lejos: number, alto: number): (() => void) => {
+      saltoPendienteRef.current = true;
+      let t: ReturnType<typeof setTimeout>;
+      const probar = (quedan: number): void => {
+        t = setTimeout(() => {
+          const c = cajaRef.current;
+          if (!c) {
+            saltoPendienteRef.current = false;
+            return;
+          }
+          const midio = c.scrollHeight !== alto;
+          if (!midio && quedan > 0) {
+            probar(quedan - 1);
+            return;
+          }
+          // Si el layout nunca llegó a medir, se lo deja pegado al final —donde
+          // el `stickyScroll` lo va a poner solo en cuanto mida— y no en una
+          // posición que ya no significa nada.
+          const max = Math.max(0, c.scrollHeight - c.viewport.height);
+          c.scrollTo(midio ? Math.max(0, max - lejos) : max);
+          saltoPendienteRef.current = false;
+        }, RETARDO_SALTO_MS);
+      };
+      probar(INTENTOS_REPOSICION);
       return () => {
         clearTimeout(t);
         saltoPendienteRef.current = false;
@@ -419,6 +595,71 @@ function Panel({ ancho, cajaRef }: PropsConversacion) {
     return cancelarSalto;
   }, [jid, mensajes, convo.anchorId, revisar, saltarA]);
 
+  // ── montaje por lotes (decisión 7) ────────────────────────────────────────
+  // Una vuelta por `setTimeout(0)`, igual que el drenador del ingest (D4): entre
+  // lote y lote el event loop respira, así que la tecla que apretás mientras se
+  // termina de montar se atiende (RNF-5). El `stickyStart="bottom"` se encarga de
+  // que las filas que entran ARRIBA no muevan lo que se está leyendo.
+  //
+  // ⚠️ …mientras el scroll esté pegado al final. **Si el usuario lo movió, el
+  // `stickyScroll` se apaga solo** (OpenTUI marca el scroll como manual) y cada
+  // lote que entra arriba le corre la lectura hacia atrás: medido en el arnés,
+  // tres `⇧↑` a los 150 ms de abrir terminaban 400 mensajes más arriba, con el
+  // texto pasando solo durante un segundo. Por eso la vuelta empieza mirando la
+  // posición, y cuando el usuario toma el control se lo RESCATA en tres pasos:
+  //
+  //   1. se corrige la vista con lo que ya está montado —`lejosDelFinal` sabe
+  //      cuánto quiso moverse—, así el frame que queda mientras se monta el
+  //      resto es el que él pidió y no el que le corrió el lote;
+  //   2. un frame después (para eso el `RETARDO_SALTO_MS`, si no el commit se
+  //      come el paso 1 sin que se llegue a dibujar) entra TODO lo que falta de
+  //      un saque: un tirón de ~400 ms, lo que costaba abrir un chat antes de
+  //      esta tarea, y ni un lote más que le corra la lectura;
+  //   3. medido el layout, se lo devuelve a la misma distancia del final.
+  //
+  // Queda un parpadeo de un frame entre 2 y 3 —el layout dibuja una vez con el
+  // contenido nuevo y el `scrollTop` viejo—: medido, 48 ms. Es el precio de que
+  // el layout viva en el renderer y no en el commit de React.
+  useEffect(() => {
+    const rescate = rescateRef.current;
+
+    // Paso 3: ya está todo montado y falta devolver la vista.
+    if (rescate !== null && rescate.alto !== null) {
+      rescateRef.current = null;
+      return reponerLectura(rescate.lejos, rescate.alto);
+    }
+    if (desdeRef.current === 0) return;
+
+    // Paso 2: la vista corregida ya se dibujó; entra todo lo que falta.
+    if (rescate !== null) {
+      const t = setTimeout(() => {
+        const c = cajaRef.current;
+        rescateRef.current = { lejos: rescate.lejos, alto: c ? c.scrollHeight : 0 };
+        desdeRef.current = 0;
+        setVuelta((v) => v + 1);
+      }, RETARDO_SALTO_MS);
+      return () => clearTimeout(t);
+    }
+
+    const t = setTimeout(() => {
+      const c = cajaRef.current;
+      if (c && !alFinal()) {
+        // Paso 1: el usuario tomó el control.
+        const max = Math.max(0, c.scrollHeight - c.viewport.height);
+        const lejos = lejosDelFinal(pinRef.current, c.scrollTop, max);
+        c.scrollTo(Math.max(0, max - lejos));
+        rescateRef.current = { lejos, alto: null };
+      } else {
+        // El pin es la posición que el usuario tiene DELANTE mientras entra el
+        // lote: la referencia contra la que se mide su próxima tecla.
+        if (c) pinRef.current = c.scrollTop;
+        desdeRef.current = Math.max(0, desdeRef.current - LOTE);
+      }
+      setVuelta((v) => v + 1);
+    }, 0);
+    return () => clearTimeout(t);
+  }, [jid, mensajes, vuelta, alFinal, cajaRef, reponerLectura]);
+
   // ── muestreo de la posición ───────────────────────────────────────────────
   useEffect(() => {
     if (jid === null) return;
@@ -465,13 +706,17 @@ function Panel({ ancho, cajaRef }: PropsConversacion) {
         backgroundColor={SURFACE}
         contentOptions={{ flexDirection: "column", paddingLeft: 1, paddingRight: 1 }}
       >
-        <Tope lleno={hayMasArriba(mensajes, convo.anchorId)} ancho={anchoFila} />
+        {/* Mientras se monta por lotes, el borde de arriba de lo montado NO es
+            el principio de la ventana: el aviso diría "lo anterior no se carga"
+            justo cuando está entrando lo anterior. Aparece al terminar, y como
+            crece hacia arriba no mueve la vista. */}
+        {desde === 0 ? <Tope lleno={hayMasArriba(mensajes, convo.anchorId)} ancho={anchoFila} /> : null}
         {mensajes.length === 0 ? (
           <text fg={MUT} wrapMode="none">
             {clip("todavía no hay mensajes en este chat", Math.max(0, anchoFila))}
           </text>
         ) : (
-          mensajes.map((m) => (
+          visibles.map((m) => (
             <MessageRow
               key={m.id}
               msg={m}

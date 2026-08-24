@@ -124,11 +124,44 @@ store.setConn({ state: "open" });
 
 const renderer = await createCliRenderer({ exitOnCtrlC: false, exitSignals: [] });
 const log = { info() {}, warn() {}, error() {}, path: "/tmp/wacosas-demo13.log" };
+
+// ── envío (tarea 14) ────────────────────────────────────────────────────────
+// La cola de envío REAL contra un socket FALSO: ⚠️ la cuenta de Gon está
+// vinculada, así que un envío de prueba le llegaría a alguien de verdad. El
+// doble anota lo que "manda" y responde como WhatsApp (misma key, mismo id), así
+// el camino completo —fila optimista `⏳`, rate limit, `✓`— se ve en pantalla sin
+// tocar la red.
+//
+//   WACOSAS_DEMO_OFFLINE=1  ⇒ la conexión figura cerrada (CA-8.7)
+const { createSendQueue } = await import(`${RAIZ}/src/wa/send.ts`);
+const offline = process.env.WACOSAS_DEMO_OFFLINE === "1";
+if (offline) store.setConn({ state: "reconnecting", attempt: 1 });
+
+const sockFalso = {
+  async sendMessage(jid: string, contenido: { text: string }, opts: { messageId: string }) {
+    return {
+      key: { id: opts.messageId, remoteJid: jid, fromMe: true },
+      message: { conversation: contenido.text },
+    };
+  },
+};
+const send = createSendQueue({
+  repo,
+  store,
+  log: log as never,
+  wa: {
+    isOpen: () => !offline,
+    socket: () => (offline ? null : (sockFalso as never)),
+    selfJid: () => "5491133445566:12@s.whatsapp.net",
+  },
+});
+
 configureCommands({
   repo,
   wa: { reconnectNow() {}, async requestPairingCode() {} } as never,
   store,
   log: log as never,
+  send,
   shutdown(code = 0) {
     try {
       renderer.destroy();

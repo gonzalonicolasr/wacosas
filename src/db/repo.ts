@@ -31,11 +31,46 @@ export const VENTANA_DEFAULT = 500;
 
 export type Counts = { all: number; unread: number; groups: number };
 
+/**
+ * Escalera del estado de entrega: sólo se sube, nunca se baja.
+ *
+ * ⚠️ Existe porque los acks de WhatsApp llegan FUERA DE ORDEN. La rama
+ * `msg-updates` del ingest aplicaba el status a pelo, así que un `SERVER_ACK`
+ * atrasado degradaba un mensaje ya leído (doble tilde azul → un tilde) y el
+ * usuario veía el estado de su mensaje ir para atrás solo. Lo mismo pasa entre
+ * `wa/send.ts` —que escribe `sent` cuando resuelve `sendMessage`— y un
+ * `DELIVERY_ACK` que llegó antes de que la promesa volviera.
+ *
+ * `failed` y `pending` comparten escalón a propósito: son los dos extremos del
+ * mismo intento y el reintento de `Ctrl-Y` (CA-9.3) tiene que poder volver de
+ * `failed` a `pending`. Lo que NO se permite es que un ack viejo mande a
+ * `failed` —ni a `pending`— un mensaje que ya salió.
+ */
+export const ORDEN_ESTADO: Record<MessageStatus, number> = {
+  received: 0,
+  pending: 1,
+  failed: 1,
+  sent: 2,
+  delivered: 3,
+  read: 4,
+};
+
+/** ¿El estado nuevo es un avance (o un movimiento dentro del mismo escalón)? */
+export function puedeAvanzar(actual: MessageStatus, nuevo: MessageStatus): boolean {
+  const a = ORDEN_ESTADO[actual];
+  const b = ORDEN_ESTADO[nuevo];
+  // Un estado desconocido (base tocada a mano, versión futura) no bloquea nada.
+  if (a === undefined || b === undefined) return true;
+  return b >= a;
+}
+
 export type Repo = {
   // ── lectura (proyecciones del store) ──────────────────────────────────────
   listChats(limit?: number): ChatRow[];
   countsByFilter(): Counts;
   getChat(jid: string): ChatRow | null;
+  /** Una fila por su id de WhatsApp: el estado para la escalera y el texto del reintento. */
+  getMessageByWaId(chatJid: string, waId: string): MessageRow | null;
   lastMessages(jid: string, limit?: number): MessageRow[];
   messagesBefore(jid: string, beforeId: number, limit: number): MessageRow[];
   messagesAround(jid: string, anchorId: number, span?: number): MessageRow[];
@@ -52,6 +87,7 @@ export type Repo = {
   bumpUnread(jid: string, delta: number): void;
   clearUnread(jid: string, lastReadId: number): void;
   setUnread(jid: string, n: number): void;
+  /** Sólo AVANZA (ver `ORDEN_ESTADO`): un ack fuera de orden no baja el estado. */
   setMessageStatus(chatJid: string, waId: string, status: MessageStatus, error?: string | null): void;
   setMessageWaId(chatJid: string, oldWaId: string, newWaId: string): void;
   revokeMessage(chatJid: string, waId: string): void;
@@ -176,6 +212,10 @@ export function createRepo(db: Database): Repo {
      FROM chats`,
   );
   const qGetChat = db.query<FilaChat, [string]>(`SELECT ${COLS_CHAT} ${FROM_CHAT} WHERE c.jid = ?`);
+  // Por el índice único (chat_jid, wa_id): es una búsqueda puntual, no un scan.
+  const qPorWaId = db.query<FilaMensaje, [string, string]>(
+    `SELECT ${COLS_MSG} FROM messages WHERE chat_jid = ? AND wa_id = ?`,
+  );
 
   const qLastMessages = db.query<FilaMensaje, [string, number]>(
     `SELECT ${COLS_MSG} FROM messages WHERE chat_jid = ? ORDER BY ts DESC, id DESC LIMIT ?`,
@@ -296,6 +336,11 @@ export function createRepo(db: Database): Repo {
       return f ? aChatRow(f) : null;
     },
 
+    getMessageByWaId(chatJid, waId) {
+      const f = qPorWaId.get(chatJid, waId);
+      return f ? aMessageRow(f) : null;
+    },
+
     lastMessages(jid, limit = VENTANA_DEFAULT) {
       return ordenarCronologico(qLastMessages.all(jid, limit));
     },
@@ -407,7 +452,16 @@ export function createRepo(db: Database): Repo {
       qSetUnread.run(n, jid);
     },
 
+    // ⚠️ La guarda vive ACÁ y no en cada llamador (`wa/ingest.ts` tiene dos y
+    // `wa/send.ts` otros dos): es el único punto por el que pasa TODO cambio de
+    // estado, así que es el único lugar donde la escalera no se puede olvidar.
+    // Leer antes de escribir cuesta una búsqueda por índice único; el `UPDATE`
+    // que no se hace ahorra el write y el markDirty que venía atrás.
     setMessageStatus(chatJid, waId, status, error) {
+      const previo = qPorWaId.get(chatJid, waId);
+      // Sin fila el `UPDATE` sería un no-op igual: se corta antes.
+      if (!previo) return;
+      if (!puedeAvanzar(previo.status as MessageStatus, status)) return;
       qSetStatus.run(status, error ?? null, chatJid, waId);
     },
 

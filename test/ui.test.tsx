@@ -33,7 +33,10 @@ const ATAJOS_BANDEJA = [
   "Tab             filtrar: todos / no leídos / grupos",
   "Esc             limpiar el buscador",
 ];
-const ATAJOS_CONVO = ["⇧↑↓ ⇧PgUp/PgDn  scrollear el chat · ⇧Inicio ⇧Fin a las puntas"];
+const ATAJOS_CONVO = [
+  "⇧↑↓ ⇧PgUp/PgDn  scrollear el chat · ⇧Inicio ⇧Fin a las puntas",
+  "^E ⏎ Alt-⏎ ^Y   escribir · enviar · salto de línea · reintentar",
+];
 const ATAJOS_MINI = [
   "⏎               entrar a la conversación",
   "Esc             volver a la bandeja",
@@ -134,10 +137,14 @@ function cablearComandos() {
 // `entera: false` = a esa altura el cuerpo YA no entra ni sacándole el adorno, y
 // lo que sobra vive en el `<scrollbox>`. Pasó al sumar los seis atajos de la
 // bandeja (tarea 12): a 60×15, el mínimo de RNF-2, el cuerpo son 9 filas y los
-// atajos vigentes ya son 14. Lo que NO puede pasar nunca es que se encimen.
+// atajos vigentes ya son 15. Lo que NO puede pasar nunca es que se encimen.
+//
+// 80×19 se sumó a los que scrollean con el atajo de redacción de la tarea 14: a
+// esa altura el cuerpo son 13 filas y lo esencial son 14. El renglón que queda
+// abajo del corte se alcanza con `↑↓`, y el pie lo anuncia (punto 4).
 for (const [width, height, mini, entera] of [
   [60, 15, true, false],
-  [80, 19, false, true],
+  [80, 19, false, false],
   [80, 20, false, true],
   [80, 24, false, true],
 ] as Array<[number, number, boolean, boolean]>) {
@@ -194,29 +201,29 @@ for (const [width, height, mini, entera] of [
 
 test("cuando el alto no alcanza se cae el adorno antes que un atajo", () => {
   const todas = lineasAyuda({ logPath: LOG, mini: true });
-  // 4 títulos + 4 huecos + 14 atajos (4 globales, 6 de bandeja, 1 de conversación,
+  // 4 títulos + 4 huecos + 15 atajos (4 globales, 6 de bandeja, 2 de conversación,
   // 3 de mini) + 2 notas.
-  expect(todas.length).toBe(24);
+  expect(todas.length).toBe(25);
   // Entra todo: se pinta todo, adorno incluido.
-  expect(lineasQueEntran(todas, 24)).toEqual(todas);
+  expect(lineasQueEntran(todas, 25)).toEqual(todas);
   // No entra: primero se van SÓLO los renglones en blanco. Los títulos son lo
   // que hace encontrar el atajo de un vistazo y aguantan un escalón más (a 80×24
   // la ayuda son 19 líneas contra 18 de alto: gastar seis renglones de adorno
   // para ahorrar uno la dejaba sin un solo título y con cinco filas en blanco).
-  const sinHuecos = lineasQueEntran(todas, 20);
-  expect(sinHuecos.length).toBe(20);
+  const sinHuecos = lineasQueEntran(todas, 21);
+  expect(sinHuecos.length).toBe(21);
   expect(sinHuecos.some((l) => l.tipo === "titulo")).toBe(true);
   expect(sinHuecos.every((l) => l.tipo !== "hueco")).toBe(true);
-  // Recién si tampoco así entra se van los títulos: quedan los 14 atajos + 2 notas.
-  const apretadas = lineasQueEntran(todas, 16);
-  expect(apretadas.length).toBe(16);
+  // Recién si tampoco así entra se van los títulos: quedan los 15 atajos + 2 notas.
+  const apretadas = lineasQueEntran(todas, 17);
+  expect(apretadas.length).toBe(17);
   expect(apretadas.every((l) => l.tipo === "atajo" || l.tipo === "nota")).toBe(true);
   // Nunca se recorta a mano por debajo de lo esencial: eso lo cubre el scroll.
   expect(lineasQueEntran(todas, 3)).toEqual(apretadas);
 
   // Con lo esencial entrando justo NO hay nada que scrollear; con menos, sí — y
   // ése es el caso de 60×15 (el mínimo de RNF-2), donde el cuerpo son 9 filas.
-  expect(ayudaScrollea({ logPath: LOG, mini: true, filas: 16 })).toBe(false);
+  expect(ayudaScrollea({ logPath: LOG, mini: true, filas: 17 })).toBe(false);
   expect(ayudaScrollea({ logPath: LOG, mini: true, filas: 9 })).toBe(true);
 });
 

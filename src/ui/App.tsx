@@ -12,8 +12,8 @@
 //     snapshot está cacheado y sólo cambia de identidad en el flush coalescido
 //     (D3), que es lo que le pone techo a los renders (RNF-5).
 //
-// Lo que TODAVÍA no cuelga de acá, con su tarea: `<Composer/>` (14) y
-// `<SearchOverlay/>` (16). Los huecos están marcados abajo.
+// Lo que TODAVÍA no cuelga de acá, con su tarea: `<SearchOverlay/>` (16). El
+// hueco está marcado abajo.
 import type { KeyEvent, ScrollBoxRenderable } from "@opentui/core";
 import { useKeyboard, useTerminalDimensions } from "@opentui/react";
 import { useEffect, useRef, useState } from "react";
@@ -22,6 +22,7 @@ import { clip } from "../lib/fmt";
 import { commands, etiquetaChat, SALTO_EXTREMO } from "../state/commands";
 import { useSlice } from "../state/hooks";
 import { store } from "../state/store";
+import { Composer, HINTS_COMPOSER } from "./Composer";
 import { Conversation, HINTS_CONVO } from "./Conversation";
 import { ALTO_FOOTER, Footer } from "./Footer";
 import { ALTO_HEADER, Header } from "./Header";
@@ -32,7 +33,15 @@ import { Splash } from "./Splash";
 import { MIN_COLS, MIN_ROWS, TooSmall } from "./TooSmall";
 import { BG, BORDER, ELEVATED, SURFACE, WARN } from "./theme";
 
-type Modo = "browse" | "help";
+/**
+ * `compose` es "el foco lo tiene el campo de redacción" (CA-8.1). Es un modo y no
+ * un `useState` adentro del composer porque el `useKeyboard` es UNO solo (§7.4):
+ * con el campo enfocado, las teclas las reciben LOS DOS —el handler global y el
+ * `<textarea>`—, así que el handler global tiene que saber que no le tocan a él.
+ * Sin esto, cada flecha escrita en el campo movería también el cursor de la
+ * bandeja.
+ */
+type Modo = "browse" | "help" | "compose";
 /** Un panel por vez cuando la terminal es angosta (§7.2). */
 type PanelMini = "inbox" | "convo";
 type Disposicion = "wide" | "compact" | "mini";
@@ -191,6 +200,14 @@ export function App({
     if (nuevo !== ui.connBanner) store.setBanner(nuevo);
   }, [conn.state, link.reason]);
 
+  // El campo de redacción sólo existe con un chat A LA VISTA: si el chat se
+  // cierra —o si un `resize` deja la conversación fuera de pantalla en `mini`—,
+  // el `<textarea>` se desmonta y el foco se va con él. Quedarse en `compose`
+  // dejaría las teclas cayendo en un campo que ya no está.
+  useEffect(() => {
+    if (modo === "compose" && (convo.jid === null || !verConvo)) setModo("browse");
+  }, [modo, convo.jid, verConvo]);
+
   // La vinculación se lleva la pantalla entera: si la ayuda quedó abierta cuando
   // WhatsApp desvinculó la sesión, dejarla "abierta abajo" haría que reaparezca
   // sola al volver a vincular, sin que nadie la haya pedido.
@@ -281,6 +298,19 @@ export function App({
       return;
     }
 
+    // ── compose ─────────────────────────────────────────────────────────────
+    // Con el campo enfocado el handler global no maneja NADA salvo la salida:
+    // todo lo demás es texto y lo resuelve el `<textarea>` (incluidas `⏎`,
+    // `Alt-⏎` y las flechas, que ahí mueven el cursor). El `return` es la parte
+    // importante: sin él, escribir en el campo también navegaría la bandeja.
+    if (modo === "compose") {
+      // CA-8.5: `Esc` devuelve el foco a la bandeja CONSERVANDO el borrador. No
+      // hay que hacer nada para conservarlo: cada tecla ya lo dejó guardado en
+      // el store (`onContentChange`), y el campo ni siquiera se desmonta.
+      if (es("escape")) setModo("browse");
+      return;
+    }
+
     if (modo === "help") {
       // La ayuda se traga el resto de las teclas; `Esc` y `?` la cierran (CA-19.3).
       if (es("escape") || es("?")) {
@@ -308,6 +338,23 @@ export function App({
     const media = Math.max(1, Math.floor(filasVisibles / 2));
     if (key.shift && TECLAS_SCROLL.has(n)) {
       scrollConvo(convoRef.current, n, media);
+      return;
+    }
+
+    // CA-8.1: la tecla que enfoca el campo de redacción, distinta de la del
+    // buscador (que está siempre enfocado y no necesita ninguna). En `mini` no
+    // hay campo hasta entrar al chat, así que la misma tecla hace las dos cosas.
+    if (key.ctrl && es("e")) {
+      if (!convo.jid) return;
+      if (disposicion === "mini") setPanelMini("convo");
+      setModo("compose");
+      return;
+    }
+
+    // CA-9.3: reintentar el último envío fallado del chat abierto. El comando
+    // resuelve CUÁL era: la vista no tiene por qué salir a buscarlo.
+    if (key.ctrl && es("y")) {
+      commands.retrySend();
       return;
     }
 
@@ -392,12 +439,18 @@ export function App({
   // necesita AHÍ. `Ctrl-R` sigue en la ayuda y, cuando de verdad hace falta, lo
   // nombra el banner de conexión (`MOTIVO_CONEXION_REEMPLAZADA`).
   const cola = convo.jid ? "? ayuda · ^C salir" : "? ayuda · ^R reconectar · ^C salir";
+  // ⚠️ Con un chat abierto esta línea mide EXACTAMENTE 78 caracteres, que es lo
+  // que entra a 80 columnas (RNF-1) descontando el padding. No es holgura: el
+  // próximo hint que se sume tiene que sacar otro.
+  const teclasChat = convo.jid ? ` · ^E escribí · ${HINTS_CONVO}` : "";
   const hints =
-    modo === "help"
-      ? `${scrollAyuda ? "↑↓ desplazar · " : ""}^R reconectar · Esc / ? cerrar la ayuda`
-      : !verBandeja
-        ? `↑↓ scroll · Esc bandeja · ${cola}`
-        : `${HINTS_BANDEJA}${convo.jid ? ` · ${HINTS_CONVO}` : ""} · ${cola}`;
+    modo === "compose"
+      ? `${HINTS_COMPOSER} · ^C salir`
+      : modo === "help"
+        ? `${scrollAyuda ? "↑↓ desplazar · " : ""}^R reconectar · Esc / ? cerrar la ayuda`
+        : !verBandeja
+          ? `↑↓ scroll · ^E escribí · Esc bandeja · ${cola}`
+          : `${HINTS_BANDEJA}${teclasChat} · ${cola}`;
 
   return (
     <box flexDirection="column" width="100%" height="100%" backgroundColor={BG}>
@@ -432,7 +485,16 @@ export function App({
               backgroundColor={SURFACE}
               title={` chats ${inbox.counts.all} `}
             >
-              <Inbox ancho={anchoInterior} alto={filasVisibles} />
+              {/* El buscador de la bandeja tiene el foco SALVO mientras se
+                  redacta: el reconciliador de OpenTUI aplica `focused` sólo
+                  cuando la prop CAMBIA, así que si el `<input>` la tuviera
+                  clavada en `true`, al volver del campo de redacción nadie se lo
+                  devolvería y tipear no filtraría más (CA-5.1). */}
+              <Inbox
+                ancho={anchoInterior}
+                alto={filasVisibles}
+                enfocado={modo !== "compose"}
+              />
             </box>
           ) : null}
 
@@ -449,7 +511,17 @@ export function App({
               title={` ${chatAbierto ? clip(etiquetaChat(chatAbierto), Math.max(8, anchoConvo - 4)) : "conversación"} `}
             >
               <Conversation ancho={anchoConvo} cajaRef={convoRef} />
-              {/* Acá va <Composer/> (tarea 14). */}
+              {/* CA-8.1: el campo sólo existe con un chat abierto. Se monta y se
+                  desmonta (no cambia de rama en el lugar), así que el gotcha de
+                  las props que no se resetean no aplica acá. */}
+              {convo.jid ? (
+                <Composer
+                  jid={convo.jid}
+                  ancho={anchoConvo}
+                  enfocado={modo === "compose"}
+                  onEnfocar={() => setModo("compose")}
+                />
+              ) : null}
             </box>
           ) : null}
         </box>
