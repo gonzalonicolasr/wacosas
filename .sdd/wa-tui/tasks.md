@@ -256,7 +256,11 @@
     `Tab` alterna las dos vistas; un teléfono de 5 dígitos es rechazado con el mensaje de formato.
   - depends-on: 9
 
-- [ ] 11. **[PRUEBA MANUAL — cuenta real de WhatsApp]** Vincular de verdad y validar el riesgo R2
+- [ ] 11. ⏸️ **DIFERIDA — [PRUEBA MANUAL, cuenta real de WhatsApp]** Vincular de verdad y validar el riesgo R2
+  - ⏸️ **Estado: pendiente de que Gon tenga el teléfono a mano** (2026-08-24: dijo "avancemos que tengo
+    que hacer"). NO bloquea a las tareas 12-16: se siguen con datos sembrados por `test/fixtures/seed.ts`
+    en vez de con la base que habría dejado esta tarea. Lo único que queda sin validar hasta correrla es
+    el end-to-end contra WhatsApp de verdad.
   - covers: CA-1.7, CA-1.8, CA-2.6, CA-2.7, CA-3.4, R2 (§9)
   - files: `src/wa/socket.ts`, `src/ui/Login.tsx` (solo ajustes que salgan de la prueba)
   - detalle: **es la primera vez que se le pide el teléfono al usuario.** Guion de la sesión, en este
