@@ -12,24 +12,25 @@
 //     snapshot está cacheado y sólo cambia de identidad en el flush coalescido
 //     (D3), que es lo que le pone techo a los renders (RNF-5).
 //
-// Lo que TODAVÍA no cuelga de acá, con su tarea: `<Inbox/>` (12),
-// `<Conversation/>` + `<Composer/>` (13 y 14) y `<SearchOverlay/>` (16). Los
-// huecos están marcados abajo.
+// Lo que TODAVÍA no cuelga de acá, con su tarea: `<Conversation/>` +
+// `<Composer/>` (13 y 14) y `<SearchOverlay/>` (16). Los huecos están marcados
+// abajo.
 import type { KeyEvent, ScrollBoxRenderable } from "@opentui/core";
 import { useKeyboard, useTerminalDimensions } from "@opentui/react";
 import { useEffect, useRef, useState } from "react";
 
 import { clip } from "../lib/fmt";
-import { commands } from "../state/commands";
+import { commands, SALTO_EXTREMO } from "../state/commands";
 import { useSlice } from "../state/hooks";
 import { store } from "../state/store";
 import { ALTO_FOOTER, Footer } from "./Footer";
 import { ALTO_HEADER, Header } from "./Header";
 import { ayudaScrollea, Help } from "./Help";
+import { HINTS_BANDEJA, Inbox } from "./Inbox";
 import { Login, metodoDe } from "./Login";
 import { Splash } from "./Splash";
 import { MIN_COLS, MIN_ROWS, TooSmall } from "./TooSmall";
-import { BG, BORDER, ELEVATED, MUT, SURFACE, TEXT_DIM, WARN } from "./theme";
+import { BG, BORDER, ELEVATED, MUT, SURFACE, WARN } from "./theme";
 
 type Modo = "browse" | "help";
 /** Un panel por vez cuando la terminal es angosta (§7.2). */
@@ -52,15 +53,6 @@ function disposicionDe(ancho: number): Disposicion {
   return "mini";
 }
 
-/**
- * Nombre visible de un chat. Un chat creado por un mensaje SALIENTE queda con
- * `name` vacío (el ingest no renombra con el `pushName` de un eco propio) y un
- * grupo sin subject también: sin este fallback la fila se vería en blanco.
- */
-function nombreDe(chat: { name: string; jid: string }): string {
-  return chat.name || (chat.jid.split("@")[0] as string);
-}
-
 export function App({ noSplash, logPath }: { noSplash: boolean; logPath: string }) {
   const { width, height } = useTerminalDimensions();
   const conn = useSlice("conn");
@@ -77,6 +69,24 @@ export function App({ noSplash, logPath }: { noSplash: boolean; logPath: string 
   const ayudaRef = useRef<ScrollBoxRenderable | null>(null);
 
   const disposicion = disposicionDe(width);
+
+  // ── medidas del layout ────────────────────────────────────────────────────
+  // Se calculan ACÁ ARRIBA, antes del `useKeyboard`, porque el teclado también
+  // las necesita: `PgUp`/`PgDn` saltan una pantalla de la bandeja y las teclas
+  // de la bandeja sólo tienen sentido si la bandeja está a la vista. Todo se
+  // recalcula en cada render: no hay nada cacheado que se desincronice al
+  // redimensionar (CA-19.4).
+  const banner = ui.connBanner;
+  const altoCuerpo = Math.max(1, height - ALTO_HEADER - ALTO_FOOTER - (banner ? 1 : 0));
+  /** −2 por los bordes del panel. */
+  const filasVisibles = Math.max(0, altoCuerpo - 2);
+  const anchoBandeja =
+    disposicion === "wide" ? Math.floor(width * RATIO_BANDEJA_WIDE) : ANCHO_BANDEJA_COMPACT;
+  const verBandeja = disposicion !== "mini" || panelMini === "inbox";
+  const verConvo = disposicion !== "mini" || panelMini === "convo";
+  /** Ancho INTERIOR del panel de la bandeja (sin los bordes). */
+  const anchoInterior = (disposicion === "mini" ? width : anchoBandeja) - 2;
+
   /**
    * CA-1.1: sin sesión vinculada la pantalla es `<Login/>`, no la bandeja. Vale
    * también para `checking` —la fase de arranque, hasta que el socket dice si
@@ -127,6 +137,18 @@ export function App({ noSplash, logPath }: { noSplash: boolean; logPath: string 
   useEffect(() => {
     if (enLogin) setModo("browse");
   }, [enLogin]);
+
+  // El `?` que abre la ayuda NO es una búsqueda. La tecla la reciben LOS DOS —el
+  // handler global y el `<input>` enfocado, que la inserta como cualquier
+  // carácter— y no hay forma de que uno se la saque al otro. Como la ayuda sólo
+  // se abre con el buscador VACÍO, al entrar el buscador tiene que quedar vacío:
+  // no se pierde nada y el `?` fantasma no queda filtrando al volver.
+  //
+  // Va en un efecto y no en el handler porque el orden entre los dos receptores
+  // de la tecla no está garantizado; el efecto corre después de los dos.
+  useEffect(() => {
+    if (modo === "help") commands.setInboxQuery("");
+  }, [modo]);
 
   useKeyboard((key: KeyEvent) => {
     const n = key?.name ?? "";
@@ -219,24 +241,60 @@ export function App({ noSplash, logPath }: { noSplash: boolean; logPath: string 
     // `Shift-PgUp/PgDn` scrollean la conversación (tarea 13). Tienen que quedar
     // ANTES de las teclas peladas, o el `↑` pelado se las come.
 
-    // `?` abre la ayuda. Cuando la tarea 12 monte el buscador, sólo con el campo
-    // vacío: con texto tipeado el `?` es un carácter más (§7.3).
-    if (es("?")) {
+    // El buscador se lee EN VIVO y no del snapshot: éste está cacheado hasta el
+    // próximo flush (D3), así que un `?` apretado dentro de los 33 ms de haber
+    // tipeado vería el campo vacío y abriría la ayuda en vez de escribirse.
+    const busqueda = store.inboxUi().inboxQuery;
+
+    // `?` abre la ayuda SÓLO con el buscador vacío (§7.3): con texto tipeado es
+    // un carácter más y lo tiene que recibir el campo, que también escucha esta
+    // misma tecla por su cuenta.
+    if (es("?") && (!verBandeja || busqueda === "")) {
       setModo("help");
       return;
     }
 
-    // `mini`: un panel por vez, `⏎` entra y `Esc` vuelve (§7.2).
-    if (disposicion === "mini") {
-      if (enter && panelMini === "inbox") {
-        setPanelMini("convo");
-        return;
-      }
-      if (es("escape") && panelMini === "convo") {
+    // `Esc` tiene tres significados y el orden importa: primero volver de panel
+    // en `mini` (§7.2), después limpiar el buscador (CA-5.4). Sin texto y sin
+    // panel que cerrar no hace nada — cerrar la aplicación con `Esc` sería un
+    // accidente esperando.
+    if (es("escape")) {
+      if (disposicion === "mini" && panelMini === "convo") {
         setPanelMini("inbox");
         return;
       }
+      if (busqueda !== "") commands.setInboxQuery("");
+      return;
     }
+
+    // De acá para abajo, las teclas de la bandeja. En `mini` con la conversación
+    // a la vista no hay lista que navegar (las teclas del panel son de la 13).
+    if (!verBandeja) return;
+
+    if (enter) {
+      commands.openSelectedChat();
+      // `mini`: un panel por vez, `⏎` entra a la conversación (§7.2).
+      if (disposicion === "mini") setPanelMini("convo");
+      return;
+    }
+
+    // CA-5.5: `Tab` cicla Todos → No leídos → Grupos.
+    if (es("tab")) {
+      commands.cycleInboxFilter();
+      return;
+    }
+
+    // CA-5.3. `Ctrl-K`/`Ctrl-J` necesitan el protocolo de teclado kitty para
+    // llegar distinguibles; sin él, `Ctrl-J` es el mismo byte que un salto de
+    // línea y aparece como `linefeed` (medido). Las flechas son el camino
+    // portable y funcionan siempre.
+    const pagina = Math.max(1, filasVisibles - 1);
+    if (es("up") || (key.ctrl && es("k"))) commands.moveSelection(-1);
+    else if (es("down") || (key.ctrl && es("j")) || es("linefeed")) commands.moveSelection(1);
+    else if (es("pageup")) commands.moveSelection(-pagina);
+    else if (es("pagedown")) commands.moveSelection(pagina);
+    else if (es("home")) commands.moveSelection(-SALTO_EXTREMO);
+    else if (es("end")) commands.moveSelection(SALTO_EXTREMO);
   });
 
   // ── render ────────────────────────────────────────────────────────────────
@@ -248,17 +306,6 @@ export function App({ noSplash, logPath }: { noSplash: boolean; logPath: string 
   // dibuja ni el panel de "el QR no entra"— y ANTES de todo lo demás.
   if (enLogin) return <Login width={width} height={height} />;
 
-  const banner = ui.connBanner;
-  const altoCuerpo = Math.max(1, height - ALTO_HEADER - ALTO_FOOTER - (banner ? 1 : 0));
-  // −2 por los bordes del panel. Es la única medida calculada a mano, y se
-  // recalcula en cada render: no hay nada cacheado que se desincronice al
-  // redimensionar (CA-19.4).
-  const filasVisibles = Math.max(0, altoCuerpo - 2);
-  const anchoBandeja =
-    disposicion === "wide" ? Math.floor(width * RATIO_BANDEJA_WIDE) : ANCHO_BANDEJA_COMPACT;
-  const verBandeja = disposicion !== "mini" || panelMini === "inbox";
-  const verConvo = disposicion !== "mini" || panelMini === "convo";
-
   // El `↑↓` sólo se anuncia si la ayuda de verdad no entra entera (terminal muy
   // baja): un hint que promete una tecla que no hace nada es ruido.
   const scrollAyuda =
@@ -268,13 +315,13 @@ export function App({ noSplash, logPath }: { noSplash: boolean; logPath: string 
   const hints =
     modo === "help"
       ? `${scrollAyuda ? "↑↓ desplazar · " : ""}^R reconectar · Esc / ? cerrar la ayuda`
-      : disposicion === "mini"
-        ? "⏎ conversación · Esc bandeja · ? ayuda · ^R reconectar · ^C salir"
-        : "? ayuda · ^R reconectar · ^C salir";
+      : !verBandeja
+        ? "Esc bandeja · ? ayuda · ^R reconectar · ^C salir"
+        : `${HINTS_BANDEJA} · ? ayuda · ^R reconectar · ^C salir`;
 
   return (
     <box flexDirection="column" width="100%" height="100%" backgroundColor={BG}>
-      <Header />
+      <Header conTabs />
 
       {banner ? (
         <box height={1} paddingLeft={1} paddingRight={1} backgroundColor={ELEVATED}>
@@ -305,21 +352,7 @@ export function App({ noSplash, logPath }: { noSplash: boolean; logPath: string 
               backgroundColor={SURFACE}
               title={` chats ${inbox.counts.all} `}
             >
-              {/* Lista MÍNIMA de la bandeja: la fila real (preview, fecha
-                  relativa, badge de no leídos), los filtros, el buscador y el
-                  mouse los construye la tarea 12 con <Inbox/>. Las filas ya van
-                  con `height={1}` + `wrapMode="none"` (§7.4.1). */}
-              {inbox.chats.length === 0 ? (
-                <text fg={MUT}>{"  (todavía no hay chats)"}</text>
-              ) : (
-                inbox.chats.slice(0, filasVisibles).map((c) => (
-                  <box key={c.jid} height={1} paddingLeft={1}>
-                    <text fg={TEXT_DIM} wrapMode="none">
-                      {clip(nombreDe(c), Math.max(4, (verConvo ? anchoBandeja : width) - 3))}
-                    </text>
-                  </box>
-                ))
-              )}
+              <Inbox ancho={anchoInterior} alto={filasVisibles} />
             </box>
           ) : null}
 

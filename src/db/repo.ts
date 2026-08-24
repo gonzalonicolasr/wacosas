@@ -44,7 +44,8 @@ export type Repo = {
   openSends(): MessageRow[];
 
   // ── escritura (sólo desde wa/ingest.ts y wa/send.ts, dentro de una txn) ───
-  upsertChat(c: Partial<ChatRow> & { jid: string }): void;
+  /** `contactName` NO se acepta: es derivado del `LEFT JOIN` con la agenda. */
+  upsertChat(c: Partial<Omit<ChatRow, "contactName">> & { jid: string }): void;
   upsertContact(jid: string, name: string, phone: string): void;
   insertMessage(m: MappedMessage): { inserted: boolean; id: number };
   touchChatActivity(jid: string, ts: number, preview: string, fromMe: boolean): void;
@@ -64,6 +65,7 @@ export type Repo = {
 type FilaChat = {
   jid: string;
   name: string;
+  contact_name: string;
   is_group: number;
   last_message_at: number;
   last_preview: string;
@@ -97,13 +99,21 @@ type FilaHit = {
   frag: string;
 };
 
-const COLS_CHAT = "jid, name, is_group, last_message_at, last_preview, last_from_me, unread_count, last_read_id";
+// El `LEFT JOIN` con la agenda es la ÚNICA forma en que `contacts` llega a la
+// pantalla: la tabla se llena con los eventos `contacts.*` de Baileys y hasta acá
+// no la leía nadie. Se resuelve al LEER, nunca escribiendo `chats` (eso crearía
+// un chat por cada contacto de la agenda). `contacts.jid` es la PK, así que es
+// una búsqueda por índice por fila.
+const COLS_CHAT =
+  "c.jid, c.name, COALESCE(k.name, '') AS contact_name, c.is_group, c.last_message_at, c.last_preview, c.last_from_me, c.unread_count, c.last_read_id";
+const FROM_CHAT = "FROM chats c LEFT JOIN contacts k ON k.jid = c.jid";
 const COLS_MSG = "id, chat_jid, wa_id, from_me, sender_jid, sender_name, ts, kind, body, attachment, status, error";
 
 function aChatRow(f: FilaChat): ChatRow {
   return {
     jid: f.jid,
     name: f.name,
+    contactName: f.contact_name,
     isGroup: f.is_group === 1,
     lastMessageAt: f.last_message_at,
     lastPreview: f.last_preview,
@@ -157,7 +167,7 @@ export function createRepo(db: Database): Repo {
   // Todas las sentencias se preparan una sola vez, acá. `db.query()` además las
   // cachea en la conexión y las finaliza sola en el `close()`.
   const qListChats = db.query<FilaChat, [number]>(
-    `SELECT ${COLS_CHAT} FROM chats ORDER BY last_message_at DESC, jid LIMIT ?`,
+    `SELECT ${COLS_CHAT} ${FROM_CHAT} ORDER BY c.last_message_at DESC, c.jid LIMIT ?`,
   );
   const qCounts = db.query<Counts, []>(
     `SELECT COUNT(*)                                                   AS "all",
@@ -165,7 +175,7 @@ export function createRepo(db: Database): Repo {
             COALESCE(SUM(CASE WHEN is_group = 1     THEN 1 ELSE 0 END), 0) AS groups
      FROM chats`,
   );
-  const qGetChat = db.query<FilaChat, [string]>(`SELECT ${COLS_CHAT} FROM chats WHERE jid = ?`);
+  const qGetChat = db.query<FilaChat, [string]>(`SELECT ${COLS_CHAT} ${FROM_CHAT} WHERE c.jid = ?`);
 
   const qLastMessages = db.query<FilaMensaje, [string, number]>(
     `SELECT ${COLS_MSG} FROM messages WHERE chat_jid = ? ORDER BY ts DESC, id DESC LIMIT ?`,
@@ -324,7 +334,11 @@ export function createRepo(db: Database): Repo {
       if (aguja === "") return [];
       const out: ChatRow[] = [];
       for (const f of qListChats.all(-1)) {
-        if (fold(f.name).includes(aguja) || fold(f.jid).includes(aguja)) {
+        if (
+          fold(f.name).includes(aguja) ||
+          fold(f.contact_name).includes(aguja) ||
+          fold(f.jid).includes(aguja)
+        ) {
           out.push(aChatRow(f));
           if (out.length >= limit) break;
         }

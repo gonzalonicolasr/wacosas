@@ -71,5 +71,25 @@ está en `.sdd/wa-tui/design.md`.
 
 ## Limitaciones conocidas
 
+### Un mismo contacto puede aparecerte como dos chats (`@lid`)
+
+WhatsApp está migrando a un identificador que **no** es el número de teléfono, el **LID**
+(`1234567890@lid`), pensado para no revelarle tu número a quien no lo tiene. Baileys 7 arma el chat
+con el identificador que venga en el sobre —a veces el número, a veces el lid— y deja el otro al lado,
+en `key.remoteJidAlt`.
+
+wacosas **no fusiona las dos identidades**: cada una es un chat distinto en la base. Si el mismo
+contacto te escribe una vez desde cada una, lo vas a ver dos veces en la bandeja, con el historial
+partido. Los chats con lid se listan como `~1234567890` —con `~` y **sin** el `+`— justamente para
+que se note que eso no es un número al que puedas llamar.
+
+Por qué no se resolvió: fusionarlas de verdad no es leer un campo más. Hay que elegir una identidad
+canónica, **mover** los mensajes ya persistidos de un `chat_jid` al otro, sumar los contadores de no
+leídos, y que el envío salga siempre por la identidad que el otro lado espera. Es una migración de
+datos, no un ajuste de la vista, y se hace mal si se hace a medias. Queda anotado como el riesgo R7
+del diseño.
+
+### El resto
+
 Pendiente de completar en la tarea 18 (ventana fija de mensajes, alcance de la búsqueda global,
-duplicados de identidad, atajos que chocan con tmux).
+atajos que chocan con tmux).

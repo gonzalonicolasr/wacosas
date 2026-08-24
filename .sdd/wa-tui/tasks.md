@@ -282,7 +282,7 @@
     queda escrito (funciona tal cual / se aplicó el plan B).
   - depends-on: 10
 
-- [ ] 12. Construir la bandeja: filas, filtros, buscador y mouse
+- [x] 12. Construir la bandeja: filas, filtros, buscador y mouse
   - covers: CA-4.1, CA-4.2, CA-4.4, CA-4.6, CA-4.7, CA-4.8, CA-5.1, CA-5.2, CA-5.3, CA-5.4, CA-5.5,
     CA-5.6, CA-5.7, CA-5.8, CA-10.2, CA-10.3, CA-10.4, CA-19.7, RNF-6
   - files: `src/ui/Inbox.tsx`, `src/ui/Header.tsx` (tabs con contadores + clickeables),

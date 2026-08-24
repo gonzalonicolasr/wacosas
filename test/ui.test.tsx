@@ -25,12 +25,20 @@ const ATAJOS_GLOBALES = [
   "Ctrl-R          reconectar ahora, sin esperar el backoff",
   "Ctrl-C · Ctrl-Q salir",
 ];
+const ATAJOS_BANDEJA = [
+  "escribir        filtrar por nombre o número, sin acentos",
+  "↑ ↓ · ^K ^J     mover la selección (la rueda también)",
+  "PgUp PgDn       saltar de a una pantalla (Inicio / Fin, a las puntas)",
+  "⏎ · doble click abrir el chat seleccionado",
+  "Tab             filtrar: todos / no leídos / grupos",
+  "Esc             limpiar el buscador",
+];
 const ATAJOS_MINI = [
   "⏎               entrar a la conversación",
   "Esc             volver a la bandeja",
 ];
 const NOTAS = [`log: ${LOG}`, "la base local NO se cifra: queda 0600, sólo para tu usuario"];
-const TITULOS = ["teclas", "en terminales angostas (un panel por vez)"];
+const TITULOS = ["teclas", "en la bandeja", "en terminales angostas (un panel por vez)"];
 
 /** Las filas de adentro del panel de la ayuda, sin borde ni padding. */
 function filasAyuda(frame: string): string[] {
@@ -116,28 +124,50 @@ function cablearComandos() {
 
 // ── el cuerpo de la ayuda entra siempre (CA-19.3, RNF-2) ────────────────────
 
-for (const [width, height, mini] of [
-  [60, 15, true],
-  [80, 19, false],
-  [80, 20, false],
-  [80, 24, false],
-] as Array<[number, number, boolean]>) {
-  test(`la ayuda a ${width}×${height} se lee entera y sin filas encimadas`, async () => {
+// `entera: false` = a esa altura el cuerpo YA no entra ni sacándole el adorno, y
+// lo que sobra vive en el `<scrollbox>`. Pasó al sumar los seis atajos de la
+// bandeja (tarea 12): a 60×15, el mínimo de RNF-2, el cuerpo son 9 filas y los
+// atajos vigentes ya son 14. Lo que NO puede pasar nunca es que se encimen.
+for (const [width, height, mini, entera] of [
+  [60, 15, true, false],
+  [80, 19, false, true],
+  [80, 20, false, true],
+  [80, 24, false, true],
+] as Array<[number, number, boolean, boolean]>) {
+  test(`la ayuda a ${width}×${height} se lee sin filas encimadas`, async () => {
     const t = await montar(width, height);
     await abrirAyuda(t);
     const filas = filasAyuda(t.captureCharFrame());
 
-    const conocidas = [...ATAJOS_GLOBALES, ...NOTAS, ...TITULOS, ...(mini ? ATAJOS_MINI : [])];
+    const conocidas = [
+      ...ATAJOS_GLOBALES,
+      ...ATAJOS_BANDEJA,
+      ...NOTAS,
+      ...TITULOS,
+      ...(mini ? ATAJOS_MINI : []),
+    ];
     // 1) Nada de lo pintado es basura: si dos `<text>` se encimaran, la fila
     //    saldría mezclada ("?eclas", "⏎n terminales anentrar…") y no matchearía.
     for (const fila of filas.filter((f) => f !== "")) {
       expect({ fila, conocida: coincideCon(fila, conocidas) }).toEqual({ fila, conocida: true });
     }
     // 2) Todos los atajos VIGENTES están, más la ruta del log (CA-16.3).
-    const obligatorias = [...ATAJOS_GLOBALES, ...NOTAS, ...(mini ? ATAJOS_MINI : [])];
-    for (const esperada of obligatorias) {
-      const hay = filas.some((f) => coincideCon(f, [esperada]) && f !== "");
-      expect({ esperada, hay }).toEqual({ esperada, hay: true });
+    const obligatorias = [
+      ...ATAJOS_GLOBALES,
+      ...ATAJOS_BANDEJA,
+      ...NOTAS,
+      ...(mini ? ATAJOS_MINI : []),
+    ];
+    if (entera) {
+      for (const esperada of obligatorias) {
+        const hay = filas.some((f) => coincideCon(f, [esperada]) && f !== "");
+        expect({ esperada, hay }).toEqual({ esperada, hay: true });
+      }
+    } else {
+      // No entra todo: lo que se ve son las PRIMERAS de la lista, en orden, y el
+      // resto se alcanza con `↑↓` (que el pie sí anuncia, abajo).
+      expect(filas.filter((f) => f !== "").length).toBeGreaterThan(0);
+      expect(coincideCon(filas[0] as string, [ATAJOS_GLOBALES[0] as string])).toBe(true);
     }
     // 3) En `compact`/`wide` no se prometen los atajos de `mini`: ahí no hacen nada.
     if (!mini) {
@@ -145,30 +175,31 @@ for (const [width, height, mini] of [
         expect(filas.some((f) => f !== "" && coincideCon(f, [ajena]))).toBe(false);
       }
     }
-    // 4) Y como entra entera, el pie NO anuncia el `↑↓` de scroll.
+    // 4) El pie anuncia el `↑↓` de scroll SÓLO cuando de verdad hay algo abajo.
     const pie = t.captureCharFrame().split("\n")[height - 1] as string;
     expect(pie).toContain("Esc / ? cerrar la ayuda");
-    expect(pie).not.toContain("↑↓");
+    expect(pie.includes("↑↓")).toBe(!entera);
     t.renderer.destroy();
   });
 }
 
 test("cuando el alto no alcanza se cae el adorno antes que un atajo", () => {
   const todas = lineasAyuda({ logPath: LOG, mini: true });
-  expect(todas.length).toBe(12);
+  // 3 títulos + 3 huecos + 12 atajos (4 globales, 6 de bandeja, 2 de mini) + 2 notas.
+  expect(todas.length).toBe(20);
   // Entra todo: se pinta todo, adorno incluido.
-  expect(lineasQueEntran(todas, 12)).toEqual(todas);
-  // No entra: se van títulos y renglones en blanco, quedan los 6 atajos + 2 notas.
-  const apretadas = lineasQueEntran(todas, 9);
-  expect(apretadas.length).toBe(8);
+  expect(lineasQueEntran(todas, 20)).toEqual(todas);
+  // No entra: se van títulos y renglones en blanco, quedan los 12 atajos + 2 notas.
+  const apretadas = lineasQueEntran(todas, 15);
+  expect(apretadas.length).toBe(14);
   expect(apretadas.every((l) => l.tipo === "atajo" || l.tipo === "nota")).toBe(true);
   // Nunca se recorta a mano por debajo de lo esencial: eso lo cubre el scroll.
   expect(lineasQueEntran(todas, 3)).toEqual(apretadas);
 
-  // A 60×15 (el mínimo, RNF-2) el cuerpo son 9 filas y entra todo lo esencial:
-  // ahí NO hay nada que scrollear. Con menos, sí.
-  expect(ayudaScrollea({ logPath: LOG, mini: true, filas: 9 })).toBe(false);
-  expect(ayudaScrollea({ logPath: LOG, mini: true, filas: 7 })).toBe(true);
+  // Con lo esencial entrando justo NO hay nada que scrollear; con menos, sí — y
+  // ése es el caso de 60×15 (el mínimo de RNF-2), donde el cuerpo son 9 filas.
+  expect(ayudaScrollea({ logPath: LOG, mini: true, filas: 14 })).toBe(false);
+  expect(ayudaScrollea({ logPath: LOG, mini: true, filas: 9 })).toBe(true);
 });
 
 test("lo que no entra ni sin adorno queda dentro del scrollbox y se alcanza con scroll", async () => {
@@ -189,7 +220,9 @@ test("lo que no entra ni sin adorno queda dentro del scrollbox y se alcanza con 
   expect(antes.some((f) => f.startsWith("log:"))).toBe(false);
 
   act(() => {
-    caja.current?.scrollBy(3);
+    // Bien de más: el `<scrollbox>` se clava en el fondo, que es donde viven las
+    // notas (el cuerpo apretado son 14 filas y se ven 5).
+    caja.current?.scrollBy(20);
   });
   await pintar(t);
   await pintar(t);

@@ -8,12 +8,15 @@
 // Ningún comando lanza: la interfaz no tiene dónde atajar una excepción y una que
 // se escape en un handler de teclado se lleva puesto el render.
 //
-// Hoy están los del esqueleto (tarea 9) y los de vinculación (tarea 10). Los de
-// envío (`send`, `retrySend`) los agrega la tarea 14 y la búsqueda global la 16.
+// Hoy están los del esqueleto (tarea 9), los de vinculación (tarea 10) y los de
+// la bandeja —selección, filtro y buscador— (tarea 12). Los de envío (`send`,
+// `retrySend`) los agrega la tarea 14 y la búsqueda global la 16.
 import type { Logger } from "../boot/log";
 import type { Repo } from "../db/repo";
+import type { ChatRow } from "../db/types";
+import { fold } from "../lib/fmt";
 import type { WaController } from "../wa/socket";
-import type { LinkSnapshot, Store } from "./store";
+import type { InboxFilter, LinkSnapshot, Store } from "./store";
 
 export type CommandDeps = {
   repo: Repo;
@@ -77,12 +80,117 @@ export function validarTelefono(
   return { ok: true, digits: texto };
 }
 
+// ── bandeja: etiqueta, filtro y selección (CA-4.*, CA-5.*, CA-10.4) ─────────
+//
+// Estos tres son PUROS y viven acá, no en `ui/Inbox.tsx`, porque los usan los dos
+// lados: la vista para pintar y los comandos para mover el cursor. Si el filtro
+// viviera en la vista, `moveSelection` no sabría sobre qué lista se está
+// moviendo — y la primera vez que alguien tipeara en el buscador, el cursor
+// saltaría a un chat que no está en pantalla.
+//
+// `commands.ts` puede importar de `lib/`, pero JAMÁS de `wa/`: `resolveChatName`
+// (§5.4) vive en `wa/map.ts`, que arrastra baileys entero (~260 ms de import) y
+// se comería el presupuesto de CA-13.1. De ahí que la precedencia de nombres se
+// repita acá, sin baileys.
+
+/** Los tres filtros en el orden en que los cicla `Tab` (CA-5.5). */
+export const FILTROS: InboxFilter[] = ["all", "unread", "groups"];
+
+/** Un jid mostrable cuando no hay ningún nombre: `+549…`, `~lid` o el jid crudo. */
+function jidLegible(jid: string): string {
+  const corte = jid.indexOf("@");
+  const user = corte < 0 ? jid : jid.slice(0, corte);
+  const server = corte < 0 ? "" : jid.slice(corte + 1);
+  if (!user) return jid;
+  // Un `@lid` NO es un teléfono: es el identificador opaco que WhatsApp usa para
+  // no revelar el número. Pintarlo con `+` sería inventarle un número que no
+  // existe y que nadie puede marcar. El `~` es la marca de "identidad sin
+  // nombre" que usa el propio WhatsApp.
+  if (server === "lid") return `~${user}`;
+  return /^\d+$/.test(user) ? `+${user}` : user;
+}
+
+/**
+ * El nombre que se VE en la fila de la bandeja (CA-4.1, CA-4.8).
+ *
+ * La precedencia es la de §5.4 —subject > agenda > `pushName` > número—, con
+ * `chats.name` haciendo de subject en un grupo y de `pushName` en un 1:1.
+ *
+ * El fallback al número NO es cosmético: un chat creado por un mensaje SALIENTE
+ * queda con `name: ""` a propósito (el `pushName` del eco de uno mismo es uno
+ * mismo, y renombraría el chat con el nombre propio), así que sin esto la fila
+ * se vería EN BLANCO.
+ */
+export function etiquetaChat(chat: Pick<ChatRow, "jid" | "name" | "contactName" | "isGroup">): string {
+  const nombre = String(chat?.name ?? "").trim();
+  // En un grupo la agenda no aplica: `contacts` guarda personas, no grupos.
+  if (chat?.isGroup) return nombre || "grupo sin nombre";
+  return String(chat?.contactName ?? "").trim() || nombre || jidLegible(String(chat?.jid ?? ""));
+}
+
+/**
+ * Los chats que la bandeja muestra AHORA: primero el filtro de tabs (CA-5.5,
+ * CA-10.4) y después el texto del buscador (CA-5.2), que compara sin acentos ni
+ * mayúsculas contra el nombre VISIBLE y contra el jid (o sea, contra el número).
+ *
+ * Se filtra en memoria y no con `repo.searchChats` a propósito: `inbox.chats` ya
+ * está en RAM, es la MISMA lista que se está viendo, y una consulta por tecla
+ * sobre la base sería I/O regalado (RNF-6).
+ */
+export function filtrarChats(chats: ChatRow[], filtro: InboxFilter, query: string): ChatRow[] {
+  const aguja = fold(String(query ?? "").trim());
+  const salida: ChatRow[] = [];
+  for (const c of chats) {
+    if (filtro === "unread" && c.unreadCount <= 0) continue;
+    if (filtro === "groups" && !c.isGroup) continue;
+    if (aguja && !fold(etiquetaChat(c)).includes(aguja) && !fold(c.jid).includes(aguja)) continue;
+    salida.push(c);
+  }
+  return salida;
+}
+
+/**
+ * El jid seleccionado EFECTIVO. El guardado si sigue a la vista; si no, el
+ * primero de la lista.
+ *
+ * Hace falta porque la lista cambia por debajo sin que el usuario toque nada: un
+ * mensaje entrante puede sacar un chat del filtro `No leídos`. El jid guardado
+ * queda como estaba hasta la próxima acción del usuario —así el cursor no se
+ * mueve solo— y todos los que lo leen resuelven igual.
+ */
+export function seleccionVigente(visibles: ChatRow[], jid: string | null): string | null {
+  if (jid && visibles.some((c) => c.jid === jid)) return jid;
+  return visibles.length > 0 ? (visibles[0] as ChatRow).jid : null;
+}
+
+/** Lo que hace falta para mover el cursor: la lista visible y dónde está parado. */
+function vistaBandeja(d: CommandDeps): { visibles: ChatRow[]; actual: string | null } {
+  const ui = d.store.inboxUi();
+  const visibles = filtrarChats(d.store.getSnapshot("inbox").chats, ui.inboxFilter, ui.inboxQuery);
+  return { visibles, actual: seleccionVigente(visibles, ui.selectedJid) };
+}
+
+/** `Home`/`End`: un delta que siempre se pasa de largo y queda clavado en la punta. */
+export const SALTO_EXTREMO = Number.MAX_SAFE_INTEGER;
+
 export type Commands = {
   /** Abre el chat y lo marca leído (CA-6.1, CA-11.1). `anchorId` = salto desde la búsqueda. */
   openChat(jid: string, opts?: { anchorId?: number }): void;
   closeChat(): void;
+  /** Abre el chat seleccionado en la bandeja (`⏎`, CA-6.1). Sin selección no hace nada. */
+  openSelectedChat(): void;
   /** Marca leído SOLO en local; el recibo a WhatsApp lo agrega la tarea 15 (CA-11.3). */
   markRead(jid: string): void;
+  /** Pone el cursor sobre un chat (click, CA-5.6). */
+  selectChat(jid: string): void;
+  /** Mueve el cursor `delta` filas dentro de la lista VISIBLE, sin dar la vuelta (CA-5.3, CA-5.7). */
+  moveSelection(delta: number): void;
+  /** Aplica un filtro (click en un tab, CA-5.8). */
+  setInboxFilter(filtro: InboxFilter): void;
+  /** `Tab`: Todos → No leídos → Grupos → Todos (CA-5.5). */
+  cycleInboxFilter(): void;
+  /** Texto del buscador de la bandeja (CA-5.2). `""` vuelve a la lista completa (CA-5.4). */
+  setInboxQuery(query: string): void;
   /** Conecta en el acto, salteando el backoff (CA-15.5). */
   reconnectNow(): void;
   /** Alterna QR ↔ código a mano (`Tab`, CA-2.6). NO toca el socket (D11). */
@@ -107,11 +215,76 @@ export const commands: Commands = {
   openChat(jid, opts) {
     if (!deps || !jid) return;
     deps.store.setOpenChat(jid, { anchorId: opts?.anchorId ?? null });
+    // El chat que se abre queda seleccionado: si se llegó por click sobre una
+    // fila que no era la del cursor —o por el salto desde la búsqueda global
+    // (CA-12.3)—, el cursor tiene que terminar donde terminó el usuario.
+    deps.store.setInboxUi({ selectedJid: jid });
     commands.markRead(jid);
+  },
+
+  openSelectedChat() {
+    if (!deps) return;
+    const { actual } = vistaBandeja(deps);
+    if (actual) commands.openChat(actual);
   },
 
   closeChat() {
     deps?.store.setOpenChat(null);
+  },
+
+  selectChat(jid) {
+    if (!deps || !jid) return;
+    deps.store.setInboxUi({ selectedJid: jid });
+  },
+
+  moveSelection(delta) {
+    if (!deps || !Number.isFinite(delta) || delta === 0) return;
+    const { visibles, actual } = vistaBandeja(deps);
+    if (visibles.length === 0) {
+      // Lista vacía: el cursor se suelta, no queda apuntando a un fantasma.
+      if (actual !== null) deps.store.setInboxUi({ selectedJid: null });
+      return;
+    }
+    // `actual` siempre está en `visibles` (lo garantiza `seleccionVigente`), así
+    // que el índice nunca es −1.
+    const i = visibles.findIndex((c) => c.jid === actual);
+    const j = Math.max(0, Math.min(visibles.length - 1, i + delta));
+    deps.store.setInboxUi({ selectedJid: (visibles[j] as ChatRow).jid });
+  },
+
+  setInboxFilter(filtro) {
+    if (!deps || !FILTROS.includes(filtro)) return;
+    const ui = deps.store.inboxUi();
+    // El cursor se REANCLA en el mismo movimiento: si el chat que estaba
+    // seleccionado no pasa el filtro nuevo, salta al primero de la lista nueva.
+    // Un solo `setInboxUi` ⇒ un solo `markDirty` ⇒ un solo render (D3).
+    const visibles = filtrarChats(deps.store.getSnapshot("inbox").chats, filtro, ui.inboxQuery);
+    deps.store.setInboxUi({
+      inboxFilter: filtro,
+      selectedJid: seleccionVigente(visibles, ui.selectedJid),
+    });
+  },
+
+  cycleInboxFilter() {
+    if (!deps) return;
+    const actual = deps.store.inboxUi().inboxFilter;
+    const i = FILTROS.indexOf(actual);
+    commands.setInboxFilter(FILTROS[(i + 1) % FILTROS.length] as InboxFilter);
+  },
+
+  setInboxQuery(query) {
+    if (!deps) return;
+    const texto = String(query ?? "");
+    const ui = deps.store.inboxUi();
+    // Sin corte por "no cambió" a propósito: el snapshot está CACHEADO hasta el
+    // próximo flush (D3), así que dos llamadas en el mismo tick comparan las dos
+    // contra el valor viejo y la segunda se perdería. Pasa de verdad: al abrir
+    // la ayuda con `?`, el campo escribe y `App` limpia, todo en la misma tecla.
+    const visibles = filtrarChats(deps.store.getSnapshot("inbox").chats, ui.inboxFilter, texto);
+    deps.store.setInboxUi({
+      inboxQuery: texto,
+      selectedJid: seleccionVigente(visibles, ui.selectedJid),
+    });
   },
 
   markRead(jid) {

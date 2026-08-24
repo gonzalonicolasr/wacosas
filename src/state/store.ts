@@ -81,7 +81,23 @@ export type ConvoSnapshot = {
  */
 export type SearchSnapshot = { query: string; hits: SearchHit[]; chats: ChatRow[] };
 
-export type UiSnapshot = { toast: { text: string; at: number } | null; connBanner: string | null };
+/** Los tres filtros de la bandeja (CA-5.5). El orden es el que cicla `Tab`. */
+export type InboxFilter = "all" | "unread" | "groups";
+
+export type UiSnapshot = {
+  toast: { text: string; at: number } | null;
+  connBanner: string | null;
+  /** Filtro activo de la bandeja (CA-5.5). */
+  inboxFilter: InboxFilter;
+  /** Texto del buscador de la bandeja. Filtra en memoria, no en SQL (CA-5.2). */
+  inboxQuery: string;
+  /**
+   * Chat seleccionado en la bandeja, SIEMPRE por jid y NUNCA por índice
+   * (CA-4.4): un mensaje entrante reordena la lista y un índice guardado dejaría
+   * el cursor sobre otro chat.
+   */
+  selectedJid: string | null;
+};
 
 /** El mapa slice → snapshot. De acá salen `Slice` y `SnapshotOf`. */
 export type Snapshots = {
@@ -131,6 +147,20 @@ export type Store = {
   setConn(patch: Partial<ConnSnapshot>): void;
   setLink(patch: Partial<LinkSnapshot>): void;
   setBanner(text: string | null): void;
+  /**
+   * Estado de navegación de la bandeja (filtro, buscador, selección). Va aparte
+   * de `setBanner`/`toast` para que un movimiento del cursor no pueda pisar un
+   * aviso efímero por descuido.
+   */
+  setInboxUi(patch: Partial<Pick<UiSnapshot, "inboxFilter" | "inboxQuery" | "selectedJid">>): void;
+  /**
+   * El estado de la bandeja EN VIVO, sin pasar por el snapshot cacheado. Mismo
+   * motivo que `openChatJid()`: quien va a ESCRIBIR necesita leer lo último, no
+   * lo último publicado. Dos teclas dentro del mismo frame de 33 ms (mantener
+   * apretada la flecha, o el `?` que abre la ayuda mientras el campo escribe)
+   * leerían las dos el mismo valor viejo y la segunda se perdería.
+   */
+  inboxUi(): Pick<UiSnapshot, "inboxFilter" | "inboxQuery" | "selectedJid">;
   /** Chat abierto: define la ventana del slice `convo` y a quién no sumarle no leídos. */
   setOpenChat(jid: string | null, opts?: { anchorId?: number | null }): void;
   openChatJid(): string | null;
@@ -170,7 +200,13 @@ export function createStore(opts: StoreOpts = {}): Store {
     pairingRequestedAt: null,
     reason: null,
   };
-  const ui: UiSnapshot = { toast: null, connBanner: null };
+  const ui: UiSnapshot = {
+    toast: null,
+    connBanner: null,
+    inboxFilter: "all",
+    inboxQuery: "",
+    selectedJid: null,
+  };
   let abierto: string | null = null;
   let ancla: number | null = null;
   let consulta = "";
@@ -332,6 +368,16 @@ export function createStore(opts: StoreOpts = {}): Store {
     setBanner(text) {
       ui.connBanner = text;
       markDirty("ui");
+    },
+
+    setInboxUi(patch) {
+      Object.assign(ui, patch);
+      markDirty("ui");
+    },
+
+    inboxUi() {
+      const { inboxFilter, inboxQuery, selectedJid } = ui;
+      return { inboxFilter, inboxQuery, selectedJid };
     },
 
     setOpenChat(jid, o = {}) {

@@ -27,6 +27,16 @@ export type MessageStatus = "received" | "pending" | "sent" | "delivered" | "rea
 export type ChatRow = {
   jid: string;
   name: string;
+  /**
+   * Nombre de la agenda (`contacts.name`), resuelto en la consulta con un
+   * `LEFT JOIN`. Es DERIVADO: no se escribe con `upsertChat`.
+   *
+   * Existe porque `chats.name` de un 1:1 sale del `pushName` —el nombre que
+   * eligió el otro— y §5.4 pide que el de la agenda tenga prioridad. Se lee al
+   * PINTAR la fila y nunca se copia a `chats`: upsertear un chat por cada
+   * contacto de la agenda llenaría la bandeja de gente con la que nunca hablaste.
+   */
+  contactName: string;
   isGroup: boolean;
   /** Epoch en SEGUNDOS del último mensaje: es el orden de la bandeja (CA-4.2). */
   lastMessageAt: number;

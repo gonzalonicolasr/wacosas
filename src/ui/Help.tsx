@@ -32,6 +32,15 @@ const ATAJOS: Array<[string, string]> = [
   ["Ctrl-C · Ctrl-Q", "salir"],
 ];
 
+const ATAJOS_BANDEJA: Array<[string, string]> = [
+  ["escribir", "filtrar por nombre o número, sin acentos"],
+  ["↑ ↓ · ^K ^J", "mover la selección (la rueda también)"],
+  ["PgUp PgDn", "saltar de a una pantalla (Inicio / Fin, a las puntas)"],
+  ["⏎ · doble click", "abrir el chat seleccionado"],
+  ["Tab", "filtrar: todos / no leídos / grupos"],
+  ["Esc", "limpiar el buscador"],
+];
+
 const ATAJOS_MINI: Array<[string, string]> = [
   ["⏎", "entrar a la conversación"],
   ["Esc", "volver a la bandeja"],
@@ -54,6 +63,9 @@ export type LineaAyuda =
 export function lineasAyuda({ logPath, mini }: { logPath: string; mini: boolean }): LineaAyuda[] {
   const lineas: LineaAyuda[] = [{ tipo: "titulo", texto: "teclas" }];
   for (const [tecla, texto] of ATAJOS) lineas.push({ tipo: "atajo", tecla, texto });
+  lineas.push({ tipo: "hueco" });
+  lineas.push({ tipo: "titulo", texto: "en la bandeja" });
+  for (const [tecla, texto] of ATAJOS_BANDEJA) lineas.push({ tipo: "atajo", tecla, texto });
   if (mini) {
     lineas.push({ tipo: "hueco" });
     lineas.push({ tipo: "titulo", texto: "en terminales angostas (un panel por vez)" });

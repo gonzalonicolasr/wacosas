@@ -322,6 +322,8 @@ describe("bandeja", () => {
     expect(repo.getChat(CHAT)).toEqual({
       jid: CHAT,
       name: "Ana Gómez",
+      // Sin fila en `contacts`: el `LEFT JOIN` deja el nombre de agenda vacío.
+      contactName: "",
       isGroup: false,
       lastMessageAt: 500,
       lastPreview: "dale",
