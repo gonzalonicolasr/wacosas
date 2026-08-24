@@ -391,6 +391,15 @@
     `{ok:false}` sin insertar nada. Y a ojo: `Ctrl-E` enfoca el campo, `⏎` con texto envía y limpia,
     `⏎` con espacios no hace nada, `Alt-⏎` mete un salto de línea, `Esc` vuelve a la bandeja con el
     borrador intacto y volver al chat lo restaura.
+  - ⚠️ **DESVÍO de D8 (decidido en la revisión de la 14) — el glifo `⏳ en cola (Ns)` NO se hizo**: D8
+    pide que la fila muestre la cuenta regresiva y que un toast avise que se está espaciando el ritmo.
+    Se hizo **sólo el toast**; el `(Ns)` pide una cuenta regresiva por mensaje en `ui/MessageRow.tsx`
+    con un re-render por segundo, que es justo lo que RNF-5 evita, y el silencio ya queda explicado
+    con el toast. Segundo hallazgo del mismo issue: el aviso **no puede medirse con la espera del
+    limitador** —el worker es serial y pide turno recién cuando toma el job, para entonces el anterior
+    ya salió y la espera da 1 s siempre, así que en una ráfaga no avisaba NUNCA—: se mide al
+    **encolar**, contra los mensajes que ya hay adelante, y en el turno queda el aviso del tope de
+    20/minuto (`UMBRAL_AVISO_MS` en `wa/send.ts`).
   - ⚠️ **abierto por la revisión de la tarea 6**: `UiSnapshot` **no tiene campo de borradores** y el
     diseño tampoco los define. Agregalo acá, en el slice `ui`, que es donde el done-when los pide.
   - ⚠️ **abierto por la tarea 7 — el estado de entrega puede retroceder**: la rama `msg-updates` del
@@ -416,6 +425,13 @@
     `chats.update` con `unreadCount:0` pone el contador local en 0. Y a ojo: abrir un chat con no
     leídos lo pone en 0, `Ctrl-L` hace lo mismo sin abrirlo, y al reiniciar el proceso los
     contadores quedan como estaban (CA-14.3).
+  - ⚠️ **abierto por la revisión de la tarea 14 — el ERROR ack llega sin motivo**: desde la 14 un
+    `messages.update` con `status: ERROR` (el ack con `attrs.error`: 403, 479 `smax-invalid`, "user is
+    temporarily restricted") baja el mensaje de `sent` a `failed` y `Ctrl-Y` lo encuentra. Pero
+    `aplicarMsgUpdate` llama a `setMessageStatus` **sin el cuarto argumento**, así que la fila queda
+    con `error = null` y el usuario ve el `✗` sin ninguna explicación. El código viene en
+    `update.messageStubParameters` (`[attrs.error]`, y el texto de restricción cuando aplica): pasalo
+    como motivo cuando el estado sea `failed`. Es una línea en `wa/ingest.ts`, que es tuyo.
   - ⚠️ **abierto por la tarea 7 — el `unreadCount` positivo es un DELTA, no un absoluto**: el ingest
     ya aplica `chats.update` con `unreadCount === 0 → setUnread(jid, 0)` y **a propósito ignora los
     positivos**, porque `process-message.js:196` emite `+1` por mensaje. Si acá tomás un positivo
@@ -460,13 +476,16 @@
   - depends-on: 13
 
 - [ ] 17. Implementar instancia única y cierre ordenado
-  - ⚠️ **abierto por la tarea 14 — el foco se lo roba el mouse sin que `App` se entere**: el renderer
-    se crea con `autoFocus` (default `true`), así que un click izquierdo enfoca el primer ancestro
-    focusable. El `<scrollbox>` de la conversación **es** focusable ⇒ **clickear la conversación le
-    saca el foco al buscador de la bandeja y al composer**, y el modo sigue diciendo `compose` con el
-    campo muerto hasta apretar `Ctrl-E` de nuevo. Ya pasaba antes de la 14 con el buscador. Se
-    arregla con `autoFocus:false` en el renderer (que es tuyo, `index.tsx`) o con un listener del
-    evento `blurred`.
+  - ✅ **cerrado por la revisión de la tarea 14 — el foco que se robaba el mouse**: el renderer se
+    creaba con `autoFocus` (default `true`), así que un click izquierdo enfocaba el primer ancestro
+    focusable; el `<scrollbox>` de la conversación **es** focusable ⇒ clickear la conversación le
+    sacaba el foco al buscador de la bandeja y al campo de redacción, y el modo seguía diciendo
+    `compose` con el campo muerto y el pie con `⏎ enviar`. ⚠️ **`Ctrl-E` solo NO lo recuperaba**
+    (en `compose` el `useKeyboard` de `App` no maneja nada más que la salida): había que hacer `Esc`
+    y recién ahí `Ctrl-E`. Ya pasaba antes de la 14 con el buscador. Arreglado en la 14 con
+    `autoFocus:false` en `createCliRenderer` (`src/index.tsx`) — verificado con clicks reales sobre
+    la demo: el buscador y el campo siguen recibiendo teclas después de clickear la conversación, y
+    el click en la bandeja (seleccionar / abrir con doble click, CA-5.6) y la rueda siguen andando.
   - ⚠️ **también de la 14**: `SendQueue` **no tiene `stop()`** (§5.8 no lo define). Para el apagado
     ordenado necesitás que el worker deje de aceptar trabajo: agregalo, o usá `inFlight()` + marcar
     `failed` como dice §6.6. Y acordate del orden: `store.stop()` va **al final**, después de parar
