@@ -421,11 +421,15 @@ function Panel({ ancho, cajaRef }: PropsConversacion) {
     // vuelve a mirar apenas el salto se ejecuta.
     if (saltoPendienteRef.current) return;
     // Lo mismo mientras se monta por lotes (decisión 7): el contenido crece
-    // hacia ARRIBA en cada vuelta, así que `scrollHeight` sube sin que el
-    // usuario haya tocado nada y la caja parece haberse ido del final. Sin esta
-    // guarda se prendía el aviso de mensajes nuevos sin que hubiera llegado
-    // nada. El muestreo vuelve a mirar apenas termina de montar.
-    if (false && desdeRef.current > 0) return;
+    // hacia ARRIBA en cada vuelta y la caja puede parecer que se fue del final
+    // sin que el usuario haya tocado nada; con eso se prendería el aviso de
+    // mensajes nuevos de la nada, o —si algún día se lotea el camino anclado—
+    // se soltaría el ancla sola. Es una guarda PREVENTIVA: sacándola no se
+    // llegó a reproducir ninguna de las dos, porque OpenTUI re-pega el sticky
+    // en el mismo pase en el que cambia el alto (`recalculateBarProps`), así
+    // que alto y posición nunca se leen desfasados. El muestreo vuelve a mirar
+    // apenas termina de montar.
+    if (desdeRef.current > 0) return;
     const lista = mensajesRef.current;
     let n = 0;
     if (alFinal()) {
