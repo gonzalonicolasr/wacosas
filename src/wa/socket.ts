@@ -85,19 +85,39 @@ const EVENTOS = [
 type BaileysLogger = NonNullable<UserFacingSocketConfig["logger"]>;
 
 /**
- * Nivel del logger de Baileys. **`warn`, no `silent`** — y eso tiene historia:
- * con `pino({level:"silent"})` (copiado del prior art) nos perdimos el aviso que
- * decía textualmente qué estaba roto en la configuración del historial
- * (`Socket/socket.js:33-37`, ver el comentario de `shouldSyncHistoryMessage` más
- * abajo). Un canal de diagnóstico apagado no es "menos ruido": es un bug que
- * tarda semanas en encontrarse.
+ * Nivel del logger de Baileys. **`info`** — y el camino hasta acá tiene historia,
+ * porque cada escalón lo pagamos con un bug que tardó semanas:
  *
- * `trace`/`debug` quedan afuera a propósito: Baileys compara `logger.level`
- * contra esos dos valores para decidir si serializa nodos binarios enteros
- * (`Socket/socket.js:75,450,466`), o sea que subirlo cuesta CPU **y** volcaría
- * contenido de mensajes al log (CA-14.7).
+ *  · `silent` (copiado del prior art) nos tapó el aviso que decía textualmente qué
+ *    estaba roto en la configuración del historial (`Socket/socket.js:33-37`, ver
+ *    el comentario de `shouldSyncHistoryMessage` más abajo);
+ *  · `warn` nos mostró que una colección de app-state quedaba **estacionada**
+ *    ("blocked on missing key … parking after 2 attempts") pero NO si la
+ *    sincronización llegaba a correr: `'Doing app state sync'` y `'App state sync
+ *    complete'` son `info` (`Socket/chats.js:997` y `:1001`), igual que
+ *    `'resyncing <col> from vN'` (`:454`), `'synced <col> to vN'` (`:497`) y las
+ *    tres líneas que dicen qué rama de la máquina de sincronización se tomó
+ *    (`:1081`, `:1090`, `:1095`). Sin esas cinco, el diagnóstico de por qué no
+ *    llegaban los nombres de la agenda salió leyendo el fuente de Baileys.
+ *
+ * **Qué cuesta**, medido con un socket real contra WhatsApp y `creds/` temporal,
+ * sin vincular: **3 líneas en 300 s** (0,6 por minuto; en `warn` fueron 0). El
+ * repaso del fuente dice que en régimen tampoco escala: los `logger.info` de
+ * Baileys son de UNA vez —por conexión (`Socket/socket.js`), por trozo de
+ * historial (`Utils/process-message.js:246`) o por resync de app-state
+ * (`Socket/chats.js`)— y **ninguno cuelga del camino de un mensaje**. El único que
+ * depende del tráfico es `Signal/libsignal.js:92`, que sólo salta con un `pkmsg`
+ * de un peer nuevo. Y la rotación de `boot/log.ts` (5 MB, un anterior) le pone
+ * techo igual.
+ *
+ * `trace`/`debug` siguen afuera a propósito: Baileys compara `logger.level`
+ * contra esos dos valores —y sólo contra esos dos— para decidir si serializa
+ * nodos binarios enteros (`Socket/socket.js:75,450,466`), o sea que subirlo cuesta
+ * CPU **y** volcaría contenido de mensajes al log (CA-14.7). Con `info` esas tres
+ * comparaciones dan `false`, igual que con `warn`: el cambio no altera en nada lo
+ * que Baileys hace, sólo lo que cuenta.
  */
-export const NIVEL_BAILEYS = "warn";
+export const NIVEL_BAILEYS = "info";
 
 /**
  * Adaptador del logger de Baileys a nuestro logger de archivo (CA-16.2, CA-14.7).
@@ -111,12 +131,17 @@ export const NIVEL_BAILEYS = "warn";
  *
  * Del aviso se queda **sólo el mensaje**: Baileys llama de las dos formas
  * (`warn("texto")` y `warn(obj, "texto")`) y ese `obj` puede traer un sobre
- * entero, con cuerpo y claves adentro. Se descarta sin mirarlo. El texto viaja
- * en el campo `aviso`, que `fmtLinea` además recorta a 200 caracteres.
+ * entero, con cuerpo y claves adentro. Se descarta sin mirarlo — y esto vale
+ * igual para `info`, que es el nivel donde más objetos gordos viajan
+ * (`logger.info({histNotification}, …)`, `Utils/process-message.js:246`). El texto
+ * viaja en el campo `aviso`, que `fmtLinea` además recorta a 200 caracteres.
+ * Ese descarte es lo que hace que subir el nivel NO pueda filtrar un cuerpo ni una
+ * credencial al archivo (CA-14.7): lo único que se copia es una cadena literal del
+ * fuente de Baileys.
  */
 export function createBaileysLogger(log: Logger, level: string = NIVEL_BAILEYS): BaileysLogger {
   const escribir =
-    (nivel: "warn" | "error") =>
+    (nivel: "info" | "warn" | "error") =>
     (obj: unknown, msg?: string): void => {
       const texto = typeof msg === "string" ? msg : typeof obj === "string" ? obj : "";
       log[nivel]("baileys", { aviso: texto || "(aviso sin texto)" });
@@ -128,9 +153,12 @@ export function createBaileysLogger(log: Logger, level: string = NIVEL_BAILEYS):
     // Baileys hace `logger.child({class:"..."})` en varias capas. Devolver el
     // mismo objeto alcanza: el contexto del hijo iría al `obj` que igual se tira.
     child: () => logger,
+    // `trace`/`debug` se tiran SIEMPRE, no según `level`: son los dos niveles que
+    // vuelcan nodos binarios (CA-14.7) y ninguna versión de esta función los tiene
+    // que poder escribir.
     trace: nada,
     debug: nada,
-    info: nada,
+    info: level === "info" ? escribir("info") : nada,
     warn: escribir("warn"),
     error: escribir("error"),
   };

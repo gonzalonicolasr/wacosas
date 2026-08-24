@@ -29,7 +29,10 @@ const COL = 16;
 const ATAJOS: Array<[string, string]> = [
   ["?", "abrir / cerrar esta ayuda"],
   ["Esc", "cerrar la ayuda"],
-  ["Ctrl-R", "reconectar ahora, sin esperar el backoff"],
+  // Las dos JUNTAS por el alto, con el mismo criterio que `⏎ · ^L` de la bandeja:
+  // a 80×24 el cuerpo son 20 filas y la ayuda mide exactamente 20, así que un
+  // renglón más le hace tirar los huecos de las tres secciones para ahorrar uno.
+  ["Ctrl-R · Ctrl-N", "reconectar ahora · volver a pedir los nombres de la agenda"],
   ["Ctrl-C · Ctrl-Q", "salir"],
 ];
 

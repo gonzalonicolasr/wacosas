@@ -287,6 +287,24 @@ export function App({
       return;
     }
 
+    // Volver a pedirle a WhatsApp los nombres de la agenda (`wa/appstate.ts`): es
+    // la salida manual de una colección de app-state estacionada, y sin ella la
+    // bandeja se queda con números para siempre sin que el usuario pueda hacer
+    // nada. Va acá arriba, con `Ctrl-R`, por dos motivos: la ayuda la anuncia en
+    // la sección GLOBAL —al lado de `^R`, en el mismo renglón— y el lugar más
+    // probable donde alguien la va a probar es justamente leyendo la ayuda, que
+    // más abajo se traga todas las teclas.
+    //
+    // Que sea global no la vuelve peligrosa: manda stanzas, pero `resyncContacts`
+    // corta sin conexión y `appstate.force` tiene su propio espaciado
+    // (`ESPERA_MANUAL_MS`), así que un `^N` de más no le pregunta nada a WhatsApp.
+    // Y no le come nada a ningún campo de texto: el `<input>` y el `<textarea>` de
+    // OpenTUI no tienen bindings con `ctrl` (§7.3, el mismo chequeo de `^L`/`^G`).
+    if (key.ctrl && es("n")) {
+      commands.resyncContacts();
+      return;
+    }
+
     // ── login ───────────────────────────────────────────────────────────────
     // Va ANTES que el resto: mientras no haya sesión, la pantalla es la
     // vinculación y las teclas de la bandeja no tienen a qué aplicarse. El

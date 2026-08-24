@@ -489,7 +489,10 @@ test("el logger de baileys se queda con el mensaje y tira el objeto (CA-14.7)", 
   bl.error({ msg: { conversation: "secreto" }, creds: "no" }, "algo falló");
   // Un hijo escribe al mismo lado, y por debajo del nivel no sale nada.
   bl.child({ class: "baileys" }).warn("desde el hijo");
-  bl.info({}, "esto no se loguea");
+  // `info` SÍ se loguea: es donde baileys cuenta si la sincronización de
+  // app-state corre y termina (`Socket/chats.js:997,1001`), que es lo que hacía
+  // falta para diagnosticar los nombres de la agenda que no llegaban.
+  bl.info({ histNotification: { conversation: "tampoco esto" } }, "Doing app state sync");
   bl.debug({}, "esto tampoco");
   bl.trace({}, "esto menos");
 
@@ -497,13 +500,32 @@ test("el logger de baileys se queda con el mensaje y tira el objeto (CA-14.7)", 
   expect(texto).toContain("aviso suelto");
   expect(texto).toContain("algo falló");
   expect(texto).toContain("desde el hijo");
+  expect(texto).toContain("INFO  baileys");
+  expect(texto).toContain("Doing app state sync");
+  // El objeto se tira ENTERO también en `info`, que es el nivel donde baileys
+  // manda los payloads más gordos (CA-14.7).
   expect(texto).not.toContain("secreto");
-  expect(texto).not.toContain("esto no se loguea");
+  expect(texto).not.toContain("tampoco esto");
   expect(texto).not.toContain("esto tampoco");
+  expect(texto).not.toContain("esto menos");
   expect(bl.level).toBe(NIVEL_BAILEYS);
   // `trace`/`debug` harían que baileys serialice nodos binarios enteros.
   expect(NIVEL_BAILEYS).not.toBe("trace");
   expect(NIVEL_BAILEYS).not.toBe("debug");
+});
+
+test("en `warn` el mismo adaptador se traga los `info` (el nivel manda de verdad)", () => {
+  const dir = mkdtempSync(join(tmp, "balog-warn-"));
+  const logPath = join(dir, "wa.log");
+  const bl = createBaileysLogger(createLogger(logPath), "warn");
+
+  bl.info({}, "esto no se loguea");
+  bl.warn("esto sí");
+
+  const texto = readFileSync(logPath, "utf8");
+  expect(texto).not.toContain("esto no se loguea");
+  expect(texto).toContain("esto sí");
+  expect(bl.level).toBe("warn");
 });
 
 test("si la versión no se puede resolver sigue con la bundleada y lo loguea (CA-1.3)", async () => {

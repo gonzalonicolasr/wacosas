@@ -22,7 +22,7 @@ const LOG = "/tmp/wacosas-test.log";
 const ATAJOS_GLOBALES = [
   "?               abrir / cerrar esta ayuda",
   "Esc             cerrar la ayuda",
-  "Ctrl-R          reconectar ahora, sin esperar el backoff",
+  "Ctrl-R · Ctrl-N reconectar ahora · volver a pedir los nombres de la agenda",
   "Ctrl-C · Ctrl-Q salir",
 ];
 const ATAJOS_BANDEJA = [
@@ -104,6 +104,10 @@ function cablearComandos() {
     telefonos: [] as string[],
     /** Eventos del log, para poder afirmar que algo NO pasó (ver `Ctrl-R`). */
     eventos: [] as string[],
+    /** Veces que `Ctrl-N` llegó a pedir el resync de app-state. */
+    resyncs: 0,
+    /** Lo que devuelve `wa.isOpen()`: `Ctrl-N` no manda nada sin conexión. */
+    conectado: true,
   };
   configureCommands({
     repo: {} as CommandDeps["repo"],
@@ -114,10 +118,18 @@ function cablearComandos() {
         // para que el test mire el mismo rastro que se lee en vivo.
         visto.eventos.push("wa.reconnect_now");
       },
+      isOpen: () => visto.conectado,
       async requestPairingCode(digits: string) {
         visto.telefonos.push(digits);
       },
     } as CommandDeps["wa"],
+    appstate: {
+      onOpen() {},
+      force() {
+        visto.resyncs++;
+      },
+      stop() {},
+    },
     store,
     log: {
       info: (ev: string) => visto.eventos.push(ev),
@@ -286,6 +298,49 @@ test("Ctrl-R funciona con la ayuda abierta y la ayuda queda abierta", async () =
   const frame = t.captureCharFrame();
   expect(frame).toContain("reconectando…"); // CA-19.5, el aviso del pie
   expect(frame).toContain("─ ayuda ");
+  t.renderer.destroy();
+});
+
+// `Ctrl-N` manda stanzas a WhatsApp, así que las dos mitades importan: que la
+// tecla llegue al comando, y que NO salga nada cuando no hay a quién preguntarle.
+test("Ctrl-N pide el resync de la agenda", async () => {
+  const visto = cablearComandos();
+  const t = await montar(80, 24);
+  act(() => {
+    t.mockInput.pressKey("n", { ctrl: true });
+  });
+  await pintar(t);
+  expect(visto.resyncs).toBe(1);
+  t.renderer.destroy();
+});
+
+test("Ctrl-N también anda con la ayuda abierta (que es donde se lee la tecla)", async () => {
+  const visto = cablearComandos();
+  const t = await montar(80, 24);
+  await abrirAyuda(t);
+  act(() => {
+    t.mockInput.pressKey("n", { ctrl: true });
+  });
+  await pintar(t);
+  expect(visto.resyncs).toBe(1);
+  // Y la ayuda queda abierta, igual que con `Ctrl-R`.
+  expect(t.captureCharFrame()).toContain("─ ayuda ");
+  t.renderer.destroy();
+});
+
+test("Ctrl-N sin conexión no manda NADA y lo avisa por el pie", async () => {
+  const visto = cablearComandos();
+  visto.conectado = false;
+  const t = await montar(80, 24);
+  act(() => {
+    t.mockInput.pressKey("n", { ctrl: true });
+  });
+  act(() => {
+    store.flushNow(); // el toast viaja en el flush coalescido (D3)
+  });
+  await pintar(t);
+  expect(visto.resyncs).toBe(0);
+  expect(t.captureCharFrame()).toContain("sin conexión");
   t.renderer.destroy();
 });
 

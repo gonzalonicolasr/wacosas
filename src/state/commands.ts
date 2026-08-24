@@ -15,6 +15,7 @@ import type { Logger } from "../boot/log";
 import type { Repo } from "../db/repo";
 import type { ChatRow } from "../db/types";
 import { fold } from "../lib/fmt";
+import type { AppStateSync } from "../wa/appstate";
 import type { ReadReceipts } from "../wa/read";
 import type { SendQueue } from "../wa/send";
 import type { WaController } from "../wa/socket";
@@ -41,6 +42,12 @@ export type CommandDeps = {
    * en menos de 1 s (CA-13.1). El `import type` de arriba se borra al compilar.
    */
   read?: ReadReceipts;
+  /**
+   * Reparación de app-state (los nombres de la agenda). Opcional por el mismo
+   * motivo que `send` y `read`: un test de interfaz no tiene socket, y sin ella
+   * `resyncContacts` avisa en vez de romper.
+   */
+  appstate?: AppStateSync;
   /**
    * Cierre del proceso. Hoy es el mínimo que deja la terminal usable; la tarea 17
    * lo reemplaza por el apagado ordenado de §6.6 sin tocar a los llamadores.
@@ -299,6 +306,13 @@ export type Commands = {
   closeSearch(restaurar?: boolean): void;
   /** Conecta en el acto, salteando el backoff (CA-15.5). */
   reconnectNow(): void;
+  /**
+   * `Ctrl-N`: vuelve a pedirle a WhatsApp las colecciones de app-state, que es de
+   * donde salen los NOMBRES de la agenda. Es la única forma de destrabar una
+   * colección que quedó estacionada por una clave que faltaba (ver
+   * `wa/appstate.ts`). Manda stanzas: por eso es una tecla y no algo automático.
+   */
+  resyncContacts(): void;
   /** Alterna QR ↔ código a mano (`Tab`, CA-2.6). NO toca el socket (D11). */
   chooseLinkMethod(m: "qr" | "code"): void;
   /**
@@ -518,6 +532,25 @@ export const commands: Commands = {
     deps.wa.reconnectNow();
     // CA-19.5: reconectar no se ve solo hasta que el badge cambia.
     deps.store.toast("reconectando…");
+  },
+
+  resyncContacts() {
+    if (!deps) return;
+    // Sin conexión no sale ni una stanza: el resync es una consulta a WhatsApp y
+    // pedirla offline sólo dejaría un error en el log. El aviso lo pone acá porque
+    // `appstate` ni se entera de que la tecla se apretó.
+    if (!deps.wa.isOpen()) {
+      deps.store.toast("sin conexión: no se puede resincronizar la agenda");
+      return;
+    }
+    if (!deps.appstate) {
+      deps.store.toast("la sincronización de la agenda todavía no está disponible");
+      return;
+    }
+    deps.log.info("appstate.pedido_manual");
+    // El aviso al usuario lo pone `appstate` (sabe si arrancó, si ya había uno en
+    // curso y cómo terminó): duplicarlo acá dejaría dos toasts por una tecla.
+    deps.appstate.force();
   },
 
   chooseLinkMethod(m) {

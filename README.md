@@ -128,6 +128,32 @@ leídos, y que el envío salga siempre por la identidad que el otro lado espera.
 datos, no un ajuste de la vista, y se hace mal si se hace a medias. Queda anotado como el riesgo R7
 del diseño.
 
+### La agenda puede llegar incompleta (y `Ctrl-N` para volver a pedirla)
+
+Los nombres de tu agenda no viajan con los chats: WhatsApp los manda por **app-state**, cinco
+colecciones aparte que se sincronizan por su cuenta. Baileys las sincroniza **una sola vez**, en la
+primera conexión después de vincular; si eso no sale bien —se corta la red, cerrás la app en el medio,
+o se pasa el tope de 20 s que Baileys se da a sí mismo—, el contador interno igual queda marcado como
+"ya sincronizado" y **no se vuelve a intentar nunca**, ni reiniciando. Cuando pasa, la bandeja te
+muestra números en vez de nombres: en la cuenta con la que se encontró esto eran 844 contactos con
+sólo 32 nombres.
+
+wacosas lo repara solo: **30 segundos después de conectar** mira qué colecciones no tienen datos en
+`creds/` y le pide a WhatsApp **sólo esas**. Si la sincronización de Baileys anduvo bien, no encuentra
+nada que pedir y no manda ni una consulta. Está topeado (tres reparaciones por proceso, una por
+conexión) y se apaga solo si dos intentos seguidos no traen nada nuevo: es una reparación, no un
+reintento en loop.
+
+Queda un caso que **no se puede arreglar del lado de la app**. A veces WhatsApp manda una colección
+cifrada con una clave que tu teléfono todavía no compartió; Baileys la reintenta dos veces y la deja
+"estacionada". Esa clave sólo la manda el teléfono cuando quiere —no hay forma de pedirla— así que
+insistir automáticamente sería martillar sin poder ganar nunca. Para eso está **`Ctrl-N`**: vuelve a
+pedir las cinco colecciones a mano, que es lo único que destraba una estacionada si la clave llegó. Si
+después de un `Ctrl-N` seguís viendo números, la clave no llegó: la salida es desvincular y volver a
+vincular (`~/.local/share/wacosas/creds/`), que le pide todo de cero al teléfono.
+
+Todo esto queda en el log (`appstate.*`), con qué se pidió y qué entró.
+
 ### El resto
 
 Pendiente de completar en la tarea 18 (ventana fija de mensajes, alcance de la búsqueda global,

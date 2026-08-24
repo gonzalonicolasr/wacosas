@@ -231,6 +231,7 @@ if (qrPngPath) {
 }
 
 // ── máquina (después del render: baileys tarda en cargar) ────────────────────
+const { createAppStateSync } = await import("./wa/appstate");
 const { createIdentityResolver } = await import("./wa/identity");
 const { createIngest } = await import("./wa/ingest");
 const { createReadReceipts } = await import("./wa/read");
@@ -304,6 +305,22 @@ wa = createWaController({
   getMessage: send.getMessage,
 });
 
+// La reparación de app-state: las colecciones de las que salen los NOMBRES de la
+// agenda. `resyncAppState` y el estado local viven los dos colgados del socket,
+// así que se leen por función igual que en `identity`. Sin socket no hay nada que
+// reparar: el chequeo corre 30 s DESPUÉS de abrir y ahí el socket está.
+const appstate = createAppStateSync({
+  log,
+  localState: async (names) =>
+    (await wa?.socket()?.authState?.keys?.get("app-state-sync-version", names as string[])) ?? {},
+  resync: async (names, isInitialSync) => {
+    const sock = wa?.socket();
+    if (!sock) throw new Error("no hay conexión con WhatsApp");
+    await sock.resyncAppState(names, isInitialSync);
+  },
+  toast: (texto) => store.toast(texto),
+});
+
 // El barrido de identidades arranca cuando la conexión ABRE, no antes: el store
 // de baileys vive colgado del socket. Se engancha al store —igual que `--qr-png`—
 // para no meterle otra responsabilidad al ciclo de vida de la conexión, y sólo
@@ -314,10 +331,13 @@ store.subscribe("conn", () => {
   const abierta = store.getSnapshot("conn").state === "open";
   if (abierta === conexionAbierta) return;
   conexionAbierta = abierta;
-  if (abierta) identity.sweep();
+  if (abierta) {
+    identity.sweep();
+    appstate.onOpen();
+  }
 });
 
-configureCommands({ repo, wa, store, log, send, read, shutdown });
+configureCommands({ repo, wa, store, log, send, read, appstate, shutdown });
 
 log.info("boot.listo", {
   version,
