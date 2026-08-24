@@ -8,22 +8,26 @@
 import { expect, test } from "bun:test";
 
 import type { MessageKind, MessageStatus } from "../src/db/types";
-import { isRevoke, mapMessage, previewFor, resolveChatName } from "../src/wa/map";
+import { isRevoke, isSystemJid, mapMessage, previewFor, resolveChatName } from "../src/wa/map";
 
 import {
   AHORA,
   CTX,
   FIXTURES,
   JID_CONTACTO,
+  JID_DIFUSION,
   JID_GRUPO,
   JID_NEWSLETTER,
   JID_PARTICIPANTE,
+  JID_PSA,
   JID_STATUS,
   SELF_JID_NORMALIZADO,
   TS_BASE,
   audioConSegundos,
   audioSinSegundos,
+  avisoPsa,
   contacto,
+  difusion,
   documentoConNombre,
   documentoSinNombre,
   ecoPropio,
@@ -281,6 +285,21 @@ test("status@broadcast, newsletters, protocolo y reacciones se descartan (§5.4)
   expect(mapMessage(newsletter, CTX)).toBeNull();
   expect(mapMessage(protocoloNoRevoke, CTX)).toBeNull();
   expect(mapMessage(reaccion, CTX)).toBeNull();
+});
+
+test("el PSA de WhatsApp (el chat `+0`) y las listas de difusión también", () => {
+  // `0@c.us` normaliza a `0@s.whatsapp.net`: es el jid con el que la bandeja
+  // mostraba un contacto llamado `+0` lleno de "no soportado".
+  expect(mapMessage(avisoPsa, CTX)).toBeNull();
+  expect(mapMessage(difusion, CTX)).toBeNull();
+});
+
+test("isSystemJid distingue los pseudo-chats de las conversaciones de verdad", () => {
+  for (const jid of [JID_PSA, "0@s.whatsapp.net", "0@lid", JID_STATUS, JID_DIFUSION, JID_NEWSLETTER, "", null, undefined])
+    expect(isSystemJid(jid), `debería ser de sistema: ${jid}`).toBe(true);
+
+  for (const jid of [JID_CONTACTO, JID_GRUPO, JID_PARTICIPANTE, "111122223333@lid", "0123@s.whatsapp.net"])
+    expect(isSystemJid(jid), `NO debería ser de sistema: ${jid}`).toBe(false);
 });
 
 test("sin remoteJid o sin key.id no hay fila que insertar (§5.4, CA-14.2)", () => {

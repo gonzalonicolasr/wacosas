@@ -154,6 +154,21 @@ vincular (`~/.local/share/wacosas/creds/`), que le pide todo de cero al teléfon
 
 Todo esto queda en el log (`appstate.*`), con qué se pidió y qué entró.
 
+### Los chats con candado (y los bloqueados) no se listan
+
+Si escondiste un chat detrás de un código secreto en el teléfono (**Chat Lock**), en wacosas **no
+aparece**: ni en la bandeja, ni en los contadores de arriba, ni en los resultados de `Ctrl-G`. Acá no
+hay dónde pedirte el código, así que la única forma de respetar lo que elegiste es no mostrarlo. Lo
+mismo con los **contactos bloqueados** (WhatsApp sí te los deja en la lista; wacosas no).
+
+**No se borra nada.** El chat y todos sus mensajes siguen en la base: en cuanto le saques el candado
+—o desbloquees a la persona— desde el teléfono, vuelve a la bandeja con su historial completo. El
+estado llega por WhatsApp (`chats.lock` y la lista de bloqueados al conectar), así que puede tardar
+unos segundos después de vincular.
+
+⚠️ Un chat que ya tenías **abierto** cuando llegó el candado se sigue viendo hasta que salgas de él
+(`Esc`); en la bandeja ya no está.
+
 ### El resto
 
 Pendiente de completar en la tarea 18 (ventana fija de mensajes, alcance de la búsqueda global,

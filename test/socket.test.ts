@@ -45,6 +45,7 @@ import {
   createBaileysLogger,
   createWaController,
   decideOnClose,
+  EVENTOS,
   MOTIVO_BAD_SESSION,
   MOTIVO_CONEXION_REEMPLAZADA,
   MOTIVO_CUENTA_RECHAZADA,
@@ -122,9 +123,18 @@ type Falso = {
   oyentes(e: keyof BaileysEventMap): number;
   /** Teléfonos que pidieron código de emparejamiento. */
   pairing: string[];
+  /**
+   * `sock.fetchBlocklist`. **Sólo existe si el banco lo pide** (`bloqueados`):
+   * el resto de los tests corren con un socket que no la tiene, que es el otro
+   * caso que el controlador tiene que aguantar (una versión de baileys sin el
+   * método) y de paso deja los `jobs` de esos tests como estaban.
+   */
+  fetchBlocklist?(): Promise<(string | undefined)[]>;
+  /** Veces que se pidió la lista de bloqueados. */
+  pedidosBlocklist: number;
 };
 
-function falso(cfg: UserFacingSocketConfig): Falso {
+function falso(cfg: UserFacingSocketConfig, bloqueados?: (string | undefined)[] | Error): Falso {
   const em = new EventEmitter();
   const f: Falso = {
     cfg,
@@ -145,7 +155,15 @@ function falso(cfg: UserFacingSocketConfig): Falso {
     emitir: (e, a) => void em.emit(e, a),
     oyentes: (e) => em.listenerCount(e),
     pairing: [],
+    pedidosBlocklist: 0,
   };
+  if (bloqueados !== undefined) {
+    f.fetchBlocklist = async () => {
+      f.pedidosBlocklist++;
+      if (bloqueados instanceof Error) throw bloqueados;
+      return bloqueados;
+    };
+  }
   return f;
 }
 
@@ -179,6 +197,11 @@ function banco(
     version?: () => Promise<{ version: WAVersion; isLatest: boolean; error?: unknown }>;
     /** Envuelve la cola real (para romperla a propósito). */
     ingest?: (real: Ingest) => Ingest;
+    /**
+     * Lo que contesta `sock.fetchBlocklist` (o el error que tira). Sin esto el
+     * socket falso NO tiene el método: ver `Falso.fetchBlocklist`.
+     */
+    bloqueados?: (string | undefined)[] | Error;
   } = {},
 ) {
   const dir = mkdtempSync(join(tmp, `banco-${nBanco++}-`));
@@ -244,7 +267,7 @@ function banco(
     schedule: agenda.schedule,
     makeSocket: (cfg) => {
       if (creados.some((f) => !f.terminado)) violaciones++;
-      const f = falso(cfg);
+      const f = falso(cfg, opts.bloqueados);
       creados.push(f);
       return f as unknown as WASocket;
     },
@@ -256,6 +279,7 @@ function banco(
   return {
     wa,
     store,
+    repo,
     agenda,
     creados,
     jobs,
@@ -602,6 +626,17 @@ test("nunca hay dos sockets vivos: ni por arranques repetidos ni por reconexione
   b.cerrar();
 });
 
+test("todos los eventos de EVENTOS quedan enganchados, uno por evento", async () => {
+  // La lista y los `s.ev.on` se escriben en dos lugares distintos: si se agrega
+  // un evento a `EVENTOS` y se olvida el handler, `descartar()` lo da de baja sin
+  // que haya estado nunca enganchado y el dato no llega nunca (pasó al agregar
+  // los eventos de bloqueo: se perdió el de `lid-mapping.update`).
+  const b = banco();
+  const s = await arrancar(b);
+  for (const ev of EVENTOS) expect(s.oyentes(ev), `evento sin handler: ${ev}`).toBe(1);
+  b.cerrar();
+});
+
 test("descartar un socket lo deja sin handlers y cerrado (D5)", async () => {
   const b = banco();
   const s1 = await arrancar(b);
@@ -686,18 +721,120 @@ test("el socket vigente alimenta la cola de ingest con todos los eventos", async
   // dos eventos la bandeja lo muestra como "grupo sin nombre" para siempre.
   s.emitir("groups.upsert", [{ id: JID_GRUPO, subject: "Asado del viernes" }] as never);
   s.emitir("groups.update", [{ id: JID_GRUPO, subject: "Asado del sábado" }] as never);
+  // El par LID ↔ número que baileys aprende EN VIVO: de acá salen los nombres de
+  // la agenda para los chats guardados bajo el número.
+  s.emitir("lid-mapping.update", { lid: "111122223333@lid", pn: JID_CONTACTO } as never);
 
   const kinds = b.jobs.map((j) => j.kind);
   expect(kinds).toContain("messages");
   expect(kinds).toContain("chats");
   expect(kinds).toContain("contacts");
   expect(kinds).toContain("chat-updates");
+  expect(kinds).toContain("aliases");
   expect(kinds.filter((k) => k === "groups").length).toBe(2);
   // El history entra marcado como tal: no puede sumar no leídos (§6.2).
   expect(b.jobs.some((j) => j.kind === "messages" && j.source === "history")).toBe(true);
 
   b.drenar();
   expect(b.filas()).toBe(2);
+  b.cerrar();
+});
+
+// ── lo que no se muestra: candados y bloqueados ─────────────────────────────
+
+test("chats.lock y blocklist.* entran a la cola con la forma que espera el ingest", async () => {
+  const b = banco();
+  const s = await arrancar(b);
+
+  // Chat Lock: el chat que el usuario escondió detrás de un código secreto.
+  s.emitir("chats.lock", { id: JID_CONTACTO, locked: true });
+  s.emitir("chats.lock", { id: JID_GRUPO, locked: false });
+  // Bloqueados: la lista completa y las altas/bajas sueltas.
+  s.emitir("blocklist.set", { blocklist: [JID_CONTACTO, JID_GRUPO] });
+  s.emitir("blocklist.update", { blocklist: [JID_CONTACTO], type: "add" });
+  s.emitir("blocklist.update", { blocklist: [JID_CONTACTO], type: "remove" });
+
+  expect(b.jobs).toEqual([
+    { kind: "chat-lock", locks: [{ jid: JID_CONTACTO, locked: true }] },
+    { kind: "chat-lock", locks: [{ jid: JID_GRUPO, locked: false }] },
+    { kind: "blocklist", jids: [JID_CONTACTO, JID_GRUPO] },
+    { kind: "block-updates", jids: [JID_CONTACTO], op: "add" },
+    { kind: "block-updates", jids: [JID_CONTACTO], op: "remove" },
+  ]);
+
+  b.drenar();
+  expect(b.repo.jidFlags(JID_CONTACTO)).toEqual({ blocked: false, locked: true });
+  b.cerrar();
+});
+
+test("los tres eventos nuevos también respetan el guard del socket viejo (D5)", async () => {
+  const b = banco();
+  const viejo = await arrancar(b);
+  expect(viejo.oyentes("chats.lock")).toBe(1);
+  expect(viejo.oyentes("blocklist.set")).toBe(1);
+  expect(viejo.oyentes("blocklist.update")).toBe(1);
+
+  b.wa.reconnectNow();
+  await asentar();
+  // Descartar el socket lo deja sin ninguno de los tres.
+  expect(viejo.oyentes("chats.lock")).toBe(0);
+  expect(viejo.oyentes("blocklist.set")).toBe(0);
+  expect(viejo.oyentes("blocklist.update")).toBe(0);
+
+  const jobsAntes = b.jobs.length;
+  viejo.emitir("chats.lock", { id: JID_CONTACTO, locked: true });
+  viejo.emitir("blocklist.set", { blocklist: [JID_CONTACTO] });
+  viejo.emitir("blocklist.update", { blocklist: [JID_CONTACTO], type: "add" });
+  await asentar();
+  b.drenar();
+
+  expect(b.jobs.length).toBe(jobsAntes);
+  expect(b.repo.jidFlags(JID_CONTACTO)).toEqual({ blocked: false, locked: false });
+  b.cerrar();
+});
+
+test("al abrir se pide la lista COMPLETA de bloqueados, una sola vez", async () => {
+  // ⚠️ `blocklist.set` no lo emite nadie en baileys 7.0.0-rc14: sin este pedido,
+  // alguien bloqueado desde antes de instalar wacosas nunca se ocultaría.
+  const b = banco({ bloqueados: [JID_CONTACTO, undefined, JID_GRUPO] });
+  const s = await arrancar(b);
+
+  s.emitir("connection.update", { connection: "open" });
+  await asentar();
+
+  expect(s.pedidosBlocklist).toBe(1);
+  // Los `undefined` que puede traer la respuesta se filtran antes de la cola.
+  expect(b.jobs).toContainEqual({ kind: "blocklist", jids: [JID_CONTACTO, JID_GRUPO] });
+
+  b.drenar();
+  expect(b.repo.jidFlags(JID_CONTACTO)).toEqual({ blocked: true, locked: false });
+  expect(b.logTexto()).toContain("wa.blocklist");
+  b.cerrar();
+});
+
+test("si la lista de bloqueados falla, la conexión sigue viva y queda en el log", async () => {
+  const b = banco({ bloqueados: new Error("timed out") });
+  const s = await arrancar(b);
+
+  s.emitir("connection.update", { connection: "open" });
+  await asentar();
+
+  expect(b.wa.isOpen()).toBe(true);
+  expect(b.conn().state).toBe("open");
+  expect(b.jobs.some((j) => j.kind === "blocklist")).toBe(false);
+  expect(b.logTexto()).toContain("wa.blocklist_fallida");
+  b.cerrar();
+});
+
+test("un socket sin fetchBlocklist (versión vieja de baileys) no rompe el open", async () => {
+  const b = banco(); // el falso por default NO tiene el método
+  const s = await arrancar(b);
+
+  s.emitir("connection.update", { connection: "open" });
+  await asentar();
+
+  expect(b.wa.isOpen()).toBe(true);
+  expect(b.jobs.some((j) => j.kind === "blocklist")).toBe(false);
   b.cerrar();
 });
 

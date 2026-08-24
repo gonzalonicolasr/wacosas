@@ -74,6 +74,37 @@ CREATE TABLE IF NOT EXISTS jid_aliases (
   updated_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
+-- Los dos motivos por los que un chat **no se muestra** (y que NO son lo mismo):
+--
+--   · \`blocked\` — el contacto está **bloqueado** en WhatsApp. Llega por
+--     \`blocklist.set\`/\`blocklist.update\` (y por \`sock.fetchBlocklist()\`, ver
+--     \`wa/socket.ts\`).
+--   · \`locked\`  — el chat tiene **candado** (Chat Lock): el usuario lo escondió
+--     detrás de un código secreto y en el teléfono sólo aparece si escribe ese
+--     código en el buscador. Llega por \`chats.lock\` (app-state,
+--     \`Utils/chat-utils.js:818\`). En wacosas no hay código que pedir, así que un
+--     chat con candado sencillamente NO se lista.
+--
+-- Los dos estados viven en la MISMA fila pero son independientes: desbloquear a
+-- alguien no le saca el candado a su chat, y sacar el candado no lo desbloquea.
+--
+-- Por qué una tabla aparte y no dos columnas en \`chats\`:
+--   · un jid bloqueado puede **no tener chat** (bloqueás a alguien con quien
+--     nunca hablaste) y upsertear \`chats\` para anotarlo crearía la fila fantasma
+--     que §5.1 justamente prohíbe;
+--   · el estado llega pegado a UNA de las dos identidades del humano (el \`@lid\` o
+--     el número) y el chat puede estar bajo la otra: por eso las consultas cruzan
+--     esta tabla con \`jid_aliases\` (ver \`db/repo.ts\`).
+--
+-- Nada se borra nunca por estar oculto: el historial queda intacto y vuelve a
+-- verse solo en cuanto WhatsApp avisa que el candado o el bloqueo se levantaron.
+CREATE TABLE IF NOT EXISTS jid_flags (
+  jid        TEXT PRIMARY KEY,
+  blocked    INTEGER NOT NULL DEFAULT 0,
+  locked     INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
 CREATE TABLE IF NOT EXISTS messages (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   chat_jid    TEXT    NOT NULL REFERENCES chats(jid) ON DELETE CASCADE,
@@ -120,16 +151,35 @@ END;
 export type Migracion = { v: number; sql: string };
 
 /**
- * Sigue vacío. La v2 agregó la tabla `jid_aliases` y **no necesita migración**:
- * es un `CREATE TABLE IF NOT EXISTS` más, y `migrate()` corre el `SCHEMA_SQL`
- * entero en cada arranque, así que la base de la v1 la crea sola al abrirla.
- * Lo que sí necesitaría una entrada acá es un `ALTER TABLE` sobre una tabla que
- * ya existe (renombrar o tipar distinto una columna).
+ * El jid de los avisos oficiales de WhatsApp (`PSA_WID` = `0@c.us`, que
+ * `jidNormalizedUser` deja en `0@s.whatsapp.net`). **No es una persona**: la
+ * bandeja lo pintaba como `+0` porque el número del jid es literalmente `0`.
+ *
+ * Las tres formas están en el `DELETE` porque el normalizado depende de por dónde
+ * entró la fila; `messages` se va sola con el `ON DELETE CASCADE` y el trigger
+ * `messages_ad` saca el texto del índice FTS.
  */
-export const MIGRATIONS: Migracion[] = [];
+export const JIDS_PSA = ["0@s.whatsapp.net", "0@c.us", "0@lid"] as const;
 
-/** v2: `jid_aliases` (equivalencia LID ↔ número). Ver el DDL más arriba. */
-export const CURRENT_VERSION = 2;
+/**
+ * La v3 agrega `jid_flags` —que no necesita migración, es un `CREATE TABLE IF NOT
+ * EXISTS` más y `migrate()` corre el `SCHEMA_SQL` entero en cada arranque— y sí
+ * necesita esta: **borrar el chat `+0` que ya está en la base**. Filtrarlo en el
+ * ingest (`isSystemJid`, `wa/map.ts`) impide que vuelva a entrar, pero no saca el
+ * que se coló antes, y ese se sigue viendo en la bandeja.
+ *
+ * Es idempotente (un `DELETE` que no encuentra nada es un no-op), así que corre
+ * también sobre una base nueva sin costo.
+ */
+export const MIGRATIONS: Migracion[] = [
+  {
+    v: 3,
+    sql: `DELETE FROM chats WHERE jid IN (${JIDS_PSA.map((j) => `'${j}'`).join(", ")});`,
+  },
+];
+
+/** v3: `jid_flags` (bloqueado / con candado) + el borrado del chat `+0`. */
+export const CURRENT_VERSION = 3;
 
 /** Lee `meta.schema_version`; si no está todavía, la base es nueva ⇒ 0. */
 function versionGuardada(db: Database): number {

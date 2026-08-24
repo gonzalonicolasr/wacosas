@@ -62,8 +62,14 @@ export const VERSION_TIMEOUT_MS = 8_000;
  */
 export const COOLDOWN_WIPE_MS = 1_500;
 
-/** Eventos que consume el controlador. También son los que se dan de baja al descartar. */
-const EVENTOS = [
+/**
+ * Eventos que consume el controlador. También son los que se dan de baja al
+ * descartar. Se exporta para que el test pueda afirmar que **cada uno tiene su
+ * handler**: agregar el nombre acá y olvidarse del `s.ev.on` deja el evento
+ * "dado de baja" sin haber estado nunca enganchado, y no se nota hasta que falta
+ * un dato en la pantalla.
+ */
+export const EVENTOS = [
   "connection.update",
   "creds.update",
   "messages.upsert",
@@ -77,6 +83,9 @@ const EVENTOS = [
   "groups.upsert",
   "groups.update",
   "lid-mapping.update",
+  "chats.lock",
+  "blocklist.set",
+  "blocklist.update",
 ] as const satisfies readonly (keyof BaileysEventMap)[];
 
 // ── logger de Baileys ───────────────────────────────────────────────────────
@@ -676,6 +685,54 @@ export function createWaController(deps: WaDeps): WaController {
           ingest.push({ kind: "aliases", pairs: [par] });
         }),
       );
+
+      // **Chat Lock**: los chats que el usuario escondió detrás de un código
+      // secreto y que en el teléfono sólo aparecen si escribe ese código en el
+      // buscador. Llega por app-state (`lockChatAction`,
+      // `Utils/chat-utils.js:818`), o sea que sólo empezó a llegar cuando se
+      // destrabaron las colecciones. Acá NO hay código que pedir: un chat con
+      // candado no se lista, y punto.
+      //
+      // (`proto.IChatLockSettings.hideLockedChats` —el "mostrar chats
+      // bloqueados" del teléfono— existe en el proto pero baileys NUNCA lo
+      // emite: `processSyncAction` no tiene rama para `chatLockSettings`. No
+      // llega, y aunque llegara no cambiaría nada de esto.)
+      s.ev.on(
+        "chats.lock",
+        guardado("chats.lock", (l: BaileysEventMap["chats.lock"]) => {
+          ingest.push({ kind: "chat-lock", locks: [{ jid: l?.id ?? "", locked: !!l?.locked }] });
+        }),
+      );
+
+      // Contactos BLOQUEADOS. Son otra cosa que el candado y se guardan aparte.
+      //
+      // ⚠️ `blocklist.set` está declarado en el mapa de eventos
+      // (`Types/Events.d.ts:117`) pero **baileys 7.0.0-rc14 no lo emite nunca**
+      // (0 apariciones en `lib/`): el único que emite es `blocklist.update`, de a
+      // UN jid por vez, desde la notificación `account_sync`
+      // (`Socket/messages-recv.js:872-877`). Se engancha igual —cuesta tres
+      // líneas y el día que baileys lo emita ya está—, pero la lista completa la
+      // trae `pedirBloqueados()` al abrir; sin eso, alguien bloqueado desde antes
+      // de instalar wacosas no se ocultaría nunca.
+      s.ev.on(
+        "blocklist.set",
+        guardado("blocklist.set", (b: BaileysEventMap["blocklist.set"]) => {
+          ingest.push({ kind: "blocklist", jids: b?.blocklist ?? [] });
+        }),
+      );
+
+      s.ev.on(
+        "blocklist.update",
+        guardado("blocklist.update", (b: BaileysEventMap["blocklist.update"]) => {
+          // El tipo es `'add' | 'remove'`, pero llega de la red: cualquier cosa
+          // que no sea un `remove` explícito se trata como alta.
+          ingest.push({
+            kind: "block-updates",
+            jids: b?.blocklist ?? [],
+            op: b?.type === "remove" ? "remove" : "add",
+          });
+        }),
+      );
     } catch (e) {
       // Falló armando la conexión (versión, auth, `makeWASocket`, enganchar un
       // handler): se trata como un cierre cualquiera para que el backoff lo
@@ -769,6 +826,40 @@ export function createWaController(deps: WaDeps): WaController {
     store.setLink({ phase: "qr-shown", qr, reason: null });
   }
 
+  /**
+   * Pide la lista COMPLETA de bloqueados, UNA vez por conexión abierta.
+   *
+   * Existe porque `blocklist.set` no lo emite nadie en esta versión de baileys
+   * (ver el handler): sin esto sólo llegarían las altas y bajas que ocurran con
+   * wacosas abierto, y los que ya estaban bloqueados seguirían en la bandeja para
+   * siempre. Es **una** stanza `iq blocklist` por conexión —lo mismo que hace
+   * WhatsApp Web al arrancar—, así que no mueve la aguja de R2/R8.
+   *
+   * Nunca lanza y nunca espera: cuelga de `alAbrir`, que corre adentro de un
+   * handler de Baileys. La respuesta entra por la cola del ingest como un job
+   * más, que es el único camino de escritura.
+   */
+  function pedirBloqueados(s: WASocket): void {
+    if (typeof s.fetchBlocklist !== "function") return;
+    let pendiente: Promise<(string | undefined)[]>;
+    try {
+      pendiente = Promise.resolve(s.fetchBlocklist());
+    } catch (e) {
+      log.warn("wa.blocklist_fallida", { motivo: motivo(e) });
+      return;
+    }
+    pendiente.then(
+      (jids) => {
+        // Un socket reemplazado en el medio ⇒ esa lista ya no es de esta sesión.
+        if (s !== actual) return;
+        const limpios = (Array.isArray(jids) ? jids : []).filter((j): j is string => !!j);
+        log.info("wa.blocklist", { bloqueados: limpios.length });
+        ingest.push({ kind: "blocklist", jids: limpios });
+      },
+      (e: unknown) => log.warn("wa.blocklist_fallida", { motivo: motivo(e) }),
+    );
+  }
+
   function alAbrir(s: WASocket): void {
     intento = 0;
     abierto = true;
@@ -788,6 +879,8 @@ export function createWaController(deps: WaDeps): WaController {
     });
     store.setLink({ phase: "linked", qr: null, pairingCode: null, reason: null });
     log.info("wa.open", { flujo, telefono: telefono ? "sí" : "no" });
+    // Después de publicar el estado: es red, y la pantalla no la espera.
+    pedirBloqueados(s);
   }
 
   function alCerrar(s: WASocket, err: unknown): void {

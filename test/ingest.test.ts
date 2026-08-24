@@ -39,10 +39,13 @@ import {
 import { seedDb } from "./fixtures/seed";
 import {
   AHORA,
+  avisoPsa,
   imagenConCaption,
   JID_CONTACTO,
+  JID_DIFUSION,
   JID_GRUPO,
   JID_PARTICIPANTE,
+  JID_PSA,
   reaccion,
   revoke,
   SELF_JID,
@@ -983,5 +986,202 @@ test("los contactos van a su tabla y no crean chats fantasma", () => {
     .chats.find((c) => c.jid === JID_CONTACTO);
   expect(fila).toBeUndefined();
   expect(b.repo.getChat(SELF_JID_NORMALIZADO)).toBeNull();
+  b.cerrar();
+});
+
+// ── chats que no se muestran: bloqueados y con candado ──────────────────────
+//
+// Las dos cosas llegan por eventos distintos y significan cosas distintas:
+// `blocklist.*` es "bloqueé a esta persona" y `chats.lock` es "escondí este chat
+// detrás de un código" (Chat Lock). Acá se prueba el camino ENTERO —el job que
+// empuja el socket, el drenador, la base y la proyección que ve la interfaz—,
+// porque el filtro vive en el repo y lo que importa es que la bandeja no los
+// liste.
+
+/** Tres chats con un mensaje cada uno, ya persistidos. */
+function conTresChats(b: ReturnType<typeof banco>): string[] {
+  const jids = [JID_CONTACTO, JID_PARTICIPANTE, "5491144332211@s.whatsapp.net"];
+  jids.forEach((jid, i) => {
+    b.ingest.push(
+      lote([
+        {
+          key: { remoteJid: jid, fromMe: false, id: `OCULTO${i}` },
+          message: { conversation: `hola numero ${i}` },
+          messageTimestamp: TS_BASE + i,
+          pushName: `Contacto ${i}`,
+        },
+      ]),
+    );
+  });
+  b.drenar();
+  return jids;
+}
+
+/** Los jids que la bandeja está mostrando, según la proyección del store. */
+function enBandeja(b: ReturnType<typeof banco>): string[] {
+  b.store.flushNow();
+  return b.store.getSnapshot("inbox").chats.map((c) => c.jid);
+}
+
+test("blocklist.set esconde a los bloqueados de la bandeja y de los contadores", () => {
+  const b = banco();
+  const [ana, beto, caro] = conTresChats(b);
+  expect(enBandeja(b).sort()).toEqual([ana!, beto!, caro!].sort());
+  expect(b.store.getSnapshot("inbox").counts).toMatchObject({ all: 3 });
+
+  b.ingest.push({ kind: "blocklist", jids: [ana!, beto!, caro!] });
+  b.drenar();
+
+  expect(enBandeja(b)).toEqual([]);
+  expect(b.store.getSnapshot("inbox").counts).toEqual({ all: 0, unread: 0, groups: 0 });
+  // Nada se borró: los mensajes siguen en la base.
+  expect(b.filas()).toBe(3);
+  b.cerrar();
+});
+
+test("una blocklist.set posterior sin uno de ellos lo devuelve, con su historial intacto", () => {
+  const b = banco();
+  const [ana, beto, caro] = conTresChats(b);
+
+  b.ingest.push({ kind: "blocklist", jids: [ana!, beto!, caro!] });
+  b.drenar();
+  expect(enBandeja(b)).toEqual([]);
+
+  // La lista nueva ya no trae a Ana ⇒ Ana vuelve.
+  b.ingest.push({ kind: "blocklist", jids: [beto!, caro!] });
+  b.drenar();
+
+  expect(enBandeja(b)).toEqual([ana!]);
+  expect(b.store.getSnapshot("inbox").counts).toMatchObject({ all: 1 });
+  expect(b.repo.lastMessages(ana!).map((m) => m.body)).toEqual(["hola numero 0"]);
+  expect(b.repo.getChat(ana!)!.unreadCount).toBe(1);
+
+  // Y una lista VACÍA —"no hay nadie bloqueado"— los devuelve a todos: es el
+  // caso que un job de largo 0 se comería si no fuera un ítem único.
+  b.ingest.push({ kind: "blocklist", jids: [] });
+  b.drenar();
+  expect(enBandeja(b).sort()).toEqual([ana!, beto!, caro!].sort());
+  b.cerrar();
+});
+
+test("blocklist.update da de alta y de baja un bloqueo suelto", () => {
+  const b = banco();
+  const [ana, beto] = conTresChats(b);
+
+  b.ingest.push({ kind: "block-updates", jids: [ana!], op: "add" });
+  b.drenar();
+  expect(enBandeja(b)).not.toContain(ana!);
+  expect(enBandeja(b)).toContain(beto!);
+  expect(b.repo.jidFlags(ana!)).toEqual({ blocked: true, locked: false });
+
+  b.ingest.push({ kind: "block-updates", jids: [ana!], op: "remove" });
+  b.drenar();
+  expect(enBandeja(b)).toContain(ana!);
+  expect(b.repo.lastMessages(ana!).map((m) => m.body)).toEqual(["hola numero 0"]);
+  b.cerrar();
+});
+
+test("chats.lock esconde el chat con candado; sacarlo lo devuelve con su historial", () => {
+  const b = banco();
+  const [ana, beto, caro] = conTresChats(b);
+
+  b.ingest.push({ kind: "chat-lock", locks: [{ jid: ana!, locked: true }] });
+  b.drenar();
+
+  expect(enBandeja(b).sort()).toEqual([beto!, caro!].sort());
+  expect(b.store.getSnapshot("inbox").counts).toMatchObject({ all: 2 });
+  expect(b.repo.jidFlags(ana!)).toEqual({ blocked: false, locked: true });
+  expect(b.filas()).toBe(3); // no se borró nada
+
+  b.ingest.push({ kind: "chat-lock", locks: [{ jid: ana!, locked: false }] });
+  b.drenar();
+
+  expect(enBandeja(b)).toContain(ana!);
+  expect(b.repo.lastMessages(ana!).map((m) => m.body)).toEqual(["hola numero 0"]);
+  b.cerrar();
+});
+
+test("un chat con candado tampoco aparece en la búsqueda global (Ctrl-G)", () => {
+  const b = banco();
+  const [ana, beto] = conTresChats(b);
+
+  b.store.setSearchQuery("hola");
+  b.store.flushNow();
+  expect(b.store.getSnapshot("search").hits.map((h) => h.chatJid).sort()).toContain(ana!);
+
+  b.ingest.push({ kind: "chat-lock", locks: [{ jid: ana!, locked: true }] });
+  b.ingest.push({ kind: "block-updates", jids: [beto!], op: "add" });
+  b.drenar();
+  // El slice `search` es una proyección: se reconstruye sola en el flush.
+  b.store.setSearchQuery("hola");
+  b.store.flushNow();
+
+  const s = b.store.getSnapshot("search");
+  expect(s.hits.map((h) => h.chatJid)).not.toContain(ana!);
+  expect(s.hits.map((h) => h.chatJid)).not.toContain(beto!);
+  expect(s.chats.map((c) => c.jid)).not.toContain(ana!);
+  expect(s.chats.map((c) => c.jid)).not.toContain(beto!);
+  // El mensaje sigue indexado: lo que no se muestra es el chat, no el índice.
+  expect(b.repo.lastMessages(ana!)).toHaveLength(1);
+  b.cerrar();
+});
+
+test("bloqueado y con candado no se pisan: sacar uno deja el otro", () => {
+  const b = banco();
+  const [ana, beto] = conTresChats(b);
+
+  b.ingest.push({ kind: "block-updates", jids: [ana!], op: "add" });
+  b.ingest.push({ kind: "chat-lock", locks: [{ jid: ana!, locked: true }] });
+  b.drenar();
+  expect(b.repo.jidFlags(ana!)).toEqual({ blocked: true, locked: true });
+
+  // Desbloquear NO le saca el candado ⇒ sigue escondido.
+  b.ingest.push({ kind: "block-updates", jids: [ana!], op: "remove" });
+  b.drenar();
+  expect(b.repo.jidFlags(ana!)).toEqual({ blocked: false, locked: true });
+  expect(enBandeja(b)).not.toContain(ana!);
+
+  // Y una blocklist completa tampoco: es otra dimensión.
+  b.ingest.push({ kind: "blocklist", jids: [beto!] });
+  b.drenar();
+  expect(b.repo.jidFlags(ana!)).toEqual({ blocked: false, locked: true });
+  expect(enBandeja(b)).not.toContain(ana!);
+
+  // Recién sacando el candado vuelve.
+  b.ingest.push({ kind: "chat-lock", locks: [{ jid: ana!, locked: false }] });
+  b.drenar();
+  expect(enBandeja(b)).toContain(ana!);
+  b.cerrar();
+});
+
+test("el bloqueo llega por el @lid y esconde el chat guardado bajo el número", () => {
+  const b = banco();
+  const [ana] = conTresChats(b);
+  const LID = "999988887777@lid";
+
+  b.ingest.push({ kind: "aliases", pairs: [{ lid: LID, pn: ana! }] as never });
+  b.drenar();
+
+  b.ingest.push({ kind: "block-updates", jids: [LID], op: "add" });
+  b.drenar();
+  expect(enBandeja(b)).not.toContain(ana!);
+
+  b.ingest.push({ kind: "block-updates", jids: [LID], op: "remove" });
+  b.drenar();
+  expect(enBandeja(b)).toContain(ana!);
+  b.cerrar();
+});
+
+test("el pseudo-chat `+0` de WhatsApp no entra ni por mensaje ni por chats.upsert", () => {
+  const b = banco();
+
+  b.ingest.push(lote([avisoPsa]));
+  b.ingest.push({ kind: "chats", chats: [{ id: JID_PSA, conversationTimestamp: TS_BASE }] as never });
+  b.ingest.push({ kind: "chats", chats: [{ id: JID_DIFUSION, conversationTimestamp: TS_BASE }] as never });
+  b.drenar();
+
+  expect(b.repo.listChats()).toEqual([]);
+  expect(b.repo.getChat("0@s.whatsapp.net")).toBeNull();
+  expect(b.filas()).toBe(0);
   b.cerrar();
 });

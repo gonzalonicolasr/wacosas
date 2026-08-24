@@ -26,6 +26,13 @@ export const JID_GRUPO = "120363041234567890@g.us";
 export const JID_PARTICIPANTE = "5491199887766@s.whatsapp.net";
 export const JID_NEWSLETTER = "120363099887766554@newsletter";
 export const JID_STATUS = "status@broadcast";
+/**
+ * El PSA de WhatsApp (`PSA_WID` de baileys). `jidNormalizedUser` lo deja en
+ * `0@s.whatsapp.net` y la bandeja lo pintaba como el chat **`+0`**.
+ */
+export const JID_PSA = "0@c.us";
+/** Una lista de difusión: tampoco es un chat con alguien. */
+export const JID_DIFUSION = "5491133445566-1600000000@broadcast";
 
 /** "Ahora" de los tests: 2025-01-01T00:00:00Z. */
 export const AHORA = 1735689600;
@@ -323,6 +330,23 @@ export const newsletter = sobre({ conversation: "novedades del canal" }, {
   id: "3EB0CANAL0000000001",
 });
 
+/**
+ * Un aviso oficial de WhatsApp (PSA). Llega con un tipo de contenido que no
+ * sabemos representar —así aparecieron los 7 "❔ mensaje no soportado" de la
+ * cuenta real— y hacía un chat llamado `+0`.
+ */
+export const avisoPsa = sobre(
+  { paymentInviteMessage: { serviceType: 1 } } as never,
+  { jid: JID_PSA, id: "3EB0PSA000000000001" },
+);
+
+/** Un mensaje mandado a una lista de difusión: no es una conversación. */
+export const difusion = sobre({ conversation: "feliz año a todos" }, {
+  jid: JID_DIFUSION,
+  id: "3EB0DIFUSION00000001",
+  fromMe: true,
+});
+
 /** Borrado por su autor, forma cruda: `protocolMessage` con `type: REVOKE` (CA-6.9). */
 export const revoke = sobre(
   {
@@ -409,6 +433,8 @@ export const FIXTURES = {
   tsBasura,
   estadoBroadcast,
   newsletter,
+  avisoPsa,
+  difusion,
   revoke,
   revokeAplanado,
   protocoloNoRevoke,
@@ -421,6 +447,8 @@ export const FIXTURES = {
 export const DESCARTADOS = [
   "estadoBroadcast",
   "newsletter",
+  "avisoPsa",
+  "difusion",
   "revoke",
   "revokeAplanado",
   "protocoloNoRevoke",

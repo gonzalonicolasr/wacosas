@@ -18,13 +18,14 @@
 // de baileys: no toca el camino de arranque de la TUI (CA-13.1).
 import {
   getContentType,
+  isJidBroadcast,
   isJidGroup,
   isJidNewsletter,
-  isJidStatusBroadcast,
   jidDecode,
   jidNormalizedUser,
   normalizeMessageContent,
   proto,
+  PSA_WID,
   toNumber,
   WAMessageStubType,
 } from "baileys";
@@ -193,6 +194,35 @@ function cuerpoDe(tipo: string | undefined, nodo: Record<string, unknown> | unde
   return texto(nodo?.caption);
 }
 
+/** El usuario del `PSA_WID` de baileys (`0@c.us`): literalmente `"0"`. */
+const USER_PSA = jidDecode(PSA_WID)?.user ?? "0";
+
+/**
+ * ¿Este jid es un pseudo-chat de WhatsApp y no una conversación con alguien?
+ *
+ * Es el único lugar donde se decide qué jid NO entra a la base — lo preguntan
+ * `mapMessage` (el mensaje) y `wa/ingest.ts` (la ficha del chat), así que no hay
+ * forma de que uno acepte lo que el otro descarta. Lo que se descarta:
+ *
+ *   · **el PSA de WhatsApp** (`0@c.us`, que `jidNormalizedUser` deja en
+ *     `0@s.whatsapp.net`): son los avisos oficiales, llegan como tipos de
+ *     contenido que no sabemos representar y la bandeja los mostraba como un chat
+ *     llamado **`+0`** con "❔ mensaje no soportado" (7 de esos en la cuenta real);
+ *   · **`status@broadcast`** (los estados) y **cualquier `@broadcast`**: una lista
+ *     de difusión no es un chat —lo que se manda por ahí le llega a cada
+ *     destinatario en su 1:1— y como chat quedaría vacía y sin nadie del otro
+ *     lado. `isJidStatusBroadcast` cubría sólo el primero;
+ *   · **los `@newsletter`** (canales), que ya estaban fuera por §5.4.
+ *
+ * Los grupos y los `@lid` NO son basura: entran normalmente.
+ */
+export function isSystemJid(jid: string | null | undefined): boolean {
+  const j = texto(jid);
+  if (!j) return true;
+  if (isJidBroadcast(j) || isJidNewsletter(j)) return true;
+  return jidDecode(j)?.user === USER_PSA;
+}
+
 /**
  * Detecta el borrado de un mensaje por su autor (CA-6.9) y devuelve a QUÉ
  * mensaje apunta. No produce fila: el revoke se aplica con
@@ -227,9 +257,10 @@ export function isRevoke(m: WAMessage): { chatJid: string; targetWaId: string } 
  * Mensaje de Baileys → fila lista para `repo.insertMessage` (§4.3), o `null`
  * cuando no hay que persistir nada.
  *
- * Devuelve `null` para (§5.4): mensajes sin `key.remoteJid`, `status@broadcast`,
- * newsletters, `protocolMessage` (el revoke se resuelve con `isRevoke`, el resto
- * son señales internas que no se muestran) y `reactionMessage`.
+ * Devuelve `null` para (§5.4): mensajes sin `key.remoteJid`, los pseudo-chats de
+ * WhatsApp (ver `isSystemJid`: PSA, difusión, estados, canales),
+ * `protocolMessage` (el revoke se resuelve con `isRevoke`, el resto son señales
+ * internas que no se muestran) y `reactionMessage`.
  *
  * Cualquier otro tipo que no se sepa representar cae en `kind: "unsupported"` y
  * **se persiste igual**, para que no queden huecos en el historial (CA-7.5).
@@ -237,9 +268,7 @@ export function isRevoke(m: WAMessage): { chatJid: string; targetWaId: string } 
 export function mapMessage(m: WAMessage, ctx: MapCtx): MappedMessage | null {
   const key = m?.key;
   const chatJid = jidNormalizedUser(key?.remoteJid ?? undefined);
-  if (!chatJid) return null;
-  if (isJidStatusBroadcast(chatJid)) return null;
-  if (isJidNewsletter(chatJid)) return null;
+  if (isSystemJid(chatJid)) return null;
 
   // Sin id de WhatsApp no hay dedupe posible: el índice único es
   // (chat_jid, wa_id), así que un `wa_id` vacío haría que el PRIMER mensaje sin

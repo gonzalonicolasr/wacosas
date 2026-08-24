@@ -87,10 +87,24 @@ export function puedeAvanzar(actual: MessageStatus, nuevo: MessageStatus): boole
   return b >= a;
 }
 
+/**
+ * Los dos motivos por los que un chat no se lista (§4.1, tabla `jid_flags`):
+ * `blocked` = contacto bloqueado, `locked` = chat con candado (Chat Lock). Son
+ * INDEPENDIENTES: sacar uno no saca el otro.
+ */
+export type JidFlags = { blocked: boolean; locked: boolean };
+
 export type Repo = {
   // ── lectura (proyecciones del store) ──────────────────────────────────────
+  /** SIN los ocultos: bloqueados y con candado no se listan (ver `VISIBLE`). */
   listChats(limit?: number): ChatRow[];
+  /** Los tres contadores de la bandeja, también SIN los ocultos. */
   countsByFilter(): Counts;
+  /**
+   * La ficha de UN chat, esté oculto o no. No filtra a propósito: lo llaman el
+   * ingest (para no pisar nombres) y `markRead`, que necesitan la fila aunque el
+   * chat no se liste.
+   */
   getChat(jid: string): ChatRow | null;
   /** Una fila de la agenda, o `null`. Se lee para prestarle el nombre a la otra identidad. */
   getContact(jid: string): ContactRow | null;
@@ -118,6 +132,17 @@ export type Repo = {
   upsertContact(jid: string, name: string, phone: string): void;
   /** Anota que estos dos jids son la misma persona. Escribe las DOS direcciones. */
   linkJids(a: string, b: string): void;
+  /**
+   * La lista COMPLETA de bloqueados (`blocklist.set` / `sock.fetchBlocklist()`):
+   * los que no están **se desmarcan**. No toca el candado de nadie.
+   */
+  setBlocklist(jids: string[]): void;
+  /** Alta o baja de UN bloqueado (`blocklist.update`). */
+  setBlocked(jid: string, blocked: boolean): void;
+  /** Candado de un chat (`chats.lock`). Independiente del bloqueo. */
+  setLocked(jid: string, locked: boolean): void;
+  /** Cómo está marcado un jid. Los dos en `false` si no tiene fila. */
+  jidFlags(jid: string): JidFlags;
   insertMessage(m: MappedMessage): { inserted: boolean; id: number };
   touchChatActivity(jid: string, ts: number, preview: string, fromMe: boolean): void;
   bumpUnread(jid: string, delta: number): void;
@@ -181,6 +206,28 @@ const COLS_CHAT =
 const FROM_CHAT = "FROM chats c LEFT JOIN contacts k ON k.jid = c.jid";
 const COLS_MSG = "id, chat_jid, wa_id, from_me, sender_jid, sender_name, ts, kind, body, attachment, status, error";
 
+// ── lo que NO se muestra: bloqueados y con candado (§4.1, `jid_flags`) ───────
+//
+// El filtro vive ACÁ, en el repo, y no en `filtrarChats`/`coincideChat`
+// (`state/commands.ts`). Es una sola decisión que cubre las CUATRO puertas por
+// las que un chat puede asomarse: la bandeja (`listChats`), los contadores de los
+// tabs (`countsByFilter`), la búsqueda de chats de la global (`searchChats`, que
+// reusa `qListChats`) y los mensajes de la global (`searchMessages`). Filtrando
+// en la vista habría que acordarse en las cuatro, y la primera que se olvide es
+// una fuga: un chat con candado que aparece en un resultado de `Ctrl-G` es
+// exactamente lo que el usuario escondió detrás de un código.
+//
+// El cruce con `jid_aliases` no es adorno: el bloqueo llega pegado al `@lid`
+// (`updateBlockStatus` de baileys manda `jid: lid`) y el chat puede estar bajo el
+// número —o al revés—. Como `linkJids` escribe las dos direcciones, alcanza con
+// UN salto: se mira la fila del propio jid y la de su hermana. Los dos joins son
+// búsquedas por PK sobre una tabla de decenas de filas.
+const JOIN_OCULTOS = `LEFT JOIN jid_aliases x ON x.jid = c.jid
+     LEFT JOIN jid_flags   f ON f.jid = c.jid
+     LEFT JOIN jid_flags   g ON g.jid = x.alt_jid`;
+const VISIBLE = `COALESCE(f.blocked, 0) = 0 AND COALESCE(f.locked, 0) = 0
+       AND COALESCE(g.blocked, 0) = 0 AND COALESCE(g.locked, 0) = 0`;
+
 function aChatRow(f: FilaChat): ChatRow {
   return {
     jid: f.jid,
@@ -239,13 +286,18 @@ export function createRepo(db: Database): Repo {
   // Todas las sentencias se preparan una sola vez, acá. `db.query()` además las
   // cachea en la conexión y las finaliza sola en el `close()`.
   const qListChats = db.query<FilaChat, [number]>(
-    `SELECT ${COLS_CHAT} ${FROM_CHAT} ORDER BY c.last_message_at DESC, c.jid LIMIT ?`,
+    `SELECT ${COLS_CHAT} ${FROM_CHAT} ${JOIN_OCULTOS}
+     WHERE ${VISIBLE}
+     ORDER BY c.last_message_at DESC, c.jid LIMIT ?`,
   );
+  // Los mismos joins que `qListChats`: un chat oculto tampoco puede contarse en
+  // los tabs (si no, `Todos` diría 12 y se verían 11).
   const qCounts = db.query<Counts, []>(
-    `SELECT COUNT(*)                                                   AS "all",
-            COALESCE(SUM(CASE WHEN unread_count > 0 THEN 1 ELSE 0 END), 0) AS unread,
-            COALESCE(SUM(CASE WHEN is_group = 1     THEN 1 ELSE 0 END), 0) AS groups
-     FROM chats`,
+    `SELECT COUNT(*)                                                     AS "all",
+            COALESCE(SUM(CASE WHEN c.unread_count > 0 THEN 1 ELSE 0 END), 0) AS unread,
+            COALESCE(SUM(CASE WHEN c.is_group = 1     THEN 1 ELSE 0 END), 0) AS groups
+     FROM chats c ${JOIN_OCULTOS}
+     WHERE ${VISIBLE}`,
   );
   const qGetChat = db.query<FilaChat, [string]>(`SELECT ${COLS_CHAT} ${FROM_CHAT} WHERE c.jid = ?`);
   const qGetContact = db.query<ContactRow, [string]>(
@@ -291,7 +343,8 @@ export function createRepo(db: Database): Repo {
      FROM messages_fts
      JOIN messages m ON m.id  = messages_fts.rowid
      JOIN chats    c ON c.jid = m.chat_jid
-     WHERE messages_fts MATCH ?
+     ${JOIN_OCULTOS}
+     WHERE messages_fts MATCH ? AND ${VISIBLE}
      ORDER BY bm25(messages_fts), m.ts DESC
      LIMIT ?`,
   );
@@ -328,6 +381,29 @@ export function createRepo(db: Database): Repo {
   const qUpsertAlias = db.query<null, [string, string]>(
     `INSERT INTO jid_aliases (jid, alt_jid) VALUES (?, ?)
      ON CONFLICT(jid) DO UPDATE SET alt_jid = excluded.alt_jid, updated_at = unixepoch()`,
+  );
+
+  // Los dos estados se escriben por SEPARADO —y con su propio `excluded`— para
+  // que marcar uno no pueda pisar el otro: el que no viene en el INSERT toma el
+  // default 0 sólo cuando la fila NO existía.
+  const qSetBlocked = db.query<null, [string, number]>(
+    `INSERT INTO jid_flags (jid, blocked) VALUES (?, ?)
+     ON CONFLICT(jid) DO UPDATE SET blocked = excluded.blocked, updated_at = unixepoch()`,
+  );
+  const qSetLocked = db.query<null, [string, number]>(
+    `INSERT INTO jid_flags (jid, locked) VALUES (?, ?)
+     ON CONFLICT(jid) DO UPDATE SET locked = excluded.locked, updated_at = unixepoch()`,
+  );
+  // `blocklist.set` trae la lista COMPLETA: lo que no está en ella dejó de estar
+  // bloqueado. Se limpia todo primero y se vuelve a marcar; el candado no se toca.
+  const qLimpiarBloqueos = db.query<null, []>(
+    "UPDATE jid_flags SET blocked = 0, updated_at = unixepoch() WHERE blocked = 1",
+  );
+  // Una fila sin ninguna marca no dice nada: se barre para que la tabla tenga
+  // tantas filas como jids ocultos, no como jids que alguna vez lo estuvieron.
+  const qBarrerFlags = db.query<null, []>("DELETE FROM jid_flags WHERE blocked = 0 AND locked = 0");
+  const qFlags = db.query<{ blocked: number; locked: number }, [string]>(
+    "SELECT blocked, locked FROM jid_flags WHERE jid = ?",
   );
 
   const qInsertMessage = db.query<{ id: number }, any>(
@@ -486,6 +562,34 @@ export function createRepo(db: Database): Repo {
     linkJids(a, b) {
       qUpsertAlias.run(a, b);
       qUpsertAlias.run(b, a);
+    },
+
+    // En UNA transacción: entre el `UPDATE` que limpia y los `INSERT` que marcan,
+    // la base diría que no hay nadie bloqueado. El `tx` anida por SAVEPOINT, así
+    // que llamarla desde adentro del chunk del ingest es seguro.
+    setBlocklist(jids) {
+      correrTx(() => {
+        qLimpiarBloqueos.run();
+        for (const jid of jids) if (jid) qSetBlocked.run(jid, 1);
+        qBarrerFlags.run();
+      });
+    },
+
+    setBlocked(jid, blocked) {
+      if (!jid) return;
+      qSetBlocked.run(jid, blocked ? 1 : 0);
+      if (!blocked) qBarrerFlags.run();
+    },
+
+    setLocked(jid, locked) {
+      if (!jid) return;
+      qSetLocked.run(jid, locked ? 1 : 0);
+      if (!locked) qBarrerFlags.run();
+    },
+
+    jidFlags(jid) {
+      const f = qFlags.get(jid);
+      return { blocked: f?.blocked === 1, locked: f?.locked === 1 };
     },
 
     // Si el chat no existe, el FK aborta: un mensaje huérfano sería invisible en

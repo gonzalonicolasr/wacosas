@@ -97,7 +97,8 @@ describe("esquema", () => {
       .all()
       .map((f) => f.name);
 
-    for (const t of ["meta", "chats", "contacts", "messages", "messages_fts"]) expect(nombres).toContain(t);
+    for (const t of ["meta", "chats", "contacts", "messages", "messages_fts", "jid_aliases", "jid_flags"])
+      expect(nombres).toContain(t);
     for (const i of ["idx_chats_activity", "idx_messages_waid", "idx_messages_chatts", "idx_messages_open"])
       expect(nombres).toContain(i);
     for (const g of ["messages_ai", "messages_ad", "messages_au"]) expect(nombres).toContain(g);
@@ -105,6 +106,34 @@ describe("esquema", () => {
     // R1: NO existe chats_fts ni sus triggers.
     expect(nombres).not.toContain("chats_fts");
     expect(nombres.filter((n) => n.startsWith("chats_a"))).toEqual([]);
+    db.close();
+  });
+
+  test("la migración v3 borra el chat `+0` de WhatsApp que ya estaba en la base", () => {
+    const path = join(tmp, "psa.sqlite");
+    // Una base de la v2 con el pseudo-chat adentro, tal como quedó en la cuenta
+    // real: `0@c.us` normalizado a `0@s.whatsapp.net`, con sus "no soportado".
+    {
+      const db = openDb(path);
+      db.run("INSERT INTO chats (jid, name) VALUES ('0@s.whatsapp.net', '')");
+      db.run(
+        `INSERT INTO messages (chat_jid, wa_id, sender_jid, ts, kind, body)
+         VALUES ('0@s.whatsapp.net', 'PSA1', '0@s.whatsapp.net', 1787364326, 'unsupported', '')`,
+      );
+      db.run("INSERT INTO chats (jid, name) VALUES ('5491150000009@s.whatsapp.net', 'Ana')");
+      db.run("UPDATE meta SET value = '2' WHERE key = 'schema_version'");
+      db.close();
+    }
+
+    const db = openDb(path);
+    expect(db.query<{ jid: string }, []>("SELECT jid FROM chats ORDER BY jid").all()).toEqual([
+      { jid: "5491150000009@s.whatsapp.net" },
+    ]);
+    // El `ON DELETE CASCADE` se llevó sus mensajes (y el trigger, el índice FTS).
+    expect(db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM messages").get()!.n).toBe(0);
+    expect(db.query<{ value: string }, []>("SELECT value FROM meta WHERE key='schema_version'").get()!.value).toBe(
+      String(CURRENT_VERSION),
+    );
     db.close();
   });
 
@@ -435,6 +464,158 @@ describe("conversación", () => {
   });
 });
 
+// ── chats que no se muestran: bloqueados y con candado ──────────────────────
+//
+// Las CUATRO puertas por las que un chat puede asomarse (bandeja, contadores,
+// búsqueda de chats y búsqueda de mensajes) se prueban juntas en cada caso: si
+// alguna se olvidara el filtro, el chat escondido reaparecería por ahí.
+
+describe("chats ocultos", () => {
+  const ANA = "5491150000001@s.whatsapp.net";
+  const BETO = "5491199999999@s.whatsapp.net";
+
+  /** Dos chats con un mensaje cada uno, buscables por `hola`. */
+  function conDosChats(): { db: Database; repo: Repo } {
+    const { db, repo } = base();
+    repo.upsertChat({ jid: ANA, name: "Ana", lastMessageAt: 300, unreadCount: 2 });
+    repo.upsertChat({ jid: BETO, name: "Beto", lastMessageAt: 200 });
+    repo.insertMessage(mensaje({ chatJid: ANA, waId: "A1", body: "hola dice ana" }));
+    repo.insertMessage(mensaje({ chatJid: BETO, waId: "B1", body: "hola dice beto" }));
+    return { db, repo };
+  }
+
+  const nombres = (repo: Repo): string[] => repo.listChats().map((c) => c.name);
+  const enBusqueda = (repo: Repo): string[] => repo.searchMessages("hola", 10).map((h) => h.chatName);
+
+  test("un bloqueado no aparece en la bandeja, ni en los contadores, ni en la búsqueda", () => {
+    const { db, repo } = conDosChats();
+    expect(repo.countsByFilter()).toEqual({ all: 2, unread: 1, groups: 0 });
+
+    repo.setBlocked(ANA, true);
+
+    expect(nombres(repo)).toEqual(["Beto"]);
+    expect(repo.countsByFilter()).toEqual({ all: 1, unread: 0, groups: 0 });
+    expect(repo.searchChats("ana", 10)).toEqual([]);
+    expect(enBusqueda(repo)).toEqual(["Beto"]);
+
+    // Ocultar NO es borrar (CA-3.2): la ficha y los mensajes siguen ahí.
+    expect(repo.getChat(ANA)).toMatchObject({ name: "Ana", unreadCount: 2 });
+    expect(repo.lastMessages(ANA).map((m) => m.body)).toEqual(["hola dice ana"]);
+
+    repo.setBlocked(ANA, false);
+    expect(nombres(repo)).toEqual(["Ana", "Beto"]);
+    expect(repo.countsByFilter()).toEqual({ all: 2, unread: 1, groups: 0 });
+    expect(enBusqueda(repo).sort()).toEqual(["Ana", "Beto"]);
+    db.close();
+  });
+
+  test("un chat con candado tampoco: ni bandeja, ni contadores, ni búsqueda global", () => {
+    const { db, repo } = conDosChats();
+
+    repo.setLocked(ANA, true);
+
+    expect(nombres(repo)).toEqual(["Beto"]);
+    expect(repo.countsByFilter()).toEqual({ all: 1, unread: 0, groups: 0 });
+    expect(repo.searchChats("ana", 10)).toEqual([]);
+    expect(enBusqueda(repo)).toEqual(["Beto"]);
+    expect(repo.lastMessages(ANA).map((m) => m.body)).toEqual(["hola dice ana"]);
+
+    repo.setLocked(ANA, false);
+    expect(nombres(repo)).toEqual(["Ana", "Beto"]);
+    expect(repo.lastMessages(ANA).map((m) => m.body)).toEqual(["hola dice ana"]);
+    db.close();
+  });
+
+  test("bloqueado y con candado son estados INDEPENDIENTES", () => {
+    const { db, repo } = conDosChats();
+
+    repo.setBlocked(ANA, true);
+    repo.setLocked(ANA, true);
+    expect(repo.jidFlags(ANA)).toEqual({ blocked: true, locked: true });
+
+    // Sacar el bloqueo no saca el candado: el chat SIGUE oculto.
+    repo.setBlocked(ANA, false);
+    expect(repo.jidFlags(ANA)).toEqual({ blocked: false, locked: true });
+    expect(nombres(repo)).toEqual(["Beto"]);
+
+    // Y al revés: con el candado sacado y el bloqueo puesto, tampoco se ve.
+    repo.setBlocked(ANA, true);
+    repo.setLocked(ANA, false);
+    expect(repo.jidFlags(ANA)).toEqual({ blocked: true, locked: false });
+    expect(nombres(repo)).toEqual(["Beto"]);
+
+    // Recién sin ninguno de los dos vuelve.
+    repo.setBlocked(ANA, false);
+    expect(repo.jidFlags(ANA)).toEqual({ blocked: false, locked: false });
+    expect(nombres(repo)).toEqual(["Ana", "Beto"]);
+    db.close();
+  });
+
+  test("setBlocklist es la lista COMPLETA: los que ya no están se desmarcan", () => {
+    const { db, repo } = conDosChats();
+
+    repo.setBlocklist([ANA, BETO]);
+    expect(repo.listChats()).toEqual([]);
+    expect(repo.countsByFilter()).toEqual({ all: 0, unread: 0, groups: 0 });
+
+    // Beto sigue bloqueado, Ana ya no: vuelve con su historial intacto.
+    repo.setBlocklist([BETO]);
+    expect(nombres(repo)).toEqual(["Ana"]);
+    expect(repo.lastMessages(ANA).map((m) => m.body)).toEqual(["hola dice ana"]);
+
+    repo.setBlocklist([]);
+    expect(nombres(repo)).toEqual(["Ana", "Beto"]);
+    db.close();
+  });
+
+  test("setBlocklist no toca los candados (son otra cosa)", () => {
+    const { db, repo } = conDosChats();
+    repo.setLocked(BETO, true);
+
+    repo.setBlocklist([ANA]);
+    expect(repo.jidFlags(BETO)).toEqual({ blocked: false, locked: true });
+    expect(repo.listChats()).toEqual([]);
+
+    repo.setBlocklist([]);
+    // Beto sigue con candado aunque la lista de bloqueados quedó vacía.
+    expect(nombres(repo)).toEqual(["Ana"]);
+    db.close();
+  });
+
+  test("la marca sobre el @lid oculta el chat que está bajo el número (y al revés)", () => {
+    const { db, repo } = base();
+    const LID = "111122223333@lid";
+    repo.upsertChat({ jid: ANA, name: "Ana", lastMessageAt: 300 });
+    repo.upsertChat({ jid: BETO, name: "Beto", lastMessageAt: 200 });
+    repo.linkJids(ANA, LID);
+
+    // WhatsApp bloquea por LID (`updateBlockStatus` manda `jid: lid`) y el chat
+    // de Ana está guardado bajo el número.
+    repo.setBlocked(LID, true);
+    expect(nombres(repo)).toEqual(["Beto"]);
+
+    repo.setBlocked(LID, false);
+    expect(nombres(repo)).toEqual(["Ana", "Beto"]);
+
+    // La vuelta contraria: la marca sobre el número esconde el chat `@lid`.
+    repo.upsertChat({ jid: LID, name: "Ana (lid)", lastMessageAt: 400 });
+    repo.setLocked(ANA, true);
+    expect(nombres(repo)).toEqual(["Beto"]);
+    db.close();
+  });
+
+  test("una fila sin ninguna marca no queda en la tabla", () => {
+    const { db, repo } = conDosChats();
+    repo.setBlocked(ANA, true);
+    repo.setLocked(ANA, false);
+    repo.setBlocked(ANA, false);
+
+    expect(db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM jid_flags").get()!.n).toBe(0);
+    expect(repo.jidFlags(ANA)).toEqual({ blocked: false, locked: false });
+    db.close();
+  });
+});
+
 // ── envíos y transacciones ──────────────────────────────────────────────────
 
 describe("envíos", () => {
@@ -520,6 +701,13 @@ describe("base corrupta (CA-13.6)", () => {
    * Deja una base sana y después le pisa `paginas` páginas a partir de la
    * fracción `desdeFrac` del archivo, sin tocar la primera (la cabecera): así
    * abre bien, el DDL pasa y el que se queja es el `quick_check`.
+   *
+   * ⚠️ La fracción depende del LAYOUT del archivo: qué hay en esa página decide
+   * si SQLite lo reporta (`quick_check` devuelve el detalle) o lo lanza
+   * ("malformed"). Agregar una tabla al esquema corre las páginas y puede pasar
+   * un caso de una rama a la otra — le pasó a `jid_flags` (la 0,6 dejó de
+   * reportar y pasó a lanzar). Si este test se cae después de tocar el esquema,
+   * no es un bug de `openDb`: hay que volver a elegir la fracción.
    */
   function baseRota(nombre: string, desdeFrac: number, paginas: number): string {
     const path = join(tmp, nombre);
@@ -536,7 +724,8 @@ describe("base corrupta (CA-13.6)", () => {
   }
 
   test("una página pisada que el quick_check REPORTA ⇒ DbCorruptError", () => {
-    const path = baseRota("rota-reporta.sqlite", 0.6, 1);
+    // 0,55 y no 0,6: ver el ⚠️ de `baseRota`.
+    const path = baseRota("rota-reporta.sqlite", 0.55, 1);
 
     try {
       openDb(path);

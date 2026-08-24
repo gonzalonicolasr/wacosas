@@ -32,8 +32,6 @@ import {
   ACCOUNT_RESTRICTED_TEXT,
   getContentType,
   isJidGroup,
-  isJidNewsletter,
-  isJidStatusBroadcast,
   isLidUser,
   jidDecode,
   jidNormalizedUser,
@@ -58,7 +56,7 @@ import type { MessageStatus } from "../db/types";
 import { oneLine } from "../lib/fmt";
 import type { Cancelar, Store } from "../state/store";
 
-import { isRevoke, mapMessage, previewFor, resolveChatName, type MapCtx } from "./map";
+import { isRevoke, isSystemJid, mapMessage, previewFor, resolveChatName, type MapCtx } from "./map";
 import type { ReadTarget } from "./read";
 
 /** Techo de filas por vuelta del drenador (design §5.7, D4). */
@@ -108,7 +106,22 @@ export type IngestJob =
    * respuesta del store de baileys que pide `wa/identity.ts`. No fusionan nada:
    * sólo dejan que el nombre de la agenda se vea desde las dos identidades.
    */
-  | { kind: "aliases"; pairs: LIDMapping[] };
+  | { kind: "aliases"; pairs: LIDMapping[] }
+  /**
+   * La lista COMPLETA de bloqueados (`blocklist.set`, o la respuesta de
+   * `sock.fetchBlocklist()`). Se aplica como UN solo ítem —no de a un jid— porque
+   * su significado es el conjunto entero: los que no están dejan de estar
+   * bloqueados. Partirla entre dos vueltas del drenador dejaría un instante con
+   * media lista aplicada.
+   */
+  | { kind: "blocklist"; jids: string[] }
+  /** Altas y bajas sueltas del bloqueo (`blocklist.update`, con su `type`). */
+  | { kind: "block-updates"; jids: string[]; op: "add" | "remove" }
+  /**
+   * Chat Lock (`chats.lock`): el chat que el usuario escondió detrás de un código
+   * secreto. NO es lo mismo que bloquear a alguien y por eso viaja aparte.
+   */
+  | { kind: "chat-lock"; locks: Array<{ jid: string; locked: boolean }> };
 
 export type Ingest = {
   /** Encola. O(1), nunca async, nunca lanza. */
@@ -212,6 +225,14 @@ function itemsDe(job: IngestJob): readonly unknown[] {
       return lista(job.groups);
     case "aliases":
       return lista(job.pairs);
+    // UN ítem: la lista completa se aplica de una (ver el tipo). Y así una lista
+    // VACÍA —"ya no hay nadie bloqueado"— tampoco se descarta por largo 0.
+    case "blocklist":
+      return [lista(job.jids)];
+    case "block-updates":
+      return lista(job.jids);
+    case "chat-lock":
+      return lista(job.locks);
     default:
       return [];
   }
@@ -605,10 +626,51 @@ export function createIngest(deps: IngestDeps): Ingest {
     marcar(fila.chatJid, true);
   }
 
+  // ── lo que no se muestra: bloqueados y candados ──────────────────────────
+  //
+  // Los dos estados se ANOTAN, nunca se borra nada (§5.1): el chat sigue en la
+  // base con todos sus mensajes y vuelve a la bandeja solo en cuanto WhatsApp
+  // avisa que el bloqueo o el candado se levantaron. Quien los esconde es el
+  // repo, en la consulta (ver `VISIBLE` en `db/repo.ts`).
+
+  /** `blocklist.set` / `fetchBlocklist`: la lista COMPLETA, con sus bajas. */
+  function aplicarBlocklist(jids: unknown): void {
+    const normalizados: string[] = [];
+    for (const j of lista(jids as string[])) {
+      const jid = jidNormalizedUser(texto(j) || undefined);
+      if (jid) normalizados.push(jid);
+    }
+    repo.setBlocklist(normalizados);
+    sucioInbox = true;
+  }
+
+  /** `blocklist.update`: una alta o una baja. El `type` lo tradujo el socket. */
+  function aplicarBloqueo(jid: unknown, bloqueado: boolean): void {
+    const j = jidNormalizedUser(texto(jid) || undefined);
+    if (!j) return;
+    repo.setBlocked(j, bloqueado);
+    sucioInbox = true;
+  }
+
+  /**
+   * `chats.lock`: el candado del chat. El `id` que trae el evento es el jid del
+   * chat tal como lo nombra app-state (`syncAction.index[1]`), que puede ser el
+   * `@lid` o el número — de eso se ocupa el cruce con `jid_aliases` al consultar.
+   */
+  function aplicarCandado(l: { jid: string; locked: boolean }): void {
+    const jid = jidNormalizedUser(texto(l?.jid) || undefined);
+    if (!jid) return;
+    repo.setLocked(jid, !!l?.locked);
+    sucioInbox = true;
+  }
+
   /** `chats.upsert` / `messaging-history.set`: la ficha del chat, sin mensajes. */
   function aplicarChat(c: Chat): void {
     const jid = jidNormalizedUser(c?.id ?? undefined);
-    if (!jid || isJidStatusBroadcast(jid) || isJidNewsletter(jid)) return;
+    // Los pseudo-chats de WhatsApp no entran (§5.4 y el `+0` de `isSystemJid`):
+    // el MISMO criterio que usa `mapMessage`, para que no pueda pasar que el
+    // mensaje se descarte y la ficha del chat quede igual.
+    if (isSystemJid(jid)) return;
 
     // `name` acá es el subject del grupo o el nombre del contacto, según el
     // chat. Vacío NO se manda: el upsert pisaría un nombre bueno con nada.
@@ -769,6 +831,12 @@ export function createIngest(deps: IngestDeps): Ingest {
         return aplicarGrupo(item as Partial<GroupMetadata>);
       case "aliases":
         return aplicarAlias(item as LIDMapping);
+      case "blocklist":
+        return aplicarBlocklist(item);
+      case "block-updates":
+        return aplicarBloqueo(item, job.op !== "remove");
+      case "chat-lock":
+        return aplicarCandado(item as { jid: string; locked: boolean });
     }
   }
 
