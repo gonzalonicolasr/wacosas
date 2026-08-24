@@ -16,6 +16,8 @@ export type Paths = {
   logPath: string;
   lockPath: string;
   configPath: string;
+  /** Hash del código que revela los chats con candado (`boot/lockcode.ts`). */
+  lockCodePath: string;
 };
 
 /** La spec XDG manda ignorar los valores relativos y usar el default. */
@@ -55,5 +57,9 @@ export function resolvePaths(env: Record<string, string | undefined> = process.e
     logPath: join(stateDir, "wacosas.log"),
     lockPath: join(dataDir, "wacosas.lock"),
     configPath: join(dataDir, "config.json"),
+    // Nombre distinto de `wacosas.lock` a propósito: aquél es el pidfile de la
+    // instancia única y éste el candado de los chats. Se parecen en el nombre y
+    // no tienen nada que ver.
+    lockCodePath: join(dataDir, "lock-code.json"),
   };
 }

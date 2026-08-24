@@ -12,6 +12,7 @@
 // la bandeja —selección, filtro y buscador— (tarea 12), los de envío (tarea 14),
 // los de leído (tarea 15) y los de la búsqueda global (tarea 16).
 import type { Logger } from "../boot/log";
+import type { LockCode } from "../boot/lockcode";
 import type { Repo } from "../db/repo";
 import type { ChatRow } from "../db/types";
 import { fold } from "../lib/fmt";
@@ -48,6 +49,12 @@ export type CommandDeps = {
    * `resyncContacts` avisa en vez de romper.
    */
   appstate?: AppStateSync;
+  /**
+   * El código que revela los chats con candado. Opcional por el mismo motivo que
+   * `send` y `read`: un test de interfaz no tiene dónde guardar un hash, y sin
+   * ella el buscador de la bandeja es un buscador y nada más.
+   */
+  lockCode?: LockCode;
   /**
    * Cierre del proceso. Hoy es el mínimo que deja la terminal usable; la tarea 17
    * lo reemplaza por el apagado ordenado de §6.6 sin tocar a los llamadores.
@@ -218,6 +225,56 @@ export function seleccionVigente(visibles: ChatRow[], jid: string | null): strin
   return visibles.length > 0 ? (visibles[0] as ChatRow).jid : null;
 }
 
+// ── el candado: revelar escribiendo el código en el buscador ─────────────────
+//
+// El gesto es el de WhatsApp: los dígitos van en el MISMO campo con el que se
+// filtra la bandeja (CA-5.1, que está siempre enfocado) y si coinciden con el
+// código guardado, los chats con candado aparecen. `Esc` los vuelve a esconder.
+//
+// Tres detalles que no son cosméticos:
+//
+//  1. **El buscador de la bandeja NO consulta la base**: filtra en memoria sobre
+//     la lista que ya está en RAM (ver `filtrarChats`). O sea que el código
+//     tipeado no llega nunca a SQLite ni al índice FTS — nada de una búsqueda
+//     full-text con el código de término. La búsqueda global (`Ctrl-G`) es otro
+//     campo, otro modo, y ahí no hay revelado que valga.
+//  2. **Al acertar, el campo se VACÍA en el acto**: los dígitos dejan de estar en
+//     pantalla apenas dejan de hacer falta, y de paso la bandeja vuelve a la
+//     lista completa (filtrando por el código no se vería ningún chat).
+//  3. **Un código que no coincide no se distingue de una búsqueda cualquiera**:
+//     no hay aviso, ni sonido, ni un "código incorrecto". El texto queda ahí
+//     filtrando, como cualquier otra cosa que se escriba. Que exista un código
+//     es algo que sabe el que lo puso.
+const AVISO_REVELADO = "chats con candado a la vista · Esc para esconderlos";
+
+/**
+ * ¿Lo que se acaba de tipear es el código? Si sí, revela; si no, no pasa nada.
+ *
+ * La derivación es ASINCRÓNICA (~30 ms fuera del hilo del event loop) para no
+ * comerse un frame por tecla, así que cuando vuelve hay que volver a preguntar
+ * qué hay escrito AHORA: entre medio pudo haber otra tecla, y revelar por un
+ * texto que ya no está sería revelar solo.
+ */
+function intentarRevelar(d: CommandDeps, texto: string): void {
+  if (!d.lockCode || d.store.lockedRevealed()) return;
+  d.lockCode
+    .verify(texto)
+    .then((ok) => {
+      if (!ok || d.store.inboxUi().inboxQuery !== texto) return;
+      // El orden importa poco (los dos `markDirty` caen en el mismo flush, D3),
+      // pero limpiar primero deja el código fuera de pantalla cuanto antes.
+      commands.setInboxQuery("");
+      d.store.setLockedRevealed(true);
+      d.store.toast(AVISO_REVELADO);
+      // Sin el código, sin su largo y sin el jid de ningún chat.
+      d.log.info("candado.revelado");
+    })
+    .catch(() => {
+      // `verify` no lanza; el catch es para que un rechazo inesperado no termine
+      // en un unhandled rejection que se lleve puesto el proceso.
+    });
+}
+
 /** Lo que hace falta para mover el cursor: la lista visible y dónde está parado. */
 function vistaBandeja(d: CommandDeps): { visibles: ChatRow[]; actual: string | null } {
   const ui = d.store.inboxUi();
@@ -285,6 +342,19 @@ export type Commands = {
   cycleInboxFilter(): void;
   /** Texto del buscador de la bandeja (CA-5.2). `""` vuelve a la lista completa (CA-5.4). */
   setInboxQuery(query: string): void;
+  /** ¿Ya hay un código del candado fijado? Lo pregunta la pantalla de `Ctrl-P`. */
+  hasLockCode(): boolean;
+  /**
+   * Fija (o reemplaza) el código del candado. Devuelve el motivo cuando no se
+   * pudo, para poder mostrarlo al lado del campo sin dar una vuelta por el store.
+   */
+  setLockCode(digits: string): Resultado;
+  /**
+   * Vuelve a esconder los chats con candado (`Esc`). Limpia el buscador y, si el
+   * chat abierto era justamente uno de los escondidos, lo cierra: dejarlo abierto
+   * sería dejar el campo de redacción apuntando a un chat que ya no se ve.
+   */
+  hideLocked(): void;
   /**
    * `Ctrl-G`: entra a la búsqueda global. Guarda el estado de la bandeja
    * —chat seleccionado, filtro y texto del buscador— para poder devolverlo tal
@@ -429,6 +499,37 @@ export const commands: Commands = {
       inboxQuery: texto,
       selectedJid: seleccionVigente(visibles, ui.selectedJid),
     });
+    // ¿Y si eso que se tipeó era el código del candado? (ver `intentarRevelar`).
+    // Va DESPUÉS de escribir la búsqueda: mientras la derivación corre, el
+    // buscador se comporta como siempre.
+    if (texto !== "") intentarRevelar(deps, texto);
+  },
+
+  hasLockCode() {
+    return deps?.lockCode?.exists() ?? false;
+  },
+
+  setLockCode(digits) {
+    const d = deps;
+    if (!d) return { ok: false, reason: "todavía no arrancó la aplicación" };
+    if (!d.lockCode) return { ok: false, reason: "el candado todavía no está disponible" };
+    const r = d.lockCode.set(digits);
+    if (!r.ok) return r;
+    return { ok: true };
+  },
+
+  hideLocked() {
+    const d = deps;
+    // El estado se lee EN VIVO (D3): el revelado llega por un camino asincrónico
+    // y el snapshot puede tener hasta 33 ms de atraso.
+    if (!d || !d.store.lockedRevealed()) return;
+    d.store.setLockedRevealed(false);
+    commands.setInboxQuery("");
+    const jid = d.store.openChatJid();
+    // `isHidden` con `false`: la pregunta es "¿este chat se esconde ahora que ya
+    // no está revelado?".
+    if (jid && d.repo.isHidden(jid, false)) commands.closeChat();
+    d.log.info("candado.escondido");
   },
 
   openSearch() {

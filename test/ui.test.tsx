@@ -5,11 +5,15 @@
 //
 // Los tamaños no son caprichosos: 60×15 es el mínimo declarado de RNF-2, 80×19 y
 // 80×20 son el rango donde la ayuda no entraba, y 80×24 es RNF-1.
-import { expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import type { ScrollBoxRenderable } from "@opentui/core";
 import { testRender } from "@opentui/react/test-utils";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { act, createRef } from "react";
 
+import { createLockCode } from "../src/boot/lockcode";
 import { configureCommands, type CommandDeps } from "../src/state/commands";
 import { store, TOAST_MS, type LinkSnapshot } from "../src/state/store";
 import { App } from "../src/ui/App";
@@ -31,7 +35,7 @@ const ATAJOS_BANDEJA = [
   "PgUp PgDn       saltar de a una pantalla (Inicio / Fin, a las puntas)",
   "⏎ · ^L          abrir el chat (o doble click) · marcarlo leído sin abrir",
   "Tab             filtrar: todos / no leídos / grupos",
-  "Esc             limpiar el buscador",
+  "Esc · ^P        limpiar el buscador · fijar el código del candado",
 ];
 const ATAJOS_CONVO = [
   "⇧↑↓ ⇧PgUp/PgDn  scrollear el chat · ⇧Inicio ⇧Fin a las puntas",
@@ -788,6 +792,148 @@ test("en la vista del QR, Ctrl-R RECONECTA aunque ya se haya pedido un código",
   // y sin sacar al usuario de la pantalla que estaba usando.
   expect(t.captureCharFrame()).toContain(qr.rows[1] as string);
   t.renderer.destroy();
+});
+
+// ── la pantalla del candado (`^P`) ──────────────────────────────────────────
+//
+// Lo que se mira en el frame de caracteres y no en el estado de React es
+// justamente lo que sólo existe ahí: que **los dígitos del código no se dibujen
+// nunca**. El buffer vive en `App` y el panel pinta `•`; si algún día alguien lo
+// cambia por un `<input>` (que no tiene modo contraseña), este test se cae.
+describe("pantalla del candado", () => {
+  const dirCandado = mkdtempSync(join(tmpdir(), "wacosas-ui-candado-"));
+  afterAll(() => rmSync(dirCandado, { recursive: true, force: true }));
+
+  /** Un código nuevo por test: no se comparten archivos entre casos. */
+  let nCandado = 0;
+  function cablearCandado() {
+    const lockCode = createLockCode(join(dirCandado, `lock-${++nCandado}.json`));
+    cablearComandos();
+    configureCommands({
+      repo: {} as CommandDeps["repo"],
+      wa: {} as CommandDeps["wa"],
+      store,
+      log: { info() {}, warn() {}, error() {}, path: LOG },
+      lockCode,
+      shutdown() {},
+    });
+    return lockCode;
+  }
+
+  const tipear = async (t: Awaited<ReturnType<typeof montar>>, texto: string) => {
+    await act(async () => {
+      await t.mockInput.typeText(texto);
+    });
+    await pintar(t);
+  };
+
+  const enter = async (t: Awaited<ReturnType<typeof montar>>) => {
+    act(() => {
+      t.mockInput.pressEnter();
+    });
+    await pintar(t);
+  };
+
+  test("los dígitos se ven como puntos, nunca en claro", async () => {
+    cablearCandado();
+    const t = await montar(80, 24);
+    act(() => {
+      t.mockInput.pressKey("p", { ctrl: true });
+    });
+    await pintar(t);
+
+    expect(t.captureCharFrame()).toContain("Fijá el código de los chats con candado");
+
+    await tipear(t, "8264");
+    const frame = t.captureCharFrame();
+    expect(frame).toContain("••••");
+    expect(frame).not.toContain("8264");
+    // Y tampoco se fue al buscador de la bandeja, que está desmontado.
+    expect(store.inboxUi().inboxQuery).toBe("");
+    t.renderer.destroy();
+  });
+
+  test("se pide dos veces, y si no coinciden se vuelve a empezar", async () => {
+    const lockCode = cablearCandado();
+    const t = await montar(80, 24);
+    act(() => {
+      t.mockInput.pressKey("p", { ctrl: true });
+    });
+    await pintar(t);
+
+    await tipear(t, "8264");
+    await enter(t);
+    expect(t.captureCharFrame()).toContain("Repetilo para confirmar");
+
+    await tipear(t, "8265");
+    await enter(t);
+    let frame = t.captureCharFrame();
+    expect(frame).toContain("no coinciden");
+    // Se volvió al primer paso con el campo VACÍO (no quedó nada tipeado).
+    expect(frame).toContain("Fijá el código");
+    expect(frame).not.toContain("•");
+    expect(lockCode.exists()).toBe(false);
+
+    // Ahora sí, dos veces lo mismo.
+    await tipear(t, "8264");
+    await enter(t);
+    await tipear(t, "8264");
+    await enter(t);
+    frame = t.captureCharFrame();
+    expect(lockCode.exists()).toBe(true);
+    // El cartel final explica el gesto, que es lo único que hay que aprender.
+    expect(frame).toContain("el código quedó fijado");
+    expect(frame).toContain("Escribí esos dígitos en el buscador");
+    expect(frame).not.toContain("8264");
+    t.renderer.destroy();
+  });
+
+  test("un código mal formado no se puede fijar y lo dice", async () => {
+    const lockCode = cablearCandado();
+    const t = await montar(80, 24);
+    act(() => {
+      t.mockInput.pressKey("p", { ctrl: true });
+    });
+    await pintar(t);
+
+    // Tres dígitos: uno menos que el mínimo. Las letras ni siquiera entran.
+    await tipear(t, "82a");
+    await enter(t);
+    const frame = t.captureCharFrame();
+    expect(frame).toContain("el código tiene 2 dígitos");
+    expect(lockCode.exists()).toBe(false);
+    t.renderer.destroy();
+  });
+
+  test("`Esc` cierra la pantalla y borra lo tipeado", async () => {
+    cablearCandado();
+    const t = await montar(80, 24);
+    act(() => {
+      t.mockInput.pressKey("p", { ctrl: true });
+    });
+    await pintar(t);
+    await tipear(t, "8264");
+    expect(t.captureCharFrame()).toContain("••••");
+
+    act(() => {
+      t.mockInput.pressEscape();
+    });
+    // El `Esc` pelado lo retiene el parser 20 ms por si es el prefijo de una
+    // secuencia (ver `apretarEsc`).
+    await act(async () => {
+      await Bun.sleep(40);
+    });
+    await pintar(t);
+    expect(t.captureCharFrame()).toContain("chats");
+
+    // Volver a entrar arranca en blanco: los dígitos no sobreviven a la pantalla.
+    act(() => {
+      t.mockInput.pressKey("p", { ctrl: true });
+    });
+    await pintar(t);
+    expect(t.captureCharFrame()).not.toContain("•");
+    t.renderer.destroy();
+  });
 });
 
 test("no reescribe el banner cuando no cambió (un flush menos por montaje)", async () => {

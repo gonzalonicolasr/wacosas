@@ -44,6 +44,21 @@ const PROHIBIDOS = [
   "password",
   "auth",
   "qr",
+  // El código que revela los chats con candado (`boot/lockcode.ts`) y todo lo
+  // que se deriva de él. `hash`/`salt` también: solos no sirven para entrar, pero
+  // con ellos en el log alcanza para probar los 10⁶ códigos de seis dígitos sin
+  // tocar el archivo de 0600.
+  //
+  // ⚠️ `code` NO está en la lista, a propósito: es el código de desconexión de
+  // WhatsApp (401, 440, 515) y es lo primero que se mira cuando la sesión se
+  // cae (`wa.close`). El código del candado se llama `codigo` en todos lados
+  // justamente para no tener que elegir entre las dos cosas — y de todas formas
+  // la regla de fondo sigue siendo la de arriba: al logger no se le pasan
+  // secretos, la lista de nombres es la red, no la puerta.
+  "codigo",
+  "pin",
+  "hash",
+  "salt",
 ] as const;
 
 /** Los mismos nombres como unión, para tiparlos `never` en `Fields`. */

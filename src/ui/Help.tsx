@@ -51,7 +51,15 @@ const ATAJOS_BANDEJA: Array<[string, string]> = [
   // blanco de las tres secciones para ahorrar uno solo.
   ["⏎ · ^L", "abrir el chat (o doble click) · marcarlo leído sin abrir"],
   ["Tab", "filtrar: todos / no leídos / grupos"],
-  ["Esc", "limpiar el buscador"],
+  // `^P` entró PEGADO a `Esc` y no en una fila propia: a 80×24 con el banner de
+  // conexión a la vista el cuerpo son 17 filas y lo esencial de la ayuda son 17,
+  // así que un renglón más le hacía tirar los títulos de sección.
+  //
+  // Lo que la ayuda NO dice —a propósito— es el gesto para revelar (escribir el
+  // código en el buscador): eso lo explica la pantalla de `^P` cuando el usuario
+  // fija el código, que es el único momento en que hace falta saberlo. Anunciarlo
+  // acá sería contárselo a cualquiera que abra la ayuda.
+  ["Esc · ^P", "limpiar el buscador · fijar el código del candado"],
 ];
 
 // Dos filas, apretadas a propósito: cada atajo nuevo empuja la ayuda un renglón

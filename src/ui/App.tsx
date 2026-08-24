@@ -26,6 +26,7 @@ import { ALTO_FOOTER, Footer } from "./Footer";
 import { ALTO_HEADER, Header } from "./Header";
 import { ayudaScrollea, Help } from "./Help";
 import { HINTS_BANDEJA, Inbox } from "./Inbox";
+import { CANDADO_INICIAL, conDigito, type EstadoCandado, LockCode, siguientePaso, sinUltimo } from "./LockCode";
 import { Login, metodoDe } from "./Login";
 import { type ApiBusqueda, HINTS_BUSQUEDA, SearchOverlay } from "./SearchOverlay";
 import { Splash } from "./Splash";
@@ -42,8 +43,12 @@ import { BG, BORDER, ELEVATED, SURFACE, WARN } from "./theme";
  *
  * `search` es la búsqueda global (CA-12.1): tapa el cuerpo entero, se lleva el
  * foco del teclado y ni la bandeja ni la conversación se pintan mientras dura.
+ *
+ * `candado` es la pantalla de `Ctrl-P` (fijar el código de los chats con
+ * candado). Tapa el cuerpo igual que la ayuda y **se come todas las teclas**: los
+ * dígitos son el código y no pueden llegar a ningún otro lado.
  */
-type Modo = "browse" | "help" | "compose" | "search";
+type Modo = "browse" | "help" | "compose" | "search" | "candado";
 /** Un panel por vez cuando la terminal es angosta (§7.2). */
 type PanelMini = "inbox" | "convo";
 type Disposicion = "wide" | "compact" | "mini";
@@ -122,6 +127,22 @@ export function App({
   const ui = useSlice("ui");
 
   const [modo, setModo] = useState<Modo>("browse");
+  // El código a medio tipear de la pantalla del candado. Vive acá y no adentro
+  // de `<LockCode/>` porque el `useKeyboard` es UNO solo (§7.4): las teclas las
+  // recibe este handler y el panel es una vista. Es memoria y nada más: no se
+  // guarda, no se loguea y se borra al salir de la pantalla (efecto de abajo).
+  //
+  // ⚠️ Va DUPLICADO en una ref, que es la que lee el teclado. Es el mismo motivo
+  // por el que los comandos leen el store en vivo (D3): varias teclas dentro del
+  // mismo render ven todas el MISMO `candado` de la closure y las últimas se
+  // pierden — medido, tipear `8264` dejaba un solo dígito. La ref es el valor de
+  // ahora; el `useState` es sólo para que se vuelva a pintar.
+  const candadoRef = useRef<EstadoCandado>(CANDADO_INICIAL);
+  const [candado, pintarCandado] = useState<EstadoCandado>(CANDADO_INICIAL);
+  const setCandado = (e: EstadoCandado): void => {
+    candadoRef.current = e;
+    pintarCandado(e);
+  };
   const [panelMini, setPanelMini] = useState<PanelMini>("inbox");
   const [splash, setSplash] = useState(!noSplash);
   const [avance, setAvance] = useState(0);
@@ -231,6 +252,13 @@ export function App({
   // de la tecla no está garantizado; el efecto corre después de los dos.
   useEffect(() => {
     if (modo === "help") commands.setInboxQuery("");
+  }, [modo]);
+
+  // Salir de la pantalla del candado borra lo tipeado (de la ref y del estado).
+  // `CANDADO_INICIAL` es una constante del módulo, así que volver a setearla
+  // cuando ya estaba no re-renderiza nada (React compara por identidad).
+  useEffect(() => {
+    if (modo !== "candado") setCandado(CANDADO_INICIAL);
   }, [modo]);
 
   /**
@@ -347,6 +375,43 @@ export function App({
       return;
     }
 
+    // ── candado: fijar el código (`Ctrl-P`) ─────────────────────────────────
+    // Se traga TODAS las teclas: acá los dígitos son el código y no pueden caer
+    // en el buscador de la bandeja (que además está desmontado, como con la
+    // ayuda). No hay `<input>`: lo tipeado se acumula en `candado.digitos` y en
+    // pantalla se ven `•`, así que el código no queda a la vista de nadie.
+    if (modo === "candado") {
+      if (es("escape")) {
+        setModo("browse");
+        return;
+      }
+      // La ref y no el `useState`: varias teclas pueden caer en el mismo render.
+      const actual = candadoRef.current;
+      if (enter) {
+        if (actual.fase === "listo") {
+          setModo("browse");
+          return;
+        }
+        const paso = siguientePaso(actual);
+        if (paso.guardar === undefined) {
+          setCandado(paso.estado);
+          return;
+        }
+        // El único punto donde el código sale de la memoria: `setLockCode` lo
+        // deriva con scrypt y guarda sal + hash (nunca los dígitos).
+        const r = commands.setLockCode(paso.guardar);
+        setCandado(r.ok ? { ...CANDADO_INICIAL, fase: "listo" } : { ...CANDADO_INICIAL, motivo: r.reason });
+        return;
+      }
+      if (es("backspace")) {
+        setCandado(sinUltimo(actual));
+        return;
+      }
+      // `sequence` y no `name`: es el carácter que se tipeó.
+      if (/^[0-9]$/.test(seq)) setCandado(conDigito(actual, seq));
+      return;
+    }
+
     // ── búsqueda global (CA-12.*) ───────────────────────────────────────────
     // Sólo las teclas de NAVEGACIÓN: el texto lo escribe el `<input>` del
     // overlay, que recibe todo lo que no se maneje acá (incluido el `?`, que
@@ -442,6 +507,16 @@ export function App({
       return;
     }
 
+    // CA nueva (candado): fijar el código que revela los chats con candado. Es
+    // un `Ctrl-<letra>` con el buscador de la bandeja enfocado y no le come nada
+    // al texto: `Ctrl-P` no está entre las teclas de edición del `<input>` de
+    // OpenTUI (verificado en el fuente: sus bindings con `ctrl` son
+    // a/e/f/b/w/k/u/d y `-`/`.`).
+    if (key.ctrl && es("p")) {
+      setModo("candado");
+      return;
+    }
+
     // El buscador se lee EN VIVO y no del snapshot: éste está cacheado hasta el
     // próximo flush (D3), así que un `?` apretado dentro de los 33 ms de haber
     // tipeado vería el campo vacío y abriría la ayuda en vez de escribirse.
@@ -455,13 +530,23 @@ export function App({
       return;
     }
 
-    // `Esc` tiene tres significados y el orden importa: primero volver de panel
-    // en `mini` (§7.2), después limpiar el buscador (CA-5.4). Sin texto y sin
-    // panel que cerrar no hace nada — cerrar la aplicación con `Esc` sería un
-    // accidente esperando.
+    // `Esc` tiene cuatro significados y el orden importa: primero volver de panel
+    // en `mini` (§7.2), después esconder de nuevo los chats con candado, y por
+    // último limpiar el buscador (CA-5.4). Sin nada de eso no hace nada — cerrar
+    // la aplicación con `Esc` sería un accidente esperando.
+    //
+    // El candado va ANTES del buscador porque al revelar el campo quedó vacío (es
+    // lo que esconde el código de la pantalla): mirando sólo el texto, `Esc` no
+    // habría tenido forma de volver a esconderlos.
     if (es("escape")) {
       if (disposicion === "mini" && panelMini === "convo") {
         setPanelMini("inbox");
+        return;
+      }
+      // EN VIVO y no del snapshot (D3): el revelado llega por un camino
+      // asincrónico (la derivación scrypt) y el snapshot puede estar atrasado.
+      if (store.lockedRevealed()) {
+        commands.hideLocked();
         return;
       }
       if (busqueda !== "") commands.setInboxQuery("");
@@ -536,7 +621,9 @@ export function App({
   const hints =
     modo === "compose"
       ? `${HINTS_COMPOSER} · ^C salir`
-      : modo === "search"
+      : modo === "candado"
+        ? `${candado.fase === "listo" ? "⏎ / Esc cerrar" : "⏎ seguir · Esc cancelar"} · ^C salir`
+        : modo === "search"
         ? `${HINTS_BUSQUEDA} · ^C salir`
         : modo === "help"
           ? `${scrollAyuda ? "↑↓ desplazar · " : ""}^R reconectar · Esc / ? cerrar la ayuda`
@@ -564,6 +651,11 @@ export function App({
           mini={disposicion === "mini"}
           cajaRef={ayudaRef}
         />
+      ) : modo === "candado" ? (
+        /* Mismo criterio que la ayuda: REEMPLAZA el cuerpo. La bandeja se
+           desmonta, así que mientras se fija el código no hay ningún `<input>`
+           enfocado que pueda recibir un dígito. */
+        <LockCode estado={candado} yaHay={commands.hasLockCode()} ancho={width} alto={filasVisibles} />
       ) : modo === "search" ? (
         /* §7.1: el overlay REEMPLAZA el cuerpo (no se dibuja encima). La bandeja
            y la conversación se desmontan, así que el `<input>` de la búsqueda es
@@ -586,7 +678,11 @@ export function App({
               border
               borderColor={BORDER}
               backgroundColor={SURFACE}
-              title={` chats ${inbox.counts.all} `}
+              // El `· candado` es el ÚNICO rastro en pantalla de que los chats
+              // con candado están a la vista. Sin él no habría cómo saber si lo
+              // que se está viendo es la bandeja de siempre o la de después del
+              // código —y el `Esc` que los esconde parecería no hacer nada—.
+              title={` chats ${inbox.counts.all}${ui.lockedRevealed ? " · candado" : ""} `}
             >
               {/* El buscador de la bandeja tiene el foco SALVO mientras se
                   redacta: el reconciliador de OpenTUI aplica `focused` sólo

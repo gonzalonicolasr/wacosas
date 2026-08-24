@@ -96,10 +96,16 @@ export type JidFlags = { blocked: boolean; locked: boolean };
 
 export type Repo = {
   // ── lectura (proyecciones del store) ──────────────────────────────────────
+  //
+  // `revealLocked` es el "el usuario escribió el código en el buscador" de
+  // `state/commands.ts`: con `true` los chats con CANDADO vuelven a listarse (los
+  // bloqueados no, nunca). Va como argumento y no como un modo guardado adentro
+  // del repo para que no pueda quedar prendido sin que el estado de la interfaz
+  // lo diga: la única fuente de verdad es `ui.lockedRevealed` del store.
   /** SIN los ocultos: bloqueados y con candado no se listan (ver `VISIBLE`). */
-  listChats(limit?: number): ChatRow[];
+  listChats(limit?: number, revealLocked?: boolean): ChatRow[];
   /** Los tres contadores de la bandeja, también SIN los ocultos. */
-  countsByFilter(): Counts;
+  countsByFilter(revealLocked?: boolean): Counts;
   /**
    * La ficha de UN chat, esté oculto o no. No filtra a propósito: lo llaman el
    * ingest (para no pisar nombres) y `markRead`, que necesitan la fila aunque el
@@ -122,9 +128,17 @@ export type Repo = {
   lastMessages(jid: string, limit?: number): MessageRow[];
   messagesBefore(jid: string, beforeId: number, limit: number): MessageRow[];
   messagesAround(jid: string, anchorId: number, span?: number): MessageRow[];
-  searchMessages(match: string, limit: number): SearchHit[];
-  searchChats(query: string, limit: number): ChatRow[];
+  searchMessages(match: string, limit: number, revealLocked?: boolean): SearchHit[];
+  searchChats(query: string, limit: number, revealLocked?: boolean): ChatRow[];
   openSends(): MessageRow[];
+  /**
+   * ¿Este chat está oculto AHORA? Es `VISIBLE` para un solo jid —cruza la
+   * identidad hermana igual que las consultas de la bandeja— y existe para la
+   * única puerta que no pasa por ellas: **el chat que ya estaba ABIERTO** cuando
+   * llegó el candado. De la bandeja desaparece, pero la ventana de mensajes es
+   * otra proyección y se seguía viendo (ver `construirConvo` en `state/store.ts`).
+   */
+  isHidden(jid: string, revealLocked?: boolean): boolean;
 
   // ── escritura (sólo desde wa/ingest.ts y wa/send.ts, dentro de una txn) ───
   /** `contactName` NO se acepta: es derivado del `LEFT JOIN` con la agenda. */
@@ -225,8 +239,19 @@ const COLS_MSG = "id, chat_jid, wa_id, from_me, sender_jid, sender_name, ts, kin
 const JOIN_OCULTOS = `LEFT JOIN jid_aliases x ON x.jid = c.jid
      LEFT JOIN jid_flags   f ON f.jid = c.jid
      LEFT JOIN jid_flags   g ON g.jid = x.alt_jid`;
-const VISIBLE = `COALESCE(f.blocked, 0) = 0 AND COALESCE(f.locked, 0) = 0
-       AND COALESCE(g.blocked, 0) = 0 AND COALESCE(g.locked, 0) = 0`;
+// ⚠️ El `?` es `revealLocked` (1/0): "el usuario escribió el código en el
+// buscador, mostrame también los que tienen candado". Va como PARÁMETRO y no
+// como dos sentencias distintas para que el plan de la consulta sea uno solo y
+// no se puedan desincronizar las cuatro puertas.
+//
+// El bloqueo NO se revela nunca: el código del candado es del CANDADO. Que
+// alguien esté bloqueado no es un chat escondido detrás de un código, es una
+// persona con la que el usuario decidió no hablar.
+const VISIBLE = `COALESCE(f.blocked, 0) = 0 AND COALESCE(g.blocked, 0) = 0
+       AND (? = 1 OR (COALESCE(f.locked, 0) = 0 AND COALESCE(g.locked, 0) = 0))`;
+
+/** El `?` de `VISIBLE`. Sin argumento, los chats con candado siguen escondidos. */
+const ver = (revealLocked: boolean | undefined): number => (revealLocked ? 1 : 0);
 
 function aChatRow(f: FilaChat): ChatRow {
   return {
@@ -285,14 +310,14 @@ const opt = <T>(v: T | undefined): T | null => (v === undefined ? null : v);
 export function createRepo(db: Database): Repo {
   // Todas las sentencias se preparan una sola vez, acá. `db.query()` además las
   // cachea en la conexión y las finaliza sola en el `close()`.
-  const qListChats = db.query<FilaChat, [number]>(
+  const qListChats = db.query<FilaChat, [number, number]>(
     `SELECT ${COLS_CHAT} ${FROM_CHAT} ${JOIN_OCULTOS}
      WHERE ${VISIBLE}
      ORDER BY c.last_message_at DESC, c.jid LIMIT ?`,
   );
   // Los mismos joins que `qListChats`: un chat oculto tampoco puede contarse en
   // los tabs (si no, `Todos` diría 12 y se verían 11).
-  const qCounts = db.query<Counts, []>(
+  const qCounts = db.query<Counts, [number]>(
     `SELECT COUNT(*)                                                     AS "all",
             COALESCE(SUM(CASE WHEN c.unread_count > 0 THEN 1 ELSE 0 END), 0) AS unread,
             COALESCE(SUM(CASE WHEN c.is_group = 1     THEN 1 ELSE 0 END), 0) AS groups
@@ -337,7 +362,7 @@ export function createRepo(db: Database): Repo {
     `SELECT ${COLS_MSG} FROM messages WHERE status IN ('pending','failed') ORDER BY id`,
   );
 
-  const qSearch = db.query<FilaHit, [string, number]>(
+  const qSearch = db.query<FilaHit, [string, number, number]>(
     `SELECT m.id, m.chat_jid, c.name AS chat_name, c.is_group, m.ts, m.from_me,
             snippet(messages_fts, 0, char(1), char(2), '…', 10) AS frag
      FROM messages_fts
@@ -455,13 +480,13 @@ export function createRepo(db: Database): Repo {
   const correrTx = db.transaction((fn: () => unknown) => fn());
 
   return {
-    listChats(limit) {
+    listChats(limit, revealLocked) {
       // `LIMIT -1` en SQLite es "sin límite".
-      return qListChats.all(limit ?? -1).map(aChatRow);
+      return qListChats.all(ver(revealLocked), limit ?? -1).map(aChatRow);
     },
 
-    countsByFilter() {
-      return qCounts.get() ?? { all: 0, unread: 0, groups: 0 };
+    countsByFilter(revealLocked) {
+      return qCounts.get(ver(revealLocked)) ?? { all: 0, unread: 0, groups: 0 };
     },
 
     getChat(jid) {
@@ -499,11 +524,11 @@ export function createRepo(db: Database): Repo {
       return ordenarCronologico([...qHasta.all(jid, anchorId, mitad), ...qDesde.all(jid, anchorId, mitad)]);
     },
 
-    searchMessages(match, limit) {
+    searchMessages(match, limit, revealLocked) {
       // Una MATCH vacía es error de sintaxis en FTS5: `buildFtsQuery` devuelve
       // '' cuando no queda ningún término y acá se corta sin llegar al motor.
       if (match.trim() === "") return [];
-      return qSearch.all(match, limit).map((f) => ({
+      return qSearch.all(match, ver(revealLocked), limit).map((f) => ({
         messageId: f.id,
         chatJid: f.chat_jid,
         chatName: f.chat_name,
@@ -519,11 +544,11 @@ export function createRepo(db: Database): Repo {
     // existe `chats_fts`). El filtrado es en JS y no en SQL porque bun:sqlite no
     // deja registrar funciones propias —así que `LIKE` no sabría de acentos— y
     // la tabla `chats` es chica por naturaleza: son cientos de filas, no miles.
-    searchChats(query, limit) {
+    searchChats(query, limit, revealLocked) {
       const aguja = fold(query.trim());
       if (aguja === "") return [];
       const out: ChatRow[] = [];
-      for (const f of qListChats.all(-1)) {
+      for (const f of qListChats.all(ver(revealLocked), -1)) {
         if (
           fold(f.name).includes(aguja) ||
           fold(f.contact_name).includes(aguja) ||
@@ -590,6 +615,21 @@ export function createRepo(db: Database): Repo {
     jidFlags(jid) {
       const f = qFlags.get(jid);
       return { blocked: f?.blocked === 1, locked: f?.locked === 1 };
+    },
+
+    // Dos búsquedas por PK como mucho (la marca puede estar pegada al `@lid` y el
+    // chat vivir bajo el número, o al revés). Lo llama el store una vez por
+    // flush del slice `convo`, o sea nunca en un lazo caliente.
+    isHidden(jid, revealLocked) {
+      if (!jid) return false;
+      const alt = qAltJid.get(jid)?.alt_jid;
+      for (const j of alt ? [jid, alt] : [jid]) {
+        const f = qFlags.get(j);
+        if (!f) continue;
+        if (f.blocked === 1) return true;
+        if (f.locked === 1 && !revealLocked) return true;
+      }
+      return false;
     },
 
     // Si el chat no existe, el FK aborta: un mensaje huérfano sería invisible en

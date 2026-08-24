@@ -111,6 +111,19 @@ export type UiSnapshot = {
    * algo escrito, casi siempre una.
    */
   drafts: Record<string, string>;
+  /**
+   * Los chats con CANDADO (Chat Lock) están a la vista porque el usuario escribió
+   * su código en el buscador de la bandeja (`state/commands.ts`).
+   *
+   * **Sólo en memoria y a propósito**: nace en `false` en cada arranque. Que
+   * sobreviviera al proceso convertiría el candado en un interruptor de una sola
+   * vez, que es exactamente lo contrario de lo que el usuario escondió detrás de
+   * un código.
+   *
+   * Los BLOQUEADOS no entran acá: siguen ocultos siempre (ver `VISIBLE` en
+   * `db/repo.ts`).
+   */
+  lockedRevealed: boolean;
 };
 
 /** El mapa slice → snapshot. De acá salen `Slice` y `SnapshotOf`. */
@@ -175,6 +188,21 @@ export type Store = {
    * leerían las dos el mismo valor viejo y la segunda se perdería.
    */
   inboxUi(): Pick<UiSnapshot, "inboxFilter" | "inboxQuery" | "selectedJid">;
+  /**
+   * Muestra o esconde los chats con candado (CANDADO, no bloqueados). Marca
+   * sucias las TRES proyecciones que los filtran —bandeja, conversación y
+   * búsqueda global—: son consultas distintas sobre la misma base y si una se
+   * quedara con el snapshot viejo habría un chat a la vista en un panel y
+   * escondido en el otro.
+   */
+  setLockedRevealed(on: boolean): void;
+  /**
+   * El estado del candado EN VIVO, sin pasar por el snapshot cacheado. Mismo
+   * motivo que `inboxUi()`: quien decide qué hace una tecla (`Esc`) no puede
+   * leer un valor de hasta 33 ms de atraso, y el revelado llega por un camino
+   * ASINCRÓNICO (la derivación scrypt tarda ~30 ms).
+   */
+  lockedRevealed(): boolean;
   /** Guarda (o borra, con `""`) el borrador de un chat (CA-8.6). */
   setDraft(jid: string | null, text: string): void;
   /**
@@ -230,6 +258,7 @@ export function createStore(opts: StoreOpts = {}): Store {
     inboxQuery: "",
     selectedJid: null,
     drafts: {},
+    lockedRevealed: false,
   };
   let abierto: string | null = null;
   let ancla: number | null = null;
@@ -257,11 +286,25 @@ export function createStore(opts: StoreOpts = {}): Store {
     if (!repo) return { chats: [], counts: { all: 0, unread: 0, groups: 0 } };
     // Sin límite: `chats` es una tabla chica por naturaleza (cientos de filas) y
     // recortarla escondería chats viejos que la bandeja tiene que poder listar.
-    return { chats: repo.listChats(), counts: repo.countsByFilter() };
+    return {
+      chats: repo.listChats(undefined, ui.lockedRevealed),
+      counts: repo.countsByFilter(ui.lockedRevealed),
+    };
   }
 
   function construirConvo(): ConvoSnapshot {
     if (!repo || abierto === null) {
+      return { jid: abierto, messages: [], hasMoreAbove: false, anchorId: ancla };
+    }
+    // El chat que ya estaba ABIERTO cuando llegó el candado (o el bloqueo): de la
+    // bandeja desaparece solo —es otra proyección de la misma base— pero la
+    // ventana de mensajes seguía pintándose hasta salir con `Esc`. Era la última
+    // puerta abierta del filtro de §4.1.
+    //
+    // La guarda NO es ciega al estado de revelado: si el usuario escribió el
+    // código, un chat con candado se abre y se lee como cualquier otro. Con un
+    // BLOQUEADO no hay revelado que valga (`isHidden` no lo mira).
+    if (repo.isHidden(abierto, ui.lockedRevealed)) {
       return { jid: abierto, messages: [], hasMoreAbove: false, anchorId: ancla };
     }
     const messages =
@@ -287,10 +330,13 @@ export function createStore(opts: StoreOpts = {}): Store {
     // bandeja encuentra "anto 🌻" y acá decía "sin coincidencias", la misma query
     // con dos respuestas distintas según dónde se escribiera.
     const match = buildFtsQuery(consulta);
+    // Con el candado revelado la búsqueda global tiene que encontrar lo mismo que
+    // la bandeja muestra: si no, el chat estaría a la vista y sus mensajes no
+    // (o al revés, que sería la fuga).
     return {
       query: consulta,
-      hits: match === "" ? [] : repo.searchMessages(match, LIMITE_HITS),
-      chats: repo.searchChats(consulta, LIMITE_CHATS_HIT),
+      hits: match === "" ? [] : repo.searchMessages(match, LIMITE_HITS, ui.lockedRevealed),
+      chats: repo.searchChats(consulta, LIMITE_CHATS_HIT, ui.lockedRevealed),
     };
   }
 
@@ -408,6 +454,17 @@ export function createStore(opts: StoreOpts = {}): Store {
     inboxUi() {
       const { inboxFilter, inboxQuery, selectedJid } = ui;
       return { inboxFilter, inboxQuery, selectedJid };
+    },
+
+    setLockedRevealed(on) {
+      const valor = on === true;
+      if (ui.lockedRevealed === valor) return;
+      ui.lockedRevealed = valor;
+      markDirty("ui", "inbox", "convo", "search");
+    },
+
+    lockedRevealed() {
+      return ui.lockedRevealed;
     },
 
     setDraft(jid, text) {

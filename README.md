@@ -69,6 +69,7 @@ Se respeta XDG; si no tenés las variables seteadas, los defaults son:
 | Base SQLite | `~/.local/share/wacosas/wacosas.sqlite` |
 | Credenciales de sesión | `~/.local/share/wacosas/creds/` |
 | Configuración | `~/.local/share/wacosas/config.json` |
+| Código del candado (hash) | `~/.local/share/wacosas/lock-code.json` |
 | QR como PNG (sólo con `--qr-png`) | `~/.local/share/wacosas/qr.png` |
 | Log | `~/.local/state/wacosas/wacosas.log` |
 
@@ -157,17 +158,54 @@ Todo esto queda en el log (`appstate.*`), con qué se pidió y qué entró.
 ### Los chats con candado (y los bloqueados) no se listan
 
 Si escondiste un chat detrás de un código secreto en el teléfono (**Chat Lock**), en wacosas **no
-aparece**: ni en la bandeja, ni en los contadores de arriba, ni en los resultados de `Ctrl-G`. Acá no
-hay dónde pedirte el código, así que la única forma de respetar lo que elegiste es no mostrarlo. Lo
-mismo con los **contactos bloqueados** (WhatsApp sí te los deja en la lista; wacosas no).
+aparece**: ni en la bandeja, ni en los contadores de arriba, ni en los resultados de `Ctrl-G` — ni
+siquiera si lo tenías abierto cuando llegó el candado (ahí la conversación se vacía sola). Lo mismo
+con los **contactos bloqueados** (WhatsApp sí te los deja en la lista; wacosas no).
 
 **No se borra nada.** El chat y todos sus mensajes siguen en la base: en cuanto le saques el candado
 —o desbloquees a la persona— desde el teléfono, vuelve a la bandeja con su historial completo. El
 estado llega por WhatsApp (`chats.lock` y la lista de bloqueados al conectar), así que puede tardar
 unos segundos después de vincular.
 
-⚠️ Un chat que ya tenías **abierto** cuando llegó el candado se sigue viendo hasta que salgas de él
-(`Esc`); en la bandeja ya no está.
+#### Verlos: escribí tu código en el buscador de la bandeja
+
+Igual que en WhatsApp: **escribís tus dígitos en el buscador de la bandeja** (el campo que ya está
+enfocado, no hay que apretar nada antes) y los chats con candado aparecen mientras dure. El campo se
+vacía solo en cuanto el código coincide —así los dígitos no quedan en pantalla— y el título del panel
+pasa a decir `chats N · candado`, que es la única forma de saber que están a la vista. **`Esc` los
+vuelve a esconder** (y cierra el chat con candado que hayas abierto).
+
+Un código que no coincide no hace nada: se queda ahí filtrando como cualquier otra búsqueda. No hay
+ningún "código incorrecto" en pantalla, a propósito — que exista un código es algo que sabe el que lo
+puso.
+
+**La primera vez hay que fijarlo, con `Ctrl-P`.** Se escribe dos veces (no se ve: se pintan `•`) y
+queda guardado. Usá **los mismos dígitos que ya usás en WhatsApp**: la idea es no obligarte a
+recordar un código nuevo. Sólo dígitos, entre 4 y 16. `Ctrl-P` de nuevo lo reemplaza.
+
+Los **bloqueados no se revelan nunca**: el código es del candado. Alguien bloqueado no es un chat
+escondido detrás de un código, es una persona con la que decidiste no hablar.
+
+#### Qué es y qué NO es este código
+
+**No es el código de WhatsApp verificado contra WhatsApp.** El de Chat Lock viaja en el protocolo
+como `UserPassword` con PBKDF2, pero **Baileys nunca emite `chatLockSettings`**, así que ese material
+no nos llega: wacosas guarda el hash de *los mismos dígitos* y compara contra **su** copia local. Dos
+consecuencias:
+
+- **si cambiás el código en el teléfono, wacosas no se entera**: volvé a fijarlo con `Ctrl-P`;
+- **es más débil que el candado del teléfono**, donde hay biometría y el sistema operativo. Acá es un
+  hash en un disco donde **la base de mensajes está sin cifrar**.
+
+Cómo se guarda: `~/.local/share/wacosas/lock-code.json`, permisos `0600`, con una **sal aleatoria** y
+el código derivado con **scrypt** (`N=16384, r=8, p=1`); los dígitos no se escriben en ningún lado —ni
+ahí, ni en el log— y la comparación es en tiempo constante. Si el archivo se rompe o lo borrás, es
+como si no hubiera código: los chats con candado se quedan escondidos hasta que fijes uno nuevo.
+
+**El alcance, dicho claro:** esto sirve contra una mirada de reojo a la terminal. **No** sirve contra
+alguien que ya está sentado en tu sesión: esa persona puede volver a fijar el código con `Ctrl-P`
+(no se pide el anterior, justamente para que no te quedes afuera si lo olvidás) y, sobre todo, puede
+abrir la base con `sqlite3` y leer todo sin preguntarle nada a nadie.
 
 ### El resto
 

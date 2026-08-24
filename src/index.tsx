@@ -159,6 +159,12 @@ try {
 const { loadConfig } = await import("./boot/config");
 const config = loadConfig(paths.configPath, log);
 
+// El código que revela los chats con candado (`Ctrl-P`). Se arma acá, con el
+// resto de los archivos del `dataDir`: adentro no hay nada del socket ni de la
+// base, sólo `node:crypto` y un archivo 0600.
+const { createLockCode } = await import("./boot/lockcode");
+const lockCode = createLockCode(paths.lockCodePath, log);
+
 const { createRepo } = await import("./db/repo");
 const { store } = await import("./state/store");
 
@@ -337,7 +343,7 @@ store.subscribe("conn", () => {
   }
 });
 
-configureCommands({ repo, wa, store, log, send, read, appstate, shutdown });
+configureCommands({ repo, wa, store, log, send, read, appstate, lockCode, shutdown });
 
 log.info("boot.listo", {
   version,
