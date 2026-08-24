@@ -369,7 +369,7 @@
     indicador "hay más arriba".
   - depends-on: 12
 
-- [ ] 14. Implementar el composer y la cola de envío con rate limit y reintentos
+- [x] 14. Implementar el composer y la cola de envío con rate limit y reintentos
   - ⚠️ **dos gotchas de OpenTUI que el `<textarea>` va a pisar** (verificados en la tarea 13, detalle en la 18):
     (1) el reconciliador **no resetea las props que desaparecen** entre dos ramas del mismo tipo en la
     misma posición — se contaminan, y sólo se ve por el camino real del usuario; (2) una caja de ancho
