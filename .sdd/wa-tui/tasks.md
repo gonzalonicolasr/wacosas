@@ -237,7 +237,7 @@
     corrupta a mano muestra `<ErrorScreen>` con ruta y motivo y sale con código **2**.
   - depends-on: 2, 3, 6, 8
 
-- [ ] 10. Construir la pantalla de vinculación: QR nativo y código de emparejamiento
+- [x] 10. Construir la pantalla de vinculación: QR nativo y código de emparejamiento
   - covers: CA-1.1, CA-1.5, CA-1.6, CA-1.9, CA-2.1, CA-2.2, CA-2.3, CA-2.4, CA-2.5, CA-2.6, RNF-3
   - files: `src/wa/qr.ts`, `src/ui/Login.tsx`, `src/ui/QrView.tsx`, `src/ui/PairingView.tsx`,
     `src/state/commands.ts` (agrega `chooseLinkMethod` y `requestPairing`), `test/qr.test.ts`,

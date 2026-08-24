@@ -11,9 +11,11 @@ import { testRender } from "@opentui/react/test-utils";
 import { act, createRef } from "react";
 
 import { configureCommands, type CommandDeps } from "../src/state/commands";
-import { store } from "../src/state/store";
+import { store, TOAST_MS, type LinkSnapshot } from "../src/state/store";
 import { App } from "../src/ui/App";
 import { ayudaScrollea, Help, lineasAyuda, lineasQueEntran } from "../src/ui/Help";
+import { VIDA_CODIGO_MS } from "../src/ui/PairingView";
+import { buildQr } from "../src/wa/qr";
 
 const LOG = "/tmp/wacosas-test.log";
 
@@ -57,6 +59,12 @@ async function pintar(t: { renderOnce: () => Promise<void> }, veces = 1) {
 }
 
 async function montar(width: number, height: number, noSplash = true) {
+  // Con la sesión sin vincular la pantalla es `<Login/>` (CA-1.1, tarea 10) y no
+  // habría bandeja ni ayuda que mirar: estos tests son de la vista principal, así
+  // que declaran la sesión ya vinculada. El `flushNow` es porque el snapshot está
+  // cacheado hasta el próximo flush (D3) y el render leería el estado anterior.
+  store.setLink({ phase: "linked", qr: null, pairingCode: null, reason: null });
+  store.flushNow();
   const t = await testRender(<App noSplash={noSplash} logPath={LOG} />, { width, height });
   await pintar(t);
   return t;
@@ -72,16 +80,33 @@ async function abrirAyuda(t: Awaited<ReturnType<typeof montar>>) {
 
 /** Comandos con dobles: sin esto `quit()` llamaría a `process.exit` de verdad. */
 function cablearComandos() {
-  const visto = { reconexiones: 0, salidas: [] as number[] };
+  const visto = {
+    reconexiones: 0,
+    salidas: [] as number[],
+    telefonos: [] as string[],
+    /** Eventos del log, para poder afirmar que algo NO pasó (ver `Ctrl-R`). */
+    eventos: [] as string[],
+  };
   configureCommands({
     repo: {} as CommandDeps["repo"],
     wa: {
       reconnectNow() {
         visto.reconexiones++;
+        // El controlador real lo loguea así (`wa/socket.ts`); el doble lo imita
+        // para que el test mire el mismo rastro que se lee en vivo.
+        visto.eventos.push("wa.reconnect_now");
+      },
+      async requestPairingCode(digits: string) {
+        visto.telefonos.push(digits);
       },
     } as CommandDeps["wa"],
     store,
-    log: { info() {}, warn() {}, error() {}, path: LOG },
+    log: {
+      info: (ev: string) => visto.eventos.push(ev),
+      warn: (ev: string) => visto.eventos.push(ev),
+      error: (ev: string) => visto.eventos.push(ev),
+      path: LOG,
+    },
     shutdown(code = 0) {
       visto.salidas.push(code);
     },
@@ -203,6 +228,375 @@ test("Ctrl-R funciona con la ayuda abierta y la ayuda queda abierta", async () =
   const frame = t.captureCharFrame();
   expect(frame).toContain("reconectando…"); // CA-19.5, el aviso del pie
   expect(frame).toContain("─ ayuda ");
+  t.renderer.destroy();
+});
+
+// ── vinculación (tarea 10) ──────────────────────────────────────────────────
+//
+// Todo se mira en el frame de caracteres, que es donde viven los bugs de esta
+// pantalla: un QR recortado, un QR encimado con el pie, o un código de
+// emparejamiento que desaparece porque baileys rotó el QR. Ninguno se ve en el
+// estado de React.
+
+/** Un payload con el largo real del de WhatsApp (277 chars ⇒ 67×34). */
+const PAYLOAD = `2@${"AbC9/+xyzWQ".repeat(26).slice(0, 271)}==,1`;
+
+const LINK_LIMPIO: LinkSnapshot = {
+  phase: "qr-waiting",
+  method: "qr",
+  methodForced: false,
+  qr: null,
+  pairingCode: null,
+  pairingRequestedAt: null,
+  reason: null,
+};
+
+async function montarLogin(width: number, height: number, link: Partial<LinkSnapshot> = {}) {
+  store.setLink({ ...LINK_LIMPIO, ...link });
+  store.flushNow();
+  const t = await testRender(<App noSplash logPath={LOG} />, { width, height });
+  await pintar(t);
+  return t;
+}
+
+/** Las filas del frame, sin el relleno de la derecha. */
+function filasDe(frame: string): string[] {
+  return frame.split("\n");
+}
+
+test("el payload de prueba mide lo mismo que el de WhatsApp", () => {
+  expect(PAYLOAD.length).toBe(277);
+  expect(buildQr(PAYLOAD)?.cols).toBe(67);
+});
+
+for (const ancho of [69, 79, 80, 100]) {
+  test(`a ${ancho}×40 el QR se dibuja ENTERO: las 34 filas, en orden y sin recortes`, async () => {
+    // Varios anchos a propósito: centrar un bloque de 67 columnas en uno de
+    // ancho par deja una coordenada fraccionaria, y el redondeo de la grilla de
+    // celdas puede comerse una columna. Una sola columna de menos deja un QR
+    // del tamaño correcto que NINGÚN teléfono lee.
+    const t = await montarLogin(ancho, 40, { phase: "qr-shown", qr: PAYLOAD });
+    const filas = filasDe(t.captureCharFrame());
+    const qr = buildQr(PAYLOAD)!;
+
+    // La primera fila con módulos oscuros ancla el bloque; de ahí en adelante
+    // TIENEN que estar las 34, cada una completa (67 caracteres seguidos).
+    const arriba = filas.findIndex((f) => f.includes(qr.rows[1] as string));
+    expect(arriba).toBeGreaterThan(0);
+    for (const [i, fila] of qr.rows.entries()) {
+      const enPantalla = filas[arriba - 1 + i] ?? "";
+      expect({ fila: i, entera: enPantalla.includes(fila) }).toEqual({ fila: i, entera: true });
+    }
+    // Y abajo del QR no hay nada del QR: el pie no quedó encimado (OpenTUI no
+    // recorta a los hijos que no entran, los superpone).
+    const abajo = filas[arriba - 1 + qr.rows.length] ?? "";
+    expect(abajo).not.toContain("▀");
+    expect(abajo).not.toContain("█");
+    t.renderer.destroy();
+  });
+}
+
+test("a 80×24 el QR NO se dibuja: panel de 'no entra' con actual vs requerido y el código", async () => {
+  const t = await montarLogin(80, 24, { phase: "qr-shown", qr: PAYLOAD });
+  const frame = t.captureCharFrame();
+
+  // CA-2.1: por qué no se ve el QR, cuánto mide la terminal y cuánto haría falta.
+  expect(frame).toContain("el QR no entra");
+  expect(frame).toContain("ahora 80 × 24");
+  expect(frame).toContain("hace falta 69 × 36");
+  // …y el camino que SÍ sirve acá, ofrecido en el acto (no escondido tras Tab).
+  expect(frame).toContain("escribí tu número");
+  // Ni un pedazo de QR dibujado a medias.
+  expect(frame).not.toContain("█");
+  t.renderer.destroy();
+});
+
+test("mientras WhatsApp no manda el payload dice que lo está esperando, no que 'no entra'", async () => {
+  // El segundo que pasa entre `wa.connect` y el primer `wa.qr`: la terminal es
+  // grande, el QR entra, lo que falta es el payload (CA-1.9).
+  const t = await montarLogin(80, 40, { phase: "qr-waiting", qr: null });
+  const frame = t.captureCharFrame();
+  expect(frame).toContain("esperando el QR");
+  expect(frame).not.toContain("no entra");
+  t.renderer.destroy();
+});
+
+test("Tab alterna QR ↔ código sin tocar el socket (CA-2.6)", async () => {
+  cablearComandos();
+  const t = await montarLogin(80, 40, { phase: "qr-shown", qr: PAYLOAD });
+  const qr = buildQr(PAYLOAD)!;
+  expect(t.captureCharFrame()).toContain(qr.rows[1] as string);
+
+  act(() => {
+    t.mockInput.pressTab();
+  });
+  act(() => {
+    store.flushNow(); // `chooseLinkMethod` viaja por el flush coalescido (D3)
+  });
+  await pintar(t);
+  const conCodigo = t.captureCharFrame();
+  expect(conCodigo).toContain("escribí tu número");
+  expect(conCodigo).not.toContain(qr.rows[1] as string);
+
+  act(() => {
+    t.mockInput.pressTab();
+  });
+  act(() => {
+    store.flushNow();
+  });
+  await pintar(t);
+  const deVuelta = t.captureCharFrame();
+  expect(deVuelta).toContain(qr.rows[1] as string);
+  expect(deVuelta).not.toContain("escribí tu número");
+  t.renderer.destroy();
+});
+
+test("la rotación del QR NO le borra al usuario el código de emparejamiento", async () => {
+  // El bug que arregló la tarea 8b, del lado de la pantalla: baileys sigue
+  // rotando el QR cada 20-60 s aunque ya se haya pedido un código, y en una pane
+  // de 80×24 ese código es el ÚNICO camino de vinculación. Del lado del store lo
+  // cubre `socket.test.ts`; acá se prueba que la vista tampoco lo pierde.
+  const t = await montarLogin(80, 24, {
+    phase: "pairing-shown",
+    method: "code",
+    methodForced: true,
+    pairingCode: "ABCD1234",
+    pairingRequestedAt: Date.now(),
+  });
+  expect(t.captureCharFrame()).toContain("ABCD-1234"); // CA-2.3
+
+  act(() => {
+    store.setLink({ qr: PAYLOAD }); // llega la rotación
+    store.flushNow();
+  });
+  await pintar(t);
+
+  const despues = t.captureCharFrame();
+  expect(despues).toContain("ABCD-1234");
+  expect(despues).toContain("ingresá este código en el teléfono");
+  t.renderer.destroy();
+});
+
+test("un teléfono de 5 dígitos se rechaza explicando el formato (CA-2.2)", async () => {
+  const visto = cablearComandos();
+  const t = await montarLogin(80, 24);
+  expect(t.captureCharFrame()).toContain("escribí tu número");
+
+  await act(async () => {
+    await t.mockInput.typeText("12345");
+  });
+  act(() => {
+    t.mockInput.pressEnter();
+  });
+  await pintar(t);
+
+  const frame = t.captureCharFrame();
+  expect(frame).toContain("el número tiene 5 dígitos");
+  expect(frame).toContain("van entre 8 y 15");
+  // Y NO se le pidió nada a WhatsApp: un número mal escrito no gasta una llamada.
+  expect(visto.telefonos).toEqual([]);
+  t.renderer.destroy();
+});
+
+test("el input se come lo que no sea un dígito y con 13 sí pide el código", async () => {
+  const visto = cablearComandos();
+  const t = await montarLogin(80, 24);
+
+  await act(async () => {
+    await t.mockInput.typeText("+54 9 11-2233-4455");
+  });
+  act(() => {
+    t.mockInput.pressEnter();
+  });
+  act(() => {
+    store.flushNow();
+  });
+  await pintar(t);
+
+  expect(visto.telefonos).toEqual(["5491122334455"]);
+  t.renderer.destroy();
+});
+
+// ── `Ctrl-R` y `Esc` en la vinculación (CA-2.5, CA-2.4) ─────────────────────
+//
+// `Ctrl-R` hace dos cosas distintas según lo que se esté MIRANDO, y el pie lo
+// anuncia: con el código a la vista pide otro código, en cualquier otro caso
+// reconecta. Lo que decide es el método visible, no que exista un `pairingCode`
+// guardado: mirando sólo eso, pedir un código una vez dejaba a `Ctrl-R` sin
+// poder reconectar nunca más durante esa vinculación, y encima el pedido
+// arrastraba al usuario fuera del QR (`requestPairing` fuerza `method:"code"`),
+// justo el tirón que arregló la tarea 8b.
+
+/** Pide un código desde el input, como en vivo (⏎ ⇒ `requestPairing`). */
+async function pedirCodigo(t: Awaited<ReturnType<typeof montarLogin>>, numero: string) {
+  await act(async () => {
+    await t.mockInput.typeText(numero);
+  });
+  act(() => {
+    t.mockInput.pressEnter();
+  });
+  act(() => {
+    store.flushNow();
+  });
+  await pintar(t);
+}
+
+/** Lo que contesta WhatsApp: el código y el momento en que se pidió. */
+async function llegaCodigo(
+  t: Awaited<ReturnType<typeof montarLogin>>,
+  codigo = "ABCD1234",
+  desde = Date.now(),
+) {
+  act(() => {
+    store.setLink({ phase: "pairing-shown", pairingCode: codigo, pairingRequestedAt: desde });
+    store.flushNow();
+  });
+  await pintar(t);
+}
+
+/**
+ * `Esc` PELADO no llega en el acto: el parser de stdin lo retiene 20 ms por si
+ * es el prefijo de una secuencia (`\x1b[…`) y recién ahí lo suelta como tecla
+ * —en un terminal de verdad pasa lo mismo—. Sin la espera, el frame se captura
+ * antes de que el handler haya visto nada.
+ */
+async function apretarEsc(t: Awaited<ReturnType<typeof montarLogin>>) {
+  act(() => {
+    t.mockInput.pressEscape();
+  });
+  await act(async () => {
+    await Bun.sleep(40);
+  });
+  act(() => {
+    store.flushNow();
+  });
+  await pintar(t);
+}
+
+/**
+ * El aviso efímero TAPA los hints (`Footer` muestra uno u otro) y vive
+ * `TOAST_MS` reales; el store no tiene con qué apagarlo antes de tiempo. Los
+ * tests que miran el pie esperan lo que le quede de vida — nada, si no hay
+ * ninguno, que es el caso salvo justo después de un `Ctrl-R` que reconectó.
+ */
+async function sinToast(t: Awaited<ReturnType<typeof montarLogin>>) {
+  act(() => {
+    store.flushNow();
+  });
+  const toast = store.getSnapshot("ui").toast;
+  if (!toast) return;
+  await act(async () => {
+    await Bun.sleep(Math.max(0, TOAST_MS - (Date.now() - toast.at)) + 20);
+  });
+  act(() => {
+    store.flushNow();
+  });
+  await pintar(t);
+}
+
+test("en la vista del código, Ctrl-R pide uno NUEVO para el mismo número (CA-2.5)", async () => {
+  const visto = cablearComandos();
+  const t = await montarLogin(80, 24, {
+    phase: "pairing-phone",
+    method: "code",
+    methodForced: true,
+  });
+  await pedirCodigo(t, "5491122334455");
+  // Vencido: es el caso que CA-2.5 pide resolver con una sola tecla.
+  await llegaCodigo(t, "ABCD1234", Date.now() - VIDA_CODIGO_MS);
+  await sinToast(t);
+  const vencido = t.captureCharFrame();
+  expect(vencido).toContain("el código venció");
+  expect(vencido).toContain("^R código nuevo");
+
+  act(() => {
+    t.mockInput.pressKey("r", { ctrl: true });
+  });
+  act(() => {
+    store.flushNow();
+  });
+  await pintar(t);
+
+  // Mismo número, segunda solicitud (`requestPairing` sin argumento lo reusa).
+  expect(visto.telefonos).toEqual(["5491122334455", "5491122334455"]);
+  expect(visto.eventos).toContain("link.pairing_pedido");
+  expect(visto.reconexiones).toBe(0);
+  t.renderer.destroy();
+});
+
+test("con el código en pantalla, Esc vuelve al input y deja pedir para otro número", async () => {
+  // El tropiezo real: WhatsApp NO valida que el número sea tuyo, así que un
+  // teléfono mal tipeado pero con formato válido devuelve un código igual. Sin
+  // esta salida, corregirlo sería `Ctrl-C` y arrancar el proceso de nuevo.
+  const visto = cablearComandos();
+  const t = await montarLogin(80, 24, {
+    phase: "pairing-phone",
+    method: "code",
+    methodForced: true,
+  });
+  // Un número distinto del `placeholder` del campo, para que verlo en pantalla
+  // signifique algo: el placeholder ES el ejemplo `5491122334455`.
+  await pedirCodigo(t, "5491133445566"); // el número EQUIVOCADO
+  await llegaCodigo(t);
+  await sinToast(t);
+  const conCodigo = t.captureCharFrame();
+  expect(conCodigo).toContain("ABCD-1234");
+  expect(conCodigo).toContain("Esc otro número"); // el pie lo ofrece
+
+  await apretarEsc(t);
+  const enInput = t.captureCharFrame();
+  expect(enInput).toContain("escribí tu número");
+  expect(enInput).not.toContain("ABCD-1234");
+
+  // Y el input quedó usable: se puede pedir para el número correcto (CA-2.4).
+  await pedirCodigo(t, "5491199887766");
+  expect(visto.telefonos).toEqual(["5491133445566", "5491199887766"]);
+  expect(t.captureCharFrame()).toContain("pidiéndole el código");
+  t.renderer.destroy();
+});
+
+test("en la vista del QR, Ctrl-R RECONECTA aunque ya se haya pedido un código", async () => {
+  const visto = cablearComandos();
+  // 80×40: el QR entra, así que volver a él con `Tab` es un camino real (CA-2.6).
+  const t = await montarLogin(80, 40, {
+    phase: "pairing-phone",
+    method: "code",
+    methodForced: true,
+    qr: PAYLOAD,
+  });
+  await pedirCodigo(t, "5491122334455");
+  await llegaCodigo(t);
+  expect(t.captureCharFrame()).toContain("ABCD-1234");
+
+  act(() => {
+    t.mockInput.pressTab(); // vuelta al QR
+  });
+  act(() => {
+    store.flushNow();
+  });
+  await pintar(t);
+  await sinToast(t);
+  const qr = buildQr(PAYLOAD)!;
+  const enQr = t.captureCharFrame();
+  expect(enQr).toContain(qr.rows[1] as string);
+  expect(enQr).toContain("^R reconectar"); // lo que promete el pie
+
+  visto.eventos.length = 0;
+  act(() => {
+    t.mockInput.pressKey("r", { ctrl: true });
+  });
+  act(() => {
+    store.flushNow();
+  });
+  await pintar(t);
+
+  // …y lo que hace la tecla. Reconecta:
+  expect(visto.eventos).toContain("wa.reconnect_now");
+  // sin pedir otro código —ni la llamada a WhatsApp ni el rastro en el log—:
+  expect(visto.eventos).not.toContain("link.pairing_pedido");
+  expect(visto.telefonos).toEqual(["5491122334455"]);
+  // y sin sacar al usuario de la pantalla que estaba usando.
+  expect(t.captureCharFrame()).toContain(qr.rows[1] as string);
   t.renderer.destroy();
 });
 

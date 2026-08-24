@@ -667,6 +667,32 @@ test("un QR resetea el backoff: el 408 de después es 'no lo escanearon', no un 
   b.cerrar();
 });
 
+test("con un QR en pantalla la conexión queda 'unlinked', nunca 'reconectando · intento 0'", async () => {
+  const b = banco();
+  await arrancar(b);
+
+  // Un cierre transitorio la deja en `reconnecting`…
+  b.ultimo().emitir("connection.update", cierre(408));
+  await asentar();
+  expect(b.conn().state).toBe("reconnecting");
+  b.avanzar(2_000);
+  await correrTimer(b);
+
+  // …y el QR la saca de ahí. Antes se reseteaba `attempt` SIN tocar `state` y
+  // quedaba el par imposible `reconnecting` + `attempt: 0` —un estado que
+  // `ConnSnapshot` no contempla—, que el badge del encabezado tenía que tapar a
+  // mano ("reconectando · intento 0"). Con un QR sobre la mesa la conexión no
+  // está reconectando: está esperando que alguien lo escanee.
+  b.ultimo().emitir("connection.update", { connection: "connecting", qr: QR_FALSO });
+  await asentar();
+  expect({
+    state: b.conn().state,
+    attempt: b.conn().attempt,
+    proximo: b.conn().nextAttemptAt,
+  }).toEqual({ state: "unlinked", attempt: 0, proximo: null });
+  b.cerrar();
+});
+
 test("el log NUNCA se lleva el payload del QR (CA-14.7)", async () => {
   const b = banco();
   const s = await arrancar(b);

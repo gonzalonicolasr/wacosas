@@ -12,9 +12,9 @@
 //     snapshot está cacheado y sólo cambia de identidad en el flush coalescido
 //     (D3), que es lo que le pone techo a los renders (RNF-5).
 //
-// Lo que TODAVÍA no cuelga de acá, con su tarea: `<Login/>` (10) cuando
-// `link.phase !== "linked"`, `<Inbox/>` (12), `<Conversation/>` + `<Composer/>`
-// (13 y 14) y `<SearchOverlay/>` (16). Los huecos están marcados abajo.
+// Lo que TODAVÍA no cuelga de acá, con su tarea: `<Inbox/>` (12),
+// `<Conversation/>` + `<Composer/>` (13 y 14) y `<SearchOverlay/>` (16). Los
+// huecos están marcados abajo.
 import type { KeyEvent, ScrollBoxRenderable } from "@opentui/core";
 import { useKeyboard, useTerminalDimensions } from "@opentui/react";
 import { useEffect, useRef, useState } from "react";
@@ -26,6 +26,7 @@ import { store } from "../state/store";
 import { ALTO_FOOTER, Footer } from "./Footer";
 import { ALTO_HEADER, Header } from "./Header";
 import { ayudaScrollea, Help } from "./Help";
+import { Login, metodoDe } from "./Login";
 import { Splash } from "./Splash";
 import { MIN_COLS, MIN_ROWS, TooSmall } from "./TooSmall";
 import { BG, BORDER, ELEVATED, MUT, SURFACE, TEXT_DIM, WARN } from "./theme";
@@ -76,6 +77,13 @@ export function App({ noSplash, logPath }: { noSplash: boolean; logPath: string 
   const ayudaRef = useRef<ScrollBoxRenderable | null>(null);
 
   const disposicion = disposicionDe(width);
+  /**
+   * CA-1.1: sin sesión vinculada la pantalla es `<Login/>`, no la bandeja. Vale
+   * también para `checking` —la fase de arranque, hasta que el socket dice si
+   * las creds sirven—: mostrar la bandeja ahí sería prometerle chats a alguien
+   * que todavía no vinculó nada.
+   */
+  const enLogin = link.phase !== "linked";
 
   // Línea de tiempo del splash (CA-19.2). Se apaga solo al llegar a 1.
   useEffect(() => {
@@ -113,6 +121,13 @@ export function App({ noSplash, logPath }: { noSplash: boolean; logPath: string 
     if (nuevo !== ui.connBanner) store.setBanner(nuevo);
   }, [conn.state, link.reason]);
 
+  // La vinculación se lleva la pantalla entera: si la ayuda quedó abierta cuando
+  // WhatsApp desvinculó la sesión, dejarla "abierta abajo" haría que reaparezca
+  // sola al volver a vincular, sin que nadie la haya pedido.
+  useEffect(() => {
+    if (enLogin) setModo("browse");
+  }, [enLogin]);
+
   useKeyboard((key: KeyEvent) => {
     const n = key?.name ?? "";
     const seq = key?.sequence ?? "";
@@ -138,7 +153,49 @@ export function App({ noSplash, logPath }: { noSplash: boolean; logPath: string 
     // `Ctrl-R` funciona en todos los modos —la ayuda lo anuncia como global
     // (CA-15.5)—, así que va ANTES de la rama que se traga las teclas.
     if (key.ctrl && es("r")) {
-      commands.reconnectNow();
+      // CA-2.5: con el código de emparejamiento A LA VISTA, la misma tecla pide
+      // OTRO código. Reconectar ahí sería tirar abajo el socket que está
+      // esperando justamente ese código.
+      //
+      // Lo que decide es el método que se está VIENDO —lo mismo que anuncia el
+      // pie (`Login.tsx`)—, no que exista un `pairingCode` guardado. Mirando
+      // sólo eso, una vez pedido un código `Ctrl-R` no podía volver a
+      // reconectar en toda la vinculación, ni siquiera con el QR en pantalla y
+      // el motivo del 440 pidiéndolo; y el pedido arrastraba al usuario de
+      // vuelta al código (`requestPairing` fuerza `method:"code"`), el mismo
+      // tirón que arregló la tarea 8b, ahora disparado por una tecla.
+      if (enLogin && link.pairingCode && metodoDe(link, width, height) === "code") {
+        commands.requestPairing();
+      } else commands.reconnectNow();
+      return;
+    }
+
+    // ── login ───────────────────────────────────────────────────────────────
+    // Va ANTES que el resto: mientras no haya sesión, la pantalla es la
+    // vinculación y las teclas de la bandeja no tienen a qué aplicarse. El
+    // `return` es importante: lo que no se maneja acá es para el input del
+    // teléfono, que recibe las mismas teclas por su cuenta (§7.4.2).
+    if (enLogin) {
+      if (es("tab")) {
+        // CA-2.6: alternar contra lo que se está VIENDO, que no siempre es
+        // `link.method` (mientras nadie eligió a mano, el método lo decide el
+        // tamaño de la terminal).
+        commands.chooseLinkMethod(metodoDe(link, width, height) === "qr" ? "code" : "qr");
+        return;
+      }
+      // `Esc` con el código a la vista ⇒ volver al input del teléfono. WhatsApp
+      // devuelve un código para CUALQUIER número bien formado (no valida que sea
+      // tuyo), así que un dígito de más deja al usuario esperando un código que
+      // su teléfono nunca le va a pedir, y `Ctrl-R` sólo pide otro para el MISMO
+      // número: sin esta salida, corregirlo era `Ctrl-C` y arrancar de nuevo.
+      //
+      // Va derecho al store y no por `commands` porque no hay nada de la máquina
+      // que avisar: es la misma pantalla un paso atrás, el socket sigue como
+      // estaba (D11). El método no se toca: se sigue viendo el código, ahora con
+      // el input.
+      if (es("escape") && link.pairingCode && metodoDe(link, width, height) === "code") {
+        store.setLink({ phase: "pairing-phone", pairingCode: null, pairingRequestedAt: null });
+      }
       return;
     }
 
@@ -187,6 +244,9 @@ export function App({ noSplash, logPath }: { noSplash: boolean; logPath: string 
   if (splash) return <Splash t={avance} width={width} />;
   // RNF-2: render condicional, no estado ⇒ agrandar la terminal lo deshace solo.
   if (width < MIN_COLS || height < MIN_ROWS) return <TooSmall width={width} height={height} />;
+  // CA-1.1: la vinculación va DESPUÉS de `<TooSmall/>` —abajo de 60×15 no se
+  // dibuja ni el panel de "el QR no entra"— y ANTES de todo lo demás.
+  if (enLogin) return <Login width={width} height={height} />;
 
   const banner = ui.connBanner;
   const altoCuerpo = Math.max(1, height - ALTO_HEADER - ALTO_FOOTER - (banner ? 1 : 0));

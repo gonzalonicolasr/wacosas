@@ -520,15 +520,20 @@ export function createWaController(deps: WaDeps): WaController {
   // ── connection.update ─────────────────────────────────────────────────────
 
   function alActualizarConexion(s: WASocket, u: Partial<BaileysEventMap["connection.update"]>): void {
-    if (typeof u?.qr === "string" && u.qr) {
-      alLlegarQr(s, u.qr);
+    const hayQr = typeof u?.qr === "string" && u.qr !== "";
+    if (hayQr) {
+      alLlegarQr(s, u.qr as string);
       // El QR pudo haber descartado este socket (CA-3.4): re-chequear.
       if (s !== actual) return;
     }
 
     if (u?.connection === "open") return alAbrir(s);
     if (u?.connection === "close") return alCerrar(s, u.lastDisconnect?.error);
-    if (u?.connection === "connecting") {
+    // El `connecting` NO pisa lo que acaba de dejar el QR: baileys manda los dos
+    // campos en el MISMO evento, y con el QR en pantalla el estado honesto es
+    // "no hay sesión vinculada", no "conectando…" (ya está conectado: falta que
+    // alguien escanee).
+    if (u?.connection === "connecting" && !hayQr) {
       store.setConn({ state: estadoDiscando() });
     }
   }
@@ -538,7 +543,14 @@ export function createWaController(deps: WaDeps): WaController {
     // D6: el 408 que sigue a un QR es "no lo escanearon", no un error de red.
     // Sin este reset el próximo QR saldría a los 60 s (lección de `worker.mjs`).
     intento = 0;
-    store.setConn({ attempt: 0, nextAttemptAt: null });
+    // Y el ESTADO también cambia, no sólo el contador: un QR sobre la mesa no es
+    // "reconectando", es que no hay sesión vinculada y WhatsApp está esperando
+    // que alguien lo escanee. Resetear `attempt` dejando `state` en
+    // `reconnecting` producía un `reconnecting` con `attempt: 0` —una
+    // combinación que `ConnSnapshot` no contempla— y el badge terminaba
+    // diciendo "reconectando · intento 0" (lo levantaron las revisiones de las
+    // tareas 8 y 9; la guarda del `Header` se queda igual, como defensa).
+    store.setConn({ state: "unlinked", attempt: 0, nextAttemptAt: null, selfPhone: null });
     // `intento` va SIEMPRE en 0 acá (lo acaba de resetear la línea de arriba):
     // es la evidencia en el log de que el backoff no se comió la vinculación.
     // El payload del QR NO se loguea (CA-14.7); sólo su largo.
@@ -557,7 +569,7 @@ export function createWaController(deps: WaDeps): WaController {
         pairingRequestedAt: null,
         reason: MOTIVO_QR_EN_RECONEXION,
       });
-      store.setConn({ state: "unlinked", selfPhone: null });
+      // El estado de conexión ya quedó en `unlinked` arriba, con el reset.
       esperar(COOLDOWN_WIPE_MS)
         .then(() => {
           // Si no se pudieron borrar, `borrarCreds` ya frenó todo: reconectar acá
