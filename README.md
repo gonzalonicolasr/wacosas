@@ -132,26 +132,50 @@ del diseño.
 ### La agenda puede llegar incompleta (y `Ctrl-N` para volver a pedirla)
 
 Los nombres de tu agenda no viajan con los chats: WhatsApp los manda por **app-state**, cinco
-colecciones aparte que se sincronizan por su cuenta. Baileys las sincroniza **una sola vez**, en la
-primera conexión después de vincular; si eso no sale bien —se corta la red, cerrás la app en el medio,
-o se pasa el tope de 20 s que Baileys se da a sí mismo—, el contador interno igual queda marcado como
-"ya sincronizado" y **no se vuelve a intentar nunca**, ni reiniciando. Cuando pasa, la bandeja te
-muestra números en vez de nombres: en la cuenta con la que se encontró esto eran 844 contactos con
-sólo 32 nombres.
+colecciones aparte que se sincronizan por su cuenta. Por ahí viajan también los **candados** de los
+chats y los silenciados.
 
-wacosas lo repara solo: **30 segundos después de conectar** mira qué colecciones no tienen datos en
-`creds/` y le pide a WhatsApp **sólo esas**. Si la sincronización de Baileys anduvo bien, no encuentra
-nada que pedir y no manda ni una consulta. Está topeado (tres reparaciones por proceso, una por
-conexión) y se apaga solo si dos intentos seguidos no traen nada nuevo: es una reparación, no un
-reintento en loop.
+Baileys las sincroniza **una sola vez**, en la primera conexión después de vincular, y ahí está el
+agujero: espera hasta **20 segundos** (un tope hardcodeado, no configurable) a que WhatsApp empiece a
+mandar el historial y, si no llega a tiempo —una cuenta con 899 chats tarda más—, se rinde **y se
+anota a sí misma que ya sincronizó** (`accountSyncCounter`, que vive en `creds.json`). Desde ese
+momento, toda conexión posterior saltea el sync completo: no lo arregla reiniciar, ni esperar. Cuando
+pasa, la bandeja te muestra números en vez de nombres —en la cuenta con la que se encontró esto eran
+844 contactos con sólo 32 nombres— y los candados no llegan nunca.
 
-Queda un caso que **no se puede arreglar del lado de la app**. A veces WhatsApp manda una colección
-cifrada con una clave que tu teléfono todavía no compartió; Baileys la reintenta dos veces y la deja
-"estacionada". Esa clave sólo la manda el teléfono cuando quiere —no hay forma de pedirla— así que
-insistir automáticamente sería martillar sin poder ganar nunca. Para eso está **`Ctrl-N`**: vuelve a
-pedir las cinco colecciones a mano, que es lo único que destraba una estacionada si la clave llegó. Si
-después de un `Ctrl-N` seguís viendo números, la clave no llegó: la salida es desvincular y volver a
-vincular (`~/.local/share/wacosas/creds/`), que le pide todo de cero al teléfono.
+**wacosas lo detecta y lo repara solo**: si al conectar ve que falta app-state *y* que ese contador
+está en la posición que impide rehacerlo, lo pone en 0, reconecta y deja que Baileys haga su
+sincronización completa como si fuera la primera vez. **No hace falta desvincular.** Se hace **una
+sola vez por sesión** (queda anotado en la base) y nunca si la sincronización está sana: resetear el
+contador con todo en orden sería un sync completo de más en cada arranque. En el log queda todo
+(`appstate.sync_completo_*`) y también en qué terminó del lado de Baileys
+(`appstate.sync_baileys fase=…`).
+
+wacosas lo repara solo: **30 segundos después de conectar** mira qué colecciones no quedaron al día y
+le pide a WhatsApp **sólo esas**. Si la sincronización de Baileys anduvo bien, no encuentra nada que
+pedir y no manda ni una consulta. Está topeado (tres reparaciones por proceso, una por conexión) y se
+apaga solo si un intento no trae nada nuevo: es una reparación, no un reintento en loop.
+
+Queda un caso que **puede** no tener arreglo del lado de la app. A veces WhatsApp manda una colección
+cifrada con una clave que tu teléfono nunca compartió con esta sesión; Baileys la reintenta dos veces
+y la deja **estacionada**. Esa clave sólo la manda el teléfono cuando quiere y Baileys no implementa
+el pedido, así que lo único que se puede hacer es preguntar **de otra manera**: antes de reintentar
+una colección estacionada, wacosas le borra su marcador de versión local para que la consulta pase de
+"mandame los cambios desde la v68" —que son los que no se pueden descifrar— a "mandame el estado
+completo", que viene con otra clave. Es la misma consulta, no una de más, y se hace una vez por
+colección.
+
+Si ni así entra, la reparación vuelve a pedirla hasta el tope de tres y frena: insistir cada 30 s
+sería martillar sin poder ganar nunca. Cuando frena queda dicho en el log
+(`appstate.tope_alcanzado … salida=Ctrl-N`). **`Ctrl-N`** vuelve a pedir las cinco colecciones a mano,
+que es lo único que destraba una estacionada si la clave llegó; si después de un `Ctrl-N` seguís
+viendo números, la clave no llegó, y la salida es desvincular y volver a vincular
+(`~/.local/share/wacosas/creds/`), que le pide todo de cero al teléfono.
+
+Ojo con una diferencia que el log tardó en decir bien: una colección estacionada **tiene** datos
+locales (viejos), así que no alcanza con mirar si hay archivo para saber si está al día. Hoy el log
+las nombra aparte (`appstate.resync_ok … resueltas=N faltan=… estacionadas=…`) y una estacionada
+**nunca** cuenta como resuelta.
 
 Todo esto queda en el log (`appstate.*`), con qué se pidió y qué entró.
 
@@ -185,6 +209,30 @@ recordar un código nuevo. Sólo dígitos, entre 4 y 16. `Ctrl-P` de nuevo lo re
 
 Los **bloqueados no se revelan nunca**: el código es del candado. Alguien bloqueado no es un chat
 escondido detrás de un código, es una persona con la que decidiste no hablar.
+
+#### Esconder un chat a mano: `Ctrl-X` (la salida de emergencia)
+
+Los candados viajan por **app-state**, o sea por el mismo camino que puede quedar estacionado (ver la
+limitación de arriba). Mientras esa sincronización no se destrabe, **un chat que tenés con candado en
+el teléfono se te puede ver igual en wacosas**. Lo que corresponde es que llegue solo —de eso se
+ocupan las reparaciones de arriba—, pero mientras tanto esto te deja esconderlo vos.
+
+Para eso está `Ctrl-X`: **esconde a mano el chat seleccionado**, y queda igual que uno con candado —no
+aparece en la bandeja, ni en los contadores, ni en `Ctrl-G`; si lo tenías abierto, se cierra— y vuelve
+con **el mismo código**. Con los chats revelados, `Ctrl-X` sobre uno escondido a mano lo **desmarca**
+(eso no pregunta nada: hace aparecer un chat, no desaparecer).
+
+Tres cosas que conviene saber:
+
+- **hay que apretarla dos veces**: la primera pregunta en el pie (`¿ocultar «Ana»? ^X de nuevo para
+  confirmar`) y la segunda esconde. La confirmación vale mientras la pregunta está en pantalla; si se
+  fue, `Ctrl-X` vuelve a preguntar;
+- **sin código fijado no esconde nada**: te manda a fijarlo con `Ctrl-P` primero. Si no, un chat
+  escondido no tendría forma de volver;
+- **no se pisa con el candado de WhatsApp**: son dos marcas distintas sobre el mismo chat. Si
+  WhatsApp te levanta el candado, el chat que escondiste a mano sigue escondido; si desmarcás el
+  tuyo, el candado de WhatsApp sigue en pie. Y si perdés el código, `Ctrl-P` fija uno nuevo (no se
+  pide el anterior) y con ese ya podés revelar.
 
 #### Qué es y qué NO es este código
 

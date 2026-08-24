@@ -97,7 +97,16 @@ describe("esquema", () => {
       .all()
       .map((f) => f.name);
 
-    for (const t of ["meta", "chats", "contacts", "messages", "messages_fts", "jid_aliases", "jid_flags"])
+    for (const t of [
+      "meta",
+      "chats",
+      "contacts",
+      "messages",
+      "messages_fts",
+      "jid_aliases",
+      "jid_flags",
+      "jid_hides",
+    ])
       expect(nombres).toContain(t);
     for (const i of ["idx_chats_activity", "idx_messages_waid", "idx_messages_chatts", "idx_messages_open"])
       expect(nombres).toContain(i);
@@ -134,6 +143,60 @@ describe("esquema", () => {
     expect(db.query<{ value: string }, []>("SELECT value FROM meta WHERE key='schema_version'").get()!.value).toBe(
       String(CURRENT_VERSION),
     );
+    db.close();
+  });
+
+  test("una base de la v3 (sin `jid_hides`) se abre y gana la tabla, sin perder nada", () => {
+    const path = join(tmp, "v3.sqlite");
+    // La base que hay HOY en disco: el esquema de la v3 es el de ahora MENOS la
+    // tabla nueva. Se arma así —y no a mano— para que el día que el esquema
+    // cambie de nuevo esto siga describiendo "la versión anterior".
+    {
+      const v3 = SCHEMA_SQL.replace(/CREATE TABLE IF NOT EXISTS jid_hides[\s\S]*?\);/, "");
+      expect(v3).not.toContain("jid_hides");
+      const db = new Database(path);
+      db.exec(v3);
+      db.run("INSERT INTO meta (key, value) VALUES ('schema_version', '3')");
+      db.run("INSERT INTO chats (jid, name) VALUES ('5491150000001@s.whatsapp.net', 'Ana')");
+      db.run("INSERT INTO jid_flags (jid, locked) VALUES ('5491150000001@s.whatsapp.net', 1)");
+      db.close();
+    }
+
+    const db = openDb(path);
+    expect(db.query<{ value: string }, []>("SELECT value FROM meta WHERE key='schema_version'").get()!.value).toBe(
+      String(CURRENT_VERSION),
+    );
+    // La tabla nueva está y lo de antes quedó intacto (el candado incluido).
+    const repo = createRepo(db);
+    expect(repo.isManuallyHidden("5491150000001@s.whatsapp.net")).toBe(false);
+    expect(repo.jidFlags("5491150000001@s.whatsapp.net")).toEqual({ blocked: false, locked: true });
+    expect(repo.getChat("5491150000001@s.whatsapp.net")).toMatchObject({ name: "Ana" });
+    // Y abrirla de nuevo no vuelve a migrar nada (el `ALTER` que no hicimos).
+    db.close();
+    const otra = openDb(path);
+    expect(() => migrate(otra)).not.toThrow();
+    otra.close();
+  });
+
+  test("`meta` guarda marcas que sobreviven al proceso (y no pisa la versión)", () => {
+    const path = join(tmp, "meta.sqlite");
+    {
+      const db = openDb(path);
+      const repo = createRepo(db);
+      expect(repo.getMeta("appstate_sync_completo_intentado")).toBe(null);
+      repo.setMeta("appstate_sync_completo_intentado", "1787600000");
+      db.close();
+    }
+    // Otro proceso: la marca sigue ahí y `migrate()` no la tocó.
+    const db = openDb(path);
+    const repo = createRepo(db);
+    expect(repo.getMeta("appstate_sync_completo_intentado")).toBe("1787600000");
+    expect(db.query<{ value: string }, []>("SELECT value FROM meta WHERE key='schema_version'").get()!.value).toBe(
+      String(CURRENT_VERSION),
+    );
+    // Se pisa, no se duplica (la clave es PK).
+    repo.setMeta("appstate_sync_completo_intentado", "");
+    expect(repo.getMeta("appstate_sync_completo_intentado")).toBe("");
     db.close();
   });
 
@@ -582,6 +645,85 @@ describe("chats ocultos", () => {
     db.close();
   });
 
+  // ── el TERCER motivo: el usuario lo escondió a mano (`^X`, `jid_hides`) ────
+
+  test("un chat escondido a mano no aparece en ninguna de las cuatro puertas", () => {
+    const { db, repo } = conDosChats();
+
+    repo.setHidden(ANA, true);
+
+    expect(nombres(repo)).toEqual(["Beto"]);
+    expect(repo.countsByFilter()).toEqual({ all: 1, unread: 0, groups: 0 });
+    expect(repo.searchChats("ana", 10)).toEqual([]);
+    expect(enBusqueda(repo)).toEqual(["Beto"]);
+    expect(repo.isHidden(ANA)).toBe(true);
+    expect(repo.isManuallyHidden(ANA)).toBe(true);
+    // Esconder NO es borrar: el historial queda entero (§5.1).
+    expect(repo.lastMessages(ANA).map((m) => m.body)).toEqual(["hola dice ana"]);
+
+    // Y se revela con el MISMO código que el candado de WhatsApp: para el usuario
+    // es la misma cosa, sólo cambia quién la marcó.
+    expect(repo.listChats(undefined, true).map((c) => c.name)).toEqual(["Ana", "Beto"]);
+    expect(repo.countsByFilter(true)).toEqual({ all: 2, unread: 1, groups: 0 });
+    expect(repo.searchChats("ana", 10, true).map((c) => c.name)).toEqual(["Ana"]);
+    expect(repo.searchMessages("hola", 10, true).map((h) => h.chatName).sort()).toEqual(["Ana", "Beto"]);
+    expect(repo.isHidden(ANA, true)).toBe(false);
+
+    repo.setHidden(ANA, false);
+    expect(nombres(repo)).toEqual(["Ana", "Beto"]);
+    expect(repo.isManuallyHidden(ANA)).toBe(false);
+    db.close();
+  });
+
+  test("el candado de WhatsApp y el ocultamiento a mano NO se pisan", () => {
+    const { db, repo } = conDosChats();
+
+    // Los dos a la vez sobre el mismo chat: viven en tablas distintas.
+    repo.setLocked(ANA, true);
+    repo.setHidden(ANA, true);
+    expect(repo.jidFlags(ANA)).toEqual({ blocked: false, locked: true });
+    expect(repo.isManuallyHidden(ANA)).toBe(true);
+
+    // WhatsApp avisa que le sacaron el candado (`chats.lock` con `locked:false`):
+    // el ocultamiento que puso el usuario SIGUE en pie.
+    repo.setLocked(ANA, false);
+    expect(repo.jidFlags(ANA)).toEqual({ blocked: false, locked: false });
+    expect(repo.isManuallyHidden(ANA)).toBe(true);
+    expect(nombres(repo)).toEqual(["Beto"]);
+
+    // Y al revés: desmarcar a mano no le saca el candado de WhatsApp.
+    repo.setLocked(ANA, true);
+    repo.setHidden(ANA, false);
+    expect(repo.jidFlags(ANA)).toEqual({ blocked: false, locked: true });
+    expect(repo.isManuallyHidden(ANA)).toBe(false);
+    expect(nombres(repo)).toEqual(["Beto"]);
+
+    // Recién sin ninguno de los dos vuelve.
+    repo.setLocked(ANA, false);
+    expect(nombres(repo)).toEqual(["Ana", "Beto"]);
+    db.close();
+  });
+
+  test("escondido a mano por una identidad, se desmarca desde la otra", () => {
+    const { db, repo } = base();
+    const LID = "111122223333@lid";
+    repo.upsertChat({ jid: ANA, name: "Ana", lastMessageAt: 300 });
+    repo.upsertChat({ jid: BETO, name: "Beto", lastMessageAt: 200 });
+    repo.linkJids(ANA, LID);
+
+    // La fila queda bajo el `@lid` y el chat vive bajo el número.
+    repo.setHidden(LID, true);
+    expect(nombres(repo)).toEqual(["Beto"]);
+    expect(repo.isManuallyHidden(ANA)).toBe(true);
+
+    // Desmarcar desde el número tiene que borrar la fila de la hermana: si no, el
+    // chat se quedaría escondido y la tecla parecería rota.
+    repo.setHidden(ANA, false);
+    expect(nombres(repo)).toEqual(["Ana", "Beto"]);
+    expect(repo.isManuallyHidden(LID)).toBe(false);
+    db.close();
+  });
+
   test("la marca sobre el @lid oculta el chat que está bajo el número (y al revés)", () => {
     const { db, repo } = base();
     const LID = "111122223333@lid";
@@ -724,8 +866,10 @@ describe("base corrupta (CA-13.6)", () => {
   }
 
   test("una página pisada que el quick_check REPORTA ⇒ DbCorruptError", () => {
-    // 0,55 y no 0,6: ver el ⚠️ de `baseRota`.
-    const path = baseRota("rota-reporta.sqlite", 0.55, 1);
+    // 0,35 y no 0,55: ver el ⚠️ de `baseRota` — la fracción se volvió a elegir al
+    // sumar `jid_hides` al esquema (con 0,55 la página pisada pasó a la rama que
+    // LANZA "malformed", que es la del test de abajo).
+    const path = baseRota("rota-reporta.sqlite", 0.35, 1);
 
     try {
       openDb(path);

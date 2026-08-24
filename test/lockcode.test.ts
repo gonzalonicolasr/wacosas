@@ -17,7 +17,12 @@ import { createLockCode, MAX_DIGITOS, MIN_DIGITOS, validarCodigo } from "../src/
 import { openDb } from "../src/db/open";
 import { createRepo, type Repo } from "../src/db/repo";
 import type { MappedMessage } from "../src/db/types";
-import { commands, configureCommands, type CommandDeps } from "../src/state/commands";
+import {
+  commands,
+  configureCommands,
+  ESPERA_CONFIRMACION_MS,
+  type CommandDeps,
+} from "../src/state/commands";
 import { createStore, type Store } from "../src/state/store";
 
 const tmp = mkdtempSync(join(tmpdir(), "wacosas-candado-"));
@@ -231,30 +236,30 @@ describe("repo con el candado revelado", () => {
 
 // ── el gesto completo, por los comandos ─────────────────────────────────────
 
+/** Comandos cableados contra un store propio y un código ya fijado. */
+function armar(codigo = "482913") {
+  const repo = baseConDosChats();
+  const s: Store = createStore();
+  s.bootstrap(repo);
+  const lockCode = createLockCode(rutaNueva(), LOG);
+  if (codigo) lockCode.set(codigo);
+  configureCommands({
+    repo,
+    wa: {} as CommandDeps["wa"],
+    store: s,
+    log: LOG as CommandDeps["log"],
+    lockCode,
+    shutdown() {},
+  });
+  return { repo, s, lockCode };
+}
+
+const listado = (s: Store): string[] => {
+  s.flushNow();
+  return s.getSnapshot("inbox").chats.map((c) => c.name);
+};
+
 describe("revelar desde el buscador de la bandeja", () => {
-  /** Comandos cableados contra un store propio y un código ya fijado. */
-  function armar(codigo = "482913") {
-    const repo = baseConDosChats();
-    const s: Store = createStore();
-    s.bootstrap(repo);
-    const lockCode = createLockCode(rutaNueva(), LOG);
-    if (codigo) lockCode.set(codigo);
-    configureCommands({
-      repo,
-      wa: {} as CommandDeps["wa"],
-      store: s,
-      log: LOG as CommandDeps["log"],
-      lockCode,
-      shutdown() {},
-    });
-    return { repo, s, lockCode };
-  }
-
-  const listado = (s: Store): string[] => {
-    s.flushNow();
-    return s.getSnapshot("inbox").chats.map((c) => c.name);
-  };
-
   test("el código correcto revela, limpia el campo y avisa", async () => {
     const { repo, s } = armar();
     repo.setLocked(ANA, true);
@@ -354,6 +359,162 @@ describe("revelar desde el buscador de la bandeja", () => {
     s.setLockedRevealed(true);
     expect(s.lockedRevealed()).toBe(true);
     expect(createStore().lockedRevealed()).toBe(false);
+  });
+});
+
+// ── esconder un chat A MANO (`^X`) ──────────────────────────────────────────
+//
+// La otra mitad del candado: la que NO depende de que WhatsApp mande el
+// `chats.lock` (que puede no llegar nunca, ver `wa/appstate.ts`). Lo que se
+// prueba acá es que se comporta igual que un candado de verdad, que no se
+// esconde de un manotazo y que los dos orígenes no se pisan.
+
+describe("esconder un chat a mano", () => {
+  /** Deja el cursor sobre Ana y la lista al día. */
+  function conAnaSeleccionada(codigo = "482913") {
+    const b = armar(codigo);
+    b.s.flushNow();
+    commands.selectChat(ANA);
+    return b;
+  }
+
+  test("sin código fijado NO esconde nada: manda a fijarlo con ^P", () => {
+    const { repo, s } = conAnaSeleccionada("");
+
+    // Dos veces, por si acaso: ni con la confirmación se esconde.
+    commands.toggleSelectedHidden();
+    commands.toggleSelectedHidden();
+
+    expect(repo.isManuallyHidden(ANA)).toBe(false);
+    expect(listado(s)).toEqual(["Ana", "Beto"]);
+    expect(s.getSnapshot("ui").toast?.text).toContain("^P");
+  });
+
+  test("la primera pulsación PREGUNTA; recién la segunda esconde", () => {
+    const { repo, s } = conAnaSeleccionada();
+
+    commands.toggleSelectedHidden();
+    expect(repo.isManuallyHidden(ANA)).toBe(false);
+    expect(listado(s)).toEqual(["Ana", "Beto"]);
+    expect(s.getSnapshot("ui").toast?.text).toContain("¿ocultar «Ana»?");
+
+    commands.toggleSelectedHidden();
+    expect(repo.isManuallyHidden(ANA)).toBe(true);
+    // Desaparece de la bandeja Y de los contadores.
+    expect(listado(s)).toEqual(["Beto"]);
+    expect(s.getSnapshot("inbox").counts).toEqual({ all: 1, unread: 0, groups: 0 });
+    // El cursor pasa al vecino, no se queda sobre un chat que ya no está.
+    expect(s.inboxUi().selectedJid).toBe(BETO);
+  });
+
+  test("la confirmación VENCE con el aviso del pie: un ^X viejo no esconde nada", () => {
+    const { repo, s } = conAnaSeleccionada();
+    commands.toggleSelectedHidden();
+
+    // El reloj de verdad, corrido más allá de la vida del aviso.
+    const real = Date.now;
+    Date.now = () => real() + ESPERA_CONFIRMACION_MS + 1;
+    try {
+      commands.toggleSelectedHidden();
+    } finally {
+      Date.now = real;
+    }
+
+    // No escondió: volvió a preguntar.
+    expect(repo.isManuallyHidden(ANA)).toBe(false);
+    expect(listado(s)).toEqual(["Ana", "Beto"]);
+    expect(s.getSnapshot("ui").toast?.text).toContain("¿ocultar");
+  });
+
+  test("cambiar de chat entre las dos pulsaciones tampoco confirma", () => {
+    const { repo, s } = conAnaSeleccionada();
+    commands.toggleSelectedHidden();
+
+    commands.selectChat(BETO);
+    commands.toggleSelectedHidden();
+
+    expect(repo.isManuallyHidden(ANA)).toBe(false);
+    expect(repo.isManuallyHidden(BETO)).toBe(false);
+    expect(listado(s)).toEqual(["Ana", "Beto"]);
+  });
+
+  test("escondido a mano no se lista en la búsqueda global (ni chats ni mensajes)", () => {
+    const { s } = conAnaSeleccionada();
+    commands.toggleSelectedHidden();
+    commands.toggleSelectedHidden();
+
+    commands.search("hola");
+    s.flushNow();
+    const busqueda = s.getSnapshot("search");
+    expect(busqueda.chats.map((c) => c.name)).toEqual([]);
+    expect(busqueda.hits.map((h) => h.chatName)).toEqual(["Beto"]);
+
+    // Con el candado revelado vuelve a estar, igual que uno de WhatsApp.
+    s.setLockedRevealed(true);
+    s.flushNow();
+    expect(s.getSnapshot("search").hits.map((h) => h.chatName).sort()).toEqual(["Ana", "Beto"]);
+  });
+
+  test("si el chat escondido era el ABIERTO, se cierra", () => {
+    const { s } = conAnaSeleccionada();
+    commands.openChat(ANA);
+    s.flushNow();
+    expect(s.getSnapshot("convo").messages).toHaveLength(2);
+
+    commands.toggleSelectedHidden();
+    commands.toggleSelectedHidden();
+    s.flushNow();
+
+    expect(s.openChatJid()).toBe(null);
+    expect(s.getSnapshot("convo").messages).toEqual([]);
+  });
+
+  test("con el código a la vista, la misma tecla lo desmarca (y sin preguntar)", async () => {
+    const { repo, s } = conAnaSeleccionada();
+    commands.toggleSelectedHidden();
+    commands.toggleSelectedHidden();
+    expect(listado(s)).toEqual(["Beto"]);
+
+    // El MISMO código del candado: el chat escondido a mano vuelve a la vista.
+    commands.setInboxQuery("482913");
+    await esperarA(() => s.lockedRevealed());
+    expect(listado(s)).toEqual(["Ana", "Beto"]);
+
+    // Y ahí se desmarca de una sola pulsación: hace APARECER un chat, no
+    // desaparecer, así que no hay nada que confirmar.
+    commands.selectChat(ANA);
+    commands.toggleSelectedHidden();
+    s.flushNow();
+    expect(repo.isManuallyHidden(ANA)).toBe(false);
+    expect(s.getSnapshot("ui").toast?.text).toContain("vuelve a la bandeja");
+
+    // Escondido el candado otra vez, Ana sigue en la bandeja: ya no está marcada.
+    commands.hideLocked();
+    expect(listado(s)).toEqual(["Ana", "Beto"]);
+  });
+
+  test("un `chats.lock` de WhatsApp y el ocultamiento a mano no se pisan", () => {
+    const { repo, s } = conAnaSeleccionada();
+    commands.toggleSelectedHidden();
+    commands.toggleSelectedHidden();
+    expect(listado(s)).toEqual(["Beto"]);
+
+    // Llega el candado de WhatsApp para el mismo chat y después se levanta:
+    // el ocultamiento del usuario sobrevive a las dos cosas.
+    repo.setLocked(ANA, true);
+    repo.setLocked(ANA, false);
+    s.markDirty("inbox");
+    expect(listado(s)).toEqual(["Beto"]);
+    expect(repo.isManuallyHidden(ANA)).toBe(true);
+  });
+
+  test("sin nada seleccionado la tecla avisa en vez de no hacer nada", () => {
+    const { s } = armar();
+    // Bandeja vacía a fuerza de filtro: no hay chat sobre el que aplicar.
+    commands.setInboxQuery("zzzz");
+    commands.toggleSelectedHidden();
+    s.flushNow();
+    expect(s.getSnapshot("ui").toast?.text).toContain("no hay ningún chat seleccionado");
   });
 });
 

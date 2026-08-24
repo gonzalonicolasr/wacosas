@@ -237,7 +237,7 @@ if (qrPngPath) {
 }
 
 // ── máquina (después del render: baileys tarda en cargar) ────────────────────
-const { createAppStateSync } = await import("./wa/appstate");
+const { createAppStateSync, META_SYNC_REPARADO } = await import("./wa/appstate");
 const { createIdentityResolver } = await import("./wa/identity");
 const { createIngest } = await import("./wa/ingest");
 const { createReadReceipts } = await import("./wa/read");
@@ -249,6 +249,10 @@ let wa: import("./wa/socket").WaController;
 // igual que `wa`: el ingest lo necesita como hook y el resolver necesita la cola
 // del ingest, así que uno de los dos tiene que existir después del otro.
 let identity: import("./wa/identity").IdentityResolver;
+// La reparación de app-state, declarada ACÁ ARRIBA por el mismo motivo: el
+// controlador le pasa los avisos de baileys (de ahí sale qué colección quedó
+// estacionada) y se arma después, cuando ya existe el socket que consulta.
+let appstate: import("./wa/appstate").AppStateSync;
 // Los recibos van PRIMERO porque el ingest los necesita como hook (§6.2). Lee el
 // socket por función, igual que la cola de envío: acá el controlador todavía no
 // existe (se necesitan mutuamente).
@@ -309,13 +313,23 @@ wa = createWaController({
   log,
   credsDir: paths.credsDir,
   getMessage: send.getMessage,
+  // El único camino por el que se sabe que una colección de app-state quedó
+  // estacionada: baileys lo dice en un `warn` y no lo publica en ningún lado
+  // (ver `wa/appstate.ts`). Se lee por función porque `appstate` se arma abajo;
+  // hasta entonces no hay socket, así que tampoco hay avisos.
+  onAviso: (texto) => appstate?.onAviso(texto),
+  // Se borraron las credenciales ⇒ empieza otra sesión, con su
+  // `accountSyncCounter` en 0. La marca de "el sync completo ya se reparó" era
+  // de la sesión anterior: si la nueva vuelve a caer en el mismo agujero (el
+  // timeout de 20 s con muchos chats), la reparación tiene que poder correr.
+  onCredsWiped: () => repo.setMeta(META_SYNC_REPARADO, ""),
 });
 
 // La reparación de app-state: las colecciones de las que salen los NOMBRES de la
 // agenda. `resyncAppState` y el estado local viven los dos colgados del socket,
 // así que se leen por función igual que en `identity`. Sin socket no hay nada que
 // reparar: el chequeo corre 30 s DESPUÉS de abrir y ahí el socket está.
-const appstate = createAppStateSync({
+appstate = createAppStateSync({
   log,
   localState: async (names) =>
     (await wa?.socket()?.authState?.keys?.get("app-state-sync-version", names as string[])) ?? {},
@@ -324,6 +338,29 @@ const appstate = createAppStateSync({
     if (!sock) throw new Error("no hay conexión con WhatsApp");
     await sock.resyncAppState(names, isInitialSync);
   },
+  // La reparación de fondo: volver a habilitar la sincronización inicial de
+  // baileys poniendo `accountSyncCounter` en 0 (ver `wa/appstate.ts`). La marca
+  // de "ya se intentó" va en `meta` —en la base, no en `creds/`— para que
+  // sobreviva al proceso: si no, cada arranque con la agenda incompleta sería
+  // una reconexión más contra WhatsApp. La limpia el borrado de credenciales
+  // (ver `onCredsWiped` más abajo), que es cuando empieza otra sesión.
+  // Borra el `app-state-sync-version-<colección>.json` de `creds/` (el key store
+  // de baileys borra el archivo cuando el valor es `null`,
+  // `Utils/use-multi-file-auth-state.js:105`). Es lo que hace que la colección
+  // trabada se pida con el SNAPSHOT completo en vez de con los parches que no se
+  // pueden descifrar. No toca la base ni el resto de las credenciales.
+  resetLocalState: async (names) => {
+    const keys = wa?.socket()?.authState?.keys;
+    if (!keys) throw new Error("no hay conexión con WhatsApp");
+    await keys.set({
+      "app-state-sync-version": Object.fromEntries(names.map((n) => [n, null])),
+    } as never);
+  },
+  syncCounter: () => wa?.syncCounter() ?? null,
+  resetSyncCounter: async () => (await wa?.resetSyncCounter()) ?? false,
+  reconnect: () => wa?.reconnectNow(),
+  yaReparado: () => !!repo.getMeta(META_SYNC_REPARADO),
+  marcarReparado: () => repo.setMeta(META_SYNC_REPARADO, String(Math.floor(Date.now() / 1000))),
   toast: (texto) => store.toast(texto),
 });
 

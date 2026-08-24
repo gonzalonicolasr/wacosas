@@ -53,13 +53,21 @@ const ATAJOS_BANDEJA: Array<[string, string]> = [
   ["Tab", "filtrar: todos / no leídos / grupos"],
   // `^P` entró PEGADO a `Esc` y no en una fila propia: a 80×24 con el banner de
   // conexión a la vista el cuerpo son 17 filas y lo esencial de la ayuda son 17,
-  // así que un renglón más le hacía tirar los títulos de sección.
+  // así que un renglón más le hacía tirar los títulos de sección. `^X` entró
+  // después por la misma puerta y por el mismo motivo — la columna de teclas mide
+  // 16 (`COL`) y `Esc · ^P · ^X` entra justo.
   //
   // Lo que la ayuda NO dice —a propósito— es el gesto para revelar (escribir el
   // código en el buscador): eso lo explica la pantalla de `^P` cuando el usuario
   // fija el código, que es el único momento en que hace falta saberlo. Anunciarlo
   // acá sería contárselo a cualquiera que abra la ayuda.
-  ["Esc · ^P", "limpiar el buscador · fijar el código del candado"],
+  //
+  // `^X` sí se nombra —es una tecla que hay que poder descubrir— pero con el
+  // "(2 veces)" pegado: sin eso parece que esconde de una, que es justo lo que no
+  // hace. Tampoco va en el pie: el pie con un chat abierto mide 78 de 80 y, sobre
+  // todo, anunciar "ocultá un chat" en la línea de siempre es una invitación al
+  // accidente.
+  ["Esc · ^P · ^X", "limpiar · fijar el código · ocultar el chat (2 veces)"],
 ];
 
 // Dos filas, apretadas a propósito: cada atajo nuevo empuja la ayuda un renglón

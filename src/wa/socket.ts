@@ -43,7 +43,7 @@ import type {
 import type { Logger } from "../boot/log";
 import { reconnectDelayMs } from "../lib/backoff";
 import type { Cancelar, Store } from "../state/store";
-import { hardenCreds, hasCreds, loadAuth, wipeCreds } from "./auth";
+import { hardenCreds, hasCreds, loadAuth, wipeCreds, type Auth } from "./auth";
 import type { Ingest } from "./ingest";
 
 /**
@@ -147,13 +147,30 @@ export const NIVEL_BAILEYS = "info";
  * Ese descarte es lo que hace que subir el nivel NO pueda filtrar un cuerpo ni una
  * credencial al archivo (CA-14.7): lo único que se copia es una cadena literal del
  * fuente de Baileys.
+ *
+ * `onAviso` recibe ese mismo texto (nunca el objeto). Existe por una sola razón:
+ * **hay cosas que Baileys no expone de ninguna otra forma**. La que nos importa es
+ * qué colección de app-state quedó ESTACIONADA por una clave que falta —
+ * `blockedCollections` es un `Set` local de su closure (`Socket/chats.js:55`), no
+ * está en el socket, y el único rastro es este `warn` (ver `wa/appstate.ts`).
  */
-export function createBaileysLogger(log: Logger, level: string = NIVEL_BAILEYS): BaileysLogger {
+export function createBaileysLogger(
+  log: Logger,
+  level: string = NIVEL_BAILEYS,
+  onAviso?: (texto: string) => void,
+): BaileysLogger {
   const escribir =
     (nivel: "info" | "warn" | "error") =>
     (obj: unknown, msg?: string): void => {
       const texto = typeof msg === "string" ? msg : typeof obj === "string" ? obj : "";
       log[nivel]("baileys", { aviso: texto || "(aviso sin texto)" });
+      // Un oyente que lance se llevaría puesta la conexión: esto corre adentro
+      // del camino de Baileys, no en un handler nuestro.
+      try {
+        onAviso?.(texto);
+      } catch {
+        /* leer un aviso no puede romper nada */
+      }
     };
   const nada = (): void => {};
 
@@ -269,6 +286,51 @@ export type WaController = {
   /** Pide el código de 8 caracteres y lo publica en el slice `link` (CA-2.3). */
   requestPairingCode(phoneDigits: string): Promise<void>;
   isOpen(): boolean;
+  /**
+   * `creds.accountSyncCounter`, o `null` si todavía no se cargaron las creds.
+   *
+   * Es el contador que decide si Baileys va a hacer su sincronización INICIAL
+   * completa: con `> 0` la saltea siempre (`Socket/chats.js:1089`). Ver
+   * `resetSyncCounter`.
+   */
+  syncCounter(): number | null;
+  /**
+   * Pone `accountSyncCounter` en **0** y lo persiste. `true` si pudo.
+   *
+   * ── QUÉ ES ESTO Y POR QUÉ EXISTE ──────────────────────────────────────────
+   *
+   * Es la reparación del agujero que dejó la cuenta real con 844 contactos y 32
+   * nombres. La secuencia, toda en `Socket/chats.js`:
+   *
+   *   1. primera conexión después de vincular: `syncState` va a
+   *      `AwaitingInitialSync` y Baileys espera hasta **20 s** un mensaje de
+   *      historial (`:1097-1099`, el tope está HARDCODEADO, no es configurable);
+   *   2. si no llega a tiempo —899 chats tardan más—, salta el timeout, pasa a
+   *      `Online` y, acá está el problema, **se auto-incrementa el contador**:
+   *      `accountSyncCounter = (creds.accountSyncCounter || 0) + 1` (`:1104-1107`);
+   *   3. desde entonces, TODA conexión ve `accountSyncCounter > 0` y se va
+   *      derecho a `Online` (`:1086-1092`), así que `doAppStateSync` —el único
+   *      lugar que sincroniza las CINCO colecciones de app-state (`:1092-1106`)—
+   *      **no vuelve a correr nunca**. Ni reiniciando: el contador está en
+   *      `creds.json`.
+   *
+   * Poniéndolo en 0 la próxima conexión vuelve a esperar el historial y, si
+   * llega, rehace el sync completo. **Sin desvincular ni perder el historial
+   * local**, que es la única otra salida que había.
+   *
+   * ⚠️ Lo que esto **no** puede hacer: traer las CLAVES de app-state que falten.
+   * Esas sólo llegan por un `APP_STATE_SYNC_KEY_SHARE` del teléfono
+   * (`Utils/process-message.js:278-293`) y Baileys no implementa el pedido
+   * (`APP_STATE_SYNC_KEY_REQUEST`, 0 usos). Si una colección quedó estacionada
+   * por una clave que no tenemos, el sync completo la va a volver a estacionar.
+   *
+   * Se escribe la MISMA propiedad que escribe Baileys y por el mismo camino
+   * (mutar `creds` + `saveCreds`, igual que su handler de `creds.update`): no
+   * hay un segundo formato ni un archivo aparte que se pueda desincronizar. Si
+   * el `saveCreds` falla, el valor viejo se restaura en memoria — mentir sobre
+   * lo que hay en disco sería peor que no haber intentado.
+   */
+  resetSyncCounter(): Promise<boolean>;
   /** SÓLO para `send.ts`/`read.ts`, que tienen que re-chequear en cada uso. */
   socket(): WASocket | null;
   /** Jid propio (crudo, como lo da WhatsApp) o `""` si todavía no hay sesión. */
@@ -301,6 +363,20 @@ export type WaDeps = {
    * sin la opción (ese mensaje puntual no se re-entrega).
    */
   getMessage?: (key: WAMessageKey) => Promise<proto.IMessage | undefined>;
+  /**
+   * Cada aviso de Baileys, como texto pelado. Lo usa `wa/appstate.ts` para
+   * enterarse de qué colección quedó estacionada, que es un dato que Baileys no
+   * publica de ninguna otra manera (ver `createBaileysLogger`). Nunca puede
+   * lanzar hacia acá: el adaptador lo envuelve.
+   */
+  onAviso?: (texto: string) => void;
+  /**
+   * Las credenciales se BORRARON (401/500, o un QR durante una reconexión): lo
+   * que venga después es otra sesión. Lo usa `index.tsx` para soltar las marcas
+   * que eran de la anterior (hoy, la de la reparación del sync completo). Nunca
+   * puede lanzar: corre adentro del camino de error del socket.
+   */
+  onCredsWiped?: () => void;
 };
 
 const agendarReal = (fn: () => void, ms: number): Cancelar => {
@@ -354,6 +430,13 @@ export function createWaController(deps: WaDeps): WaController {
    * `send.ts`/`read.ts` van a preguntar `isOpen()` justo antes de tocar la red.
    */
   let abierto = false;
+
+  /**
+   * Las credenciales VIVAS (el mismo objeto que lee baileys) más su `saveCreds`.
+   * Se guardan para poder tocar `accountSyncCounter` (ver `resetSyncCounter`):
+   * es la única propiedad de `creds` que esta app escribe por su cuenta.
+   */
+  let auth: Auth | null = null;
 
   let cancelarReintento: Cancelar | null = null;
 
@@ -418,7 +501,18 @@ export function createWaController(deps: WaDeps): WaController {
   function borrarCreds(motivoOriginal: string): boolean {
     const ok = wipeCreds(credsDir);
     log.info("wa.creds_borradas", { ok, motivo: motivoOriginal });
-    if (ok) return true;
+    if (ok) {
+      // Lo que quedó en memoria ya no describe nada de lo que hay en disco: un
+      // `saveCreds` sobre eso reescribiría la sesión que se acaba de borrar.
+      auth = null;
+      try {
+        deps.onCredsWiped?.();
+      } catch (e) {
+        // Nunca hacia afuera: esto corre en el camino de error del socket.
+        log.warn("wa.creds_wiped_hook_fallido", { motivo: motivo(e) });
+      }
+      return true;
+    }
 
     log.error("wa.wipe_imposible", { dir: credsDir, motivo: motivoOriginal });
     store.setConn({ state: "offline", nextAttemptAt: null });
@@ -494,7 +588,10 @@ export function createWaController(deps: WaDeps): WaController {
       log.info("wa.connect", { flujo, intento });
 
       const version = await resolverVersion();
-      const { state, saveCreds } = await loadAuth(credsDir);
+      // Se guarda la referencia: `resetSyncCounter` necesita el MISMO objeto de
+      // creds que va a leer baileys, no una copia leída del disco.
+      auth = await loadAuth(credsDir);
+      const { state, saveCreds } = auth;
 
       // El `stop()` pudo llegar mientras se resolvía la versión: no abrir nada.
       if (detenido) return;
@@ -548,8 +645,9 @@ export function createWaController(deps: WaDeps): WaController {
         ...(version ? { version } : {}),
         auth: state,
         browser: Browsers.ubuntu("Chrome"), // WA rechaza clientes sin browser
-        // CA-16.2: nada a la terminal — pero sus avisos SÍ van a nuestro log.
-        logger: createBaileysLogger(log),
+        // CA-16.2: nada a la terminal — pero sus avisos SÍ van a nuestro log (y,
+        // de paso, al oyente que lee las colecciones estacionadas).
+        logger: createBaileysLogger(log, NIVEL_BAILEYS, deps.onAviso),
         markOnlineOnConnect: false, // CA-15.8
         syncFullHistory: false,
         generateHighQualityLinkPreview: false,
@@ -1040,6 +1138,30 @@ export function createWaController(deps: WaDeps): WaController {
 
     isOpen() {
       return abierto;
+    },
+
+    syncCounter() {
+      const n = auth?.state?.creds?.accountSyncCounter;
+      return typeof n === "number" && Number.isFinite(n) ? n : null;
+    },
+
+    async resetSyncCounter() {
+      const a = auth;
+      if (!a?.state?.creds) return false;
+      const previo = a.state.creds.accountSyncCounter ?? 0;
+      // Ya está en 0: baileys va a intentar el sync completo solo en la próxima
+      // conexión y no hay nada que reparar (ni que escribir).
+      if (previo === 0) return false;
+      a.state.creds.accountSyncCounter = 0;
+      try {
+        await a.saveCreds();
+      } catch (e) {
+        a.state.creds.accountSyncCounter = previo;
+        log.error("wa.sync_counter_no_guardado", { motivo: motivo(e), previo });
+        return false;
+      }
+      log.warn("wa.sync_counter_reset", { previo });
+      return true;
     },
 
     socket() {

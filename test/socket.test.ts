@@ -194,6 +194,12 @@ function banco(
   opts: {
     /** Sembrar `creds.json` con una sesión vinculada ⇒ el flujo arranca en `reconnect`. */
     vinculado?: boolean;
+    /**
+     * `accountSyncCounter` en las creds sembradas. Es el número que decide si
+     * baileys rehace su sincronización inicial completa (`Socket/chats.js:1089`):
+     * con `> 0` la saltea para siempre. Ver `resetSyncCounter`.
+     */
+    contador?: number;
     version?: () => Promise<{ version: WAVersion; isLatest: boolean; error?: unknown }>;
     /** Envuelve la cola real (para romperla a propósito). */
     ingest?: (real: Ingest) => Ingest;
@@ -217,7 +223,12 @@ function banco(
     // verdad usa el usuario (ver `test/auth.test.ts`).
     writeFileSync(
       archivoCreds,
-      JSON.stringify({ me: { id: SELF_JID, name: "Yo" }, platform: "iphone", registered: false }),
+      JSON.stringify({
+        me: { id: SELF_JID, name: "Yo" },
+        platform: "iphone",
+        registered: false,
+        ...(opts.contador === undefined ? {} : { accountSyncCounter: opts.contador }),
+      }),
       { mode: 0o600 },
     );
   }
@@ -258,11 +269,17 @@ function banco(
   const agenda = agendadorManual();
   let reloj = 1_700_000_000_000;
 
+  /** Veces que se avisó que las creds se borraron (`onCredsWiped`). */
+  let wiped = 0;
+
   wa = createWaController({
     ingest,
     store,
     log,
     credsDir,
+    onCredsWiped: () => {
+      wiped++;
+    },
     now: () => reloj,
     schedule: agenda.schedule,
     makeSocket: (cfg) => {
@@ -299,6 +316,7 @@ function banco(
     vivos: () => creados.filter((f) => !f.terminado),
     ultimo: () => creados[creados.length - 1]!,
     violaciones: () => violaciones,
+    wiped: () => wiped,
     filas: () => contar.get()!.n,
     drenar: () => espia.drainNow(),
     logTexto: () => readFileSync(logPath, "utf8"),
@@ -536,6 +554,28 @@ test("el logger de baileys se queda con el mensaje y tira el objeto (CA-14.7)", 
   // `trace`/`debug` harían que baileys serialice nodos binarios enteros.
   expect(NIVEL_BAILEYS).not.toBe("trace");
   expect(NIVEL_BAILEYS).not.toBe("debug");
+});
+
+test("el oyente de avisos recibe el TEXTO, y si lanza no se lleva puesta la conexión", () => {
+  const dir = mkdtempSync(join(tmp, "balog-aviso-"));
+  const logPath = join(dir, "wa.log");
+  const avisos: string[] = [];
+  const bl = createBaileysLogger(createLogger(logPath), NIVEL_BAILEYS, (t) => avisos.push(t));
+
+  // La línea que le importa a `wa/appstate.ts`: el texto llega entero y el objeto
+  // (que trae el stack del error) NO se le pasa a nadie.
+  const parking = "regular_low blocked on missing key from v68, parking after 2 attempts";
+  bl.warn({ name: "regular_low", error: "secreto" }, parking);
+  bl.info({}, "synced regular_low to v69");
+
+  expect(avisos).toEqual([parking, "synced regular_low to v69"]);
+  expect(readFileSync(logPath, "utf8")).not.toContain("secreto");
+
+  // Un oyente que lanza corre ADENTRO del camino de baileys: no puede subir.
+  const roto = createBaileysLogger(createLogger(logPath), NIVEL_BAILEYS, () => {
+    throw new Error("boom");
+  });
+  expect(() => roto.warn("cualquier cosa")).not.toThrow();
 });
 
 test("en `warn` el mismo adaptador se traga los `info` (el nivel manda de verdad)", () => {
@@ -1178,6 +1218,76 @@ test("401 loggedOut: borra SOLO las creds, conserva el historial y vuelve a vinc
   expect(b.vivos().length).toBe(1);
   expect(b.logTexto()).toContain("wa.creds_borradas");
   expect(b.violaciones()).toBe(0);
+  b.cerrar();
+});
+
+// ── `accountSyncCounter`: el número que apaga la sincronización inicial ─────
+//
+// La causa raíz del agujero de app-state (ver el encabezado de
+// `wa/appstate.ts`): baileys se auto-incrementa ese contador cuando su timeout
+// de 20 s salta, y desde ahí no vuelve a hacer el sync completo NUNCA. Estos
+// tests prueban la reparación **sin cuenta real**: creds de verdad en un
+// directorio temporal (`useMultiFileAuthState`) y la fábrica de socket
+// inyectada, que es como se probaron las tareas 8 y 10.
+
+test("resetSyncCounter deja el contador en 0 EN DISCO, sin tocar el resto de las creds", async () => {
+  const b = banco({ vinculado: true, contador: 1 });
+  await arrancar(b);
+  expect(b.wa.syncCounter()).toBe(1);
+
+  expect(await b.wa.resetSyncCounter()).toBe(true);
+
+  // Lo único que importa es lo que va a leer la PRÓXIMA conexión, o sea el
+  // archivo — no la copia en memoria de este proceso.
+  const enDisco = JSON.parse(readFileSync(b.archivoCreds, "utf8"));
+  expect(enDisco.accountSyncCounter).toBe(0);
+  // Y la sesión sigue entera: esto escribe UNA propiedad, no reescribe creds.
+  expect(enDisco.me.id).toBe(SELF_JID);
+  expect(enDisco.platform).toBe("iphone");
+
+  // Como lo va a leer baileys en la conexión siguiente.
+  const { state } = await loadAuth(b.credsDir);
+  expect(state.creds.accountSyncCounter).toBe(0);
+
+  expect(b.wa.syncCounter()).toBe(0);
+  expect(b.logTexto()).toContain("wa.sync_counter_reset previo=1");
+  b.cerrar();
+});
+
+test("con el contador ya en 0 no hay nada que escribir", async () => {
+  const b = banco({ vinculado: true, contador: 0 });
+  await arrancar(b);
+
+  expect(b.wa.syncCounter()).toBe(0);
+  expect(await b.wa.resetSyncCounter()).toBe(false);
+  expect(b.logTexto()).not.toContain("wa.sync_counter_reset");
+  b.cerrar();
+});
+
+test("sin creds cargadas todavía, no se toca nada a ciegas", async () => {
+  const b = banco({ vinculado: true, contador: 2 });
+  // Sin `start()`: `loadAuth` no corrió, así que no hay creds que tocar.
+  expect(b.wa.syncCounter()).toBe(null);
+  expect(await b.wa.resetSyncCounter()).toBe(false);
+  expect(JSON.parse(readFileSync(b.archivoCreds, "utf8")).accountSyncCounter).toBe(2);
+  b.cerrar();
+});
+
+test("borrar las credenciales avisa (la marca de la reparación era de esa sesión)", async () => {
+  const b = banco({ vinculado: true, contador: 1 });
+  const s = await arrancar(b);
+  expect(b.wiped()).toBe(0);
+
+  s.emitir("connection.update", cierre(401));
+  await asentar();
+  await correrTimer(b); // vence el cooldown ⇒ borra las creds
+
+  expect(b.wiped()).toBe(1);
+  // Las creds viejas se soltaron y el `conectar()` que sigue al borrado ya
+  // arranca con unas nuevas, con el contador en 0: la sesión que viene no
+  // heredó el número que apagaba el sync (ni hay nada que resetear).
+  expect(b.wa.syncCounter()).toBe(0);
+  expect(await b.wa.resetSyncCounter()).toBe(false);
   b.cerrar();
 });
 

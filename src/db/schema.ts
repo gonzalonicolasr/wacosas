@@ -105,6 +105,30 @@ CREATE TABLE IF NOT EXISTS jid_flags (
   updated_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
+-- El TERCER motivo por el que un chat no se muestra, y el único que NO viene de
+-- WhatsApp: **el usuario lo escondió a mano desde wacosas** (la tecla \`^X\`).
+--
+-- Se comporta igual que un candado: no se lista en ninguna de las cuatro puertas
+-- y se revela con el MISMO código (\`boot/lockcode.ts\`). Lo que cambia es de dónde
+-- viene, y por eso vive en su propia tabla y no en una columna de \`jid_flags\`:
+--
+--   · \`jid_flags\` es el espejo de lo que dice WhatsApp (\`chats.lock\`,
+--     \`blocklist.*\`) y sus escrituras PISAN el valor anterior — así tiene que ser:
+--     si el teléfono dice que el candado se levantó, se levanta. Un ocultamiento
+--     del usuario no puede depender de eso: WhatsApp no sabe que existe;
+--   · con dos orígenes en la misma columna, sacar uno borraría el otro. Acá
+--     desmarcar a mano es \`DELETE\` de esta fila y no toca \`jid_flags\`, y un
+--     \`chats.lock\` con \`locked: false\` no toca esta tabla;
+--   · la fila EXISTE o no existe: no hace falta \`0\`/\`1\` ni barrido.
+--
+-- Se guarda bajo el jid que el usuario tenía a la vista; el cruce con
+-- \`jid_aliases\` (ver \`db/repo.ts\`) hace que esconda también a la identidad
+-- hermana, igual que el candado y el bloqueo.
+CREATE TABLE IF NOT EXISTS jid_hides (
+  jid        TEXT PRIMARY KEY,
+  created_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
 CREATE TABLE IF NOT EXISTS messages (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   chat_jid    TEXT    NOT NULL REFERENCES chats(jid) ON DELETE CASCADE,
@@ -178,8 +202,19 @@ export const MIGRATIONS: Migracion[] = [
   },
 ];
 
-/** v3: `jid_flags` (bloqueado / con candado) + el borrado del chat `+0`. */
-export const CURRENT_VERSION = 3;
+/**
+ * v3: `jid_flags` (bloqueado / con candado) + el borrado del chat `+0`.
+ * v4: `jid_hides` (los chats que el usuario escondió a mano con `^X`).
+ *
+ * La v4 no tiene entrada en `MIGRATIONS` y no es un olvido: es una tabla NUEVA,
+ * o sea un `CREATE TABLE IF NOT EXISTS` más, y `migrate()` corre el `SCHEMA_SQL`
+ * entero en cada arranque —así que la base que venía de la v3 la crea igual—. Lo
+ * que SÍ necesitaría una migración es cambiar una tabla que ya existe (un
+ * `ALTER TABLE` no es idempotente y acá las migraciones corren también sobre una
+ * base nueva, donde la columna ya vendría del `SCHEMA_SQL`): ése es justamente
+ * uno de los motivos por los que el ocultamiento manual es una tabla aparte.
+ */
+export const CURRENT_VERSION = 4;
 
 /** Lee `meta.schema_version`; si no está todavía, la base es nueva ⇒ 0. */
 function versionGuardada(db: Database): number {

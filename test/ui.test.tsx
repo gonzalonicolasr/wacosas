@@ -14,6 +14,8 @@ import { join } from "node:path";
 import { act, createRef } from "react";
 
 import { createLockCode } from "../src/boot/lockcode";
+import { openDb } from "../src/db/open";
+import { createRepo } from "../src/db/repo";
 import { configureCommands, type CommandDeps } from "../src/state/commands";
 import { store, TOAST_MS, type LinkSnapshot } from "../src/state/store";
 import { App } from "../src/ui/App";
@@ -35,7 +37,7 @@ const ATAJOS_BANDEJA = [
   "PgUp PgDn       saltar de a una pantalla (Inicio / Fin, a las puntas)",
   "⏎ · ^L          abrir el chat (o doble click) · marcarlo leído sin abrir",
   "Tab             filtrar: todos / no leídos / grupos",
-  "Esc · ^P        limpiar el buscador · fijar el código del candado",
+  "Esc · ^P · ^X   limpiar · fijar el código · ocultar el chat (2 veces)",
 ];
 const ATAJOS_CONVO = [
   "⇧↑↓ ⇧PgUp/PgDn  scrollear el chat · ⇧Inicio ⇧Fin a las puntas",
@@ -132,6 +134,7 @@ function cablearComandos() {
       force() {
         visto.resyncs++;
       },
+      onAviso() {},
       stop() {},
     },
     store,
@@ -951,4 +954,95 @@ test("no reescribe el banner cuando no cambió (un flush menos por montaje)", as
   } finally {
     store.setBanner = original;
   }
+});
+
+// ── esconder un chat a mano (`^X`) ──────────────────────────────────────────
+//
+// Acá se mira el frame y no el estado porque las dos mitades del gesto sólo
+// existen ahí: que la tecla LLEGUE (el buscador de la bandeja está enfocado y
+// también la recibe) y que el chat desaparezca de la lista pintada.
+describe("esconder un chat con ^X", () => {
+  const dirOcultar = mkdtempSync(join(tmpdir(), "wacosas-ui-ocultar-"));
+  afterAll(() => {
+    rmSync(dirOcultar, { recursive: true, force: true });
+    // El store es un singleton compartido con el resto de los archivos: se lo
+    // deja como estaba (mismo cuidado que `test/inbox.test.tsx`).
+    store.bootstrap(createRepo(openDb(":memory:")));
+    store.setInboxUi({ inboxFilter: "all", inboxQuery: "", selectedJid: null });
+    store.flushNow();
+  });
+
+  let nOcultar = 0;
+  /** Dos chats de verdad en una base en memoria, con el código ya fijado. */
+  function cablear(conCodigo = true) {
+    const repo = createRepo(openDb(":memory:"));
+    repo.upsertChat({ jid: "5491150000001@s.whatsapp.net", name: "Ana", lastMessageAt: 300 });
+    repo.upsertChat({ jid: "5491199999999@s.whatsapp.net", name: "Beto", lastMessageAt: 200 });
+    store.bootstrap(repo);
+    store.setInboxUi({ inboxFilter: "all", inboxQuery: "", selectedJid: null });
+    store.flushNow();
+
+    const lockCode = createLockCode(join(dirOcultar, `lock-${++nOcultar}.json`));
+    if (conCodigo) lockCode.set("482913");
+    configureCommands({
+      repo,
+      wa: {} as CommandDeps["wa"],
+      store,
+      log: { info() {}, warn() {}, error() {}, path: LOG },
+      lockCode,
+      shutdown() {},
+    });
+    return repo;
+  }
+
+  const equis = async (t: Awaited<ReturnType<typeof montar>>) => {
+    act(() => {
+      t.mockInput.pressKey("x", { ctrl: true });
+    });
+    act(() => {
+      store.flushNow(); // el toast y la bandeja viajan en el flush coalescido (D3)
+    });
+    await pintar(t);
+  };
+
+  test("la primera pregunta en el pie y la segunda saca el chat de la bandeja", async () => {
+    const repo = cablear();
+    const t = await montar(80, 24);
+    expect(t.captureCharFrame()).toContain("Ana");
+
+    await equis(t);
+    let frame = t.captureCharFrame();
+    // La pregunta está y el chat sigue: `^X` no esconde de un manotazo.
+    expect(frame).toContain("¿ocultar «Ana»?");
+    expect(frame).toContain("Ana");
+
+    await equis(t);
+    frame = t.captureCharFrame();
+    // Ya no hay FILA de Ana (el `▪` es el glifo de un chat 1:1). El nombre sigue
+    // apareciendo una vez en el pie, que es el aviso de que se acaba de esconder.
+    expect(frame).not.toContain("▪ Ana");
+    expect(frame).toContain("«Ana» oculto");
+    expect(frame).toContain("▪ Beto");
+    // El contador del panel también lo descuenta (es la misma consulta).
+    expect(frame).toContain("chats 1");
+    expect(repo.isManuallyHidden("5491150000001@s.whatsapp.net")).toBe(true);
+    // Y la tecla NO se le fue al buscador, que está enfocado y recibe todo:
+    // `^X` no está entre los bindings del `<input>` de OpenTUI.
+    expect(store.inboxUi().inboxQuery).toBe("");
+    t.renderer.destroy();
+  });
+
+  test("sin código fijado no esconde nada y lo dice en el pie", async () => {
+    const repo = cablear(false);
+    const t = await montar(80, 24);
+
+    await equis(t);
+    await equis(t);
+
+    const frame = t.captureCharFrame();
+    expect(frame).toContain("^P");
+    expect(frame).toContain("Ana");
+    expect(repo.isManuallyHidden("5491150000001@s.whatsapp.net")).toBe(false);
+    t.renderer.destroy();
+  });
 });

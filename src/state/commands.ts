@@ -15,12 +15,12 @@ import type { Logger } from "../boot/log";
 import type { LockCode } from "../boot/lockcode";
 import type { Repo } from "../db/repo";
 import type { ChatRow } from "../db/types";
-import { fold } from "../lib/fmt";
+import { clip, fold } from "../lib/fmt";
 import type { AppStateSync } from "../wa/appstate";
 import type { ReadReceipts } from "../wa/read";
 import type { SendQueue } from "../wa/send";
 import type { WaController } from "../wa/socket";
-import type { InboxFilter, LinkSnapshot, Store } from "./store";
+import { TOAST_MS, type InboxFilter, type LinkSnapshot, type Store } from "./store";
 
 export type CommandDeps = {
   repo: Repo;
@@ -67,6 +67,9 @@ let deps: CommandDeps | null = null;
 /** Cablea los comandos. Se llama UNA vez, desde el entry, antes de renderizar. */
 export function configureCommands(d: CommandDeps): void {
   deps = d;
+  // Otro mundo (otro repo, otro store): una confirmación a medias del anterior no
+  // puede esconder un chat del nuevo.
+  confirmarOculto = null;
 }
 
 /**
@@ -275,6 +278,38 @@ function intentarRevelar(d: CommandDeps, texto: string): void {
     });
 }
 
+// ── esconder un chat A MANO (`Ctrl-X`) ──────────────────────────────────────
+//
+// La vía automática puede no llegar nunca: el `chats.lock` de WhatsApp viaja por
+// app-state y en la cuenta real dos colecciones quedaron ESTACIONADAS por una
+// clave que sólo puede mandar el teléfono (ver `wa/appstate.ts`). O sea que un
+// chat con candado en el teléfono puede verse igual en la TUI. Esto es la salida
+// manual: el usuario esconde el chat él mismo.
+//
+// Tres decisiones:
+//
+//  1. **Se comporta EXACTAMENTE como un candado de WhatsApp**: no se lista en
+//     ninguna de las cuatro puertas y vuelve escribiendo el MISMO código en el
+//     buscador (el filtro vive en `db/repo.ts`, no acá). Lo que NO comparte es la
+//     fila: va a `jid_hides` y no a `jid_flags`, así ninguno de los dos orígenes
+//     puede pisar al otro (§4.1).
+//  2. **Pide confirmación**: la primera pulsación pregunta y la segunda esconde.
+//     Es una acción que hace DESAPARECER un chat de la vista, y `^X` no puede ser
+//     una tecla que se apriete sola. La ventana de confirmación dura lo que dura
+//     el aviso en el pie (`TOAST_MS`): mientras la pregunta está en pantalla, la
+//     tecla confirma; cuando se fue, vuelve a preguntar. Un `^X` de hace un
+//     minuto no puede esconder nada.
+//  3. **Sin código fijado no se puede esconder.** Sin `^P` no hay forma de
+//     revelar, así que esconder sería tirar el chat a un pozo. Se avisa y se
+//     manda a fijarlo. Desmarcar, en cambio, no pide nada: hace APARECER un chat.
+export const SIN_CODIGO_PARA_OCULTAR = "fijá antes el código con ^P: sin código no habría cómo volver a ver el chat";
+
+/** Cuánto vale la primera pulsación de `^X`. Es la vida del aviso del pie. */
+export const ESPERA_CONFIRMACION_MS = TOAST_MS;
+
+/** Tope del nombre en los avisos: el pie es UNA línea de 80 columnas (RNF-1). */
+const LARGO_NOMBRE_AVISO = 22;
+
 /** Lo que hace falta para mover el cursor: la lista visible y dónde está parado. */
 function vistaBandeja(d: CommandDeps): { visibles: ChatRow[]; actual: string | null } {
   const ui = d.store.inboxUi();
@@ -356,6 +391,17 @@ export type Commands = {
    */
   hideLocked(): void;
   /**
+   * `Ctrl-X`: esconde el chat SELECCIONADO de la bandeja, o lo devuelve si ya
+   * estaba escondido a mano (que es lo que se puede hacer con el candado
+   * revelado). Ver la sección "esconder un chat A MANO" de más arriba: pide
+   * confirmación para esconder, no para mostrar, y no esconde nada si todavía no
+   * hay código fijado.
+   *
+   * Todos los caminos AVISAN por el pie: una tecla que a veces no hace nada
+   * visible parece rota (mismo criterio que `retrySend`).
+   */
+  toggleSelectedHidden(): void;
+  /**
    * `Ctrl-G`: entra a la búsqueda global. Guarda el estado de la bandeja
    * —chat seleccionado, filtro y texto del buscador— para poder devolverlo tal
    * cual con `Esc` (CA-12.8), y arranca con la lista vacía.
@@ -406,6 +452,15 @@ let ultimoTelefono = "";
  * guardarlo adentro sería guardarlo en algo que muere justo cuando hace falta.
  */
 let bandejaGuardada: ReturnType<Store["inboxUi"]> | null = null;
+
+/**
+ * El `^X` que ya preguntó "¿ocultar X?" y espera el segundo. Vive acá y no en un
+ * `useRef` de la vista por lo mismo que `bandejaGuardada`: es estado de la
+ * MÁQUINA (qué va a hacer el próximo comando), y así se puede probar sin montar
+ * la interfaz. Se ata al jid: cambiar de chat entre las dos pulsaciones no
+ * confirma nada.
+ */
+let confirmarOculto: { jid: string; at: number } | null = null;
 
 /** Fases que la elección manual de método puede reescribir sin pisar nada. */
 const FASES_EN_CURSO = new Set(["checking", "need-link", "qr-waiting", "qr-shown", "pairing-phone", "pairing-shown"]);
@@ -530,6 +585,76 @@ export const commands: Commands = {
     // no está revelado?".
     if (jid && d.repo.isHidden(jid, false)) commands.closeChat();
     d.log.info("candado.escondido");
+  },
+
+  toggleSelectedHidden() {
+    const d = deps;
+    if (!d) return;
+    const { visibles, actual } = vistaBandeja(d);
+    if (!actual) {
+      d.store.toast("no hay ningún chat seleccionado");
+      return;
+    }
+    const i = visibles.findIndex((c) => c.jid === actual);
+    // `seleccionVigente` garantiza que `actual` está en `visibles` (o es `null`,
+    // que ya salió arriba), así que la fila existe.
+    const nombre = clip(etiquetaChat(visibles[i] as ChatRow), LARGO_NOMBRE_AVISO);
+
+    // ── devolverlo a la bandeja ───────────────────────────────────────────
+    // Sin confirmación a propósito: hace APARECER un chat, no desaparecer.
+    if (d.repo.isManuallyHidden(actual)) {
+      confirmarOculto = null;
+      d.repo.setHidden(actual, false);
+      d.store.markDirty("inbox", "convo", "search");
+      d.store.toast(`«${nombre}» vuelve a la bandeja`);
+      // Sin el jid: es un número de teléfono (mismo criterio que el resto del
+      // módulo del candado, donde no se loguea ni el código ni su largo).
+      d.log.info("candado.manual", { accion: "mostrar" });
+      return;
+    }
+
+    // ── esconderlo ────────────────────────────────────────────────────────
+    if (!commands.hasLockCode()) {
+      d.store.toast(SIN_CODIGO_PARA_OCULTAR);
+      d.log.info("candado.manual", { accion: "sin_codigo" });
+      return;
+    }
+    // Vale la confirmación del MISMO chat y sólo mientras la pregunta sigue en el
+    // pie. El `< 0` no es paranoia: un salto de reloj hacia atrás (NTP) dejaría
+    // una confirmación "del futuro" viva para siempre, y esa es exactamente la
+    // que escondería un chat de una sola pulsación.
+    const ahora = Date.now();
+    const desde = confirmarOculto ? ahora - confirmarOculto.at : Infinity;
+    if (!confirmarOculto || confirmarOculto.jid !== actual || desde < 0 || desde > ESPERA_CONFIRMACION_MS) {
+      confirmarOculto = { jid: actual, at: ahora };
+      d.store.toast(`¿ocultar «${nombre}»? ^X de nuevo para confirmar`);
+      return;
+    }
+    confirmarOculto = null;
+    d.repo.setHidden(actual, true);
+    // ¿Desaparece AHORA? Con el candado revelado el chat sigue a la vista, y ahí
+    // no hay ni cursor que mover ni chat que cerrar. El estado se lee EN VIVO
+    // (D3): el revelado llega por un camino asincrónico.
+    const seEsconde = d.repo.isHidden(actual, d.store.lockedRevealed());
+    if (seEsconde) {
+      // El cursor no puede quedar sobre un chat que ya no está. Se elige el
+      // vecino ANTES de que la lista cambie: `seleccionVigente` lo mandaría al
+      // primero de la bandeja, que está en cualquier otro lado de la pantalla.
+      const vecino = visibles[i + 1] ?? visibles[i - 1] ?? null;
+      d.store.setInboxUi({ selectedJid: vecino ? vecino.jid : null });
+      // Y si el que se escondió era el chat ABIERTO, se cierra: dejarlo sería
+      // dejar el campo de redacción apuntando a algo que ya no se ve (mismo
+      // criterio que `hideLocked`).
+      const abierto = d.store.openChatJid();
+      if (abierto && d.repo.isHidden(abierto, d.store.lockedRevealed())) commands.closeChat();
+    }
+    d.store.markDirty("inbox", "convo", "search");
+    d.store.toast(
+      seEsconde
+        ? `«${nombre}» oculto · escribí el código para verlo`
+        : `«${nombre}» oculto · desaparece al esconder el candado`,
+    );
+    d.log.info("candado.manual", { accion: "ocultar" });
   },
 
   openSearch() {

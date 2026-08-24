@@ -517,6 +517,24 @@ export function App({
       return;
     }
 
+    // Esconder a mano el chat seleccionado (o devolverlo, con el candado
+    // revelado). Va acá abajo, con las teclas de la bandeja y NO arriba con las
+    // globales: opera sobre la selección, así que en la ayuda, en la búsqueda o
+    // fijando el código no tiene a qué aplicarse.
+    //
+    // POR QUÉ `^X`: de las teclas que quedaban libres es la única que no choca
+    // con nada. `^H`/`^I`/`^M` son los mismos bytes que Backspace/Tab/⏎ en una
+    // terminal legacy, `^S`/`^Q` son el control de flujo XON/XOFF de la tty y
+    // `^Z` suspende el proceso. `^X` no está entre las teclas de edición del
+    // `<input>` de OpenTUI (sus bindings con `ctrl` son a/e/f/b/w/k/u/d, las
+    // flechas, `-` y `.`; verificado en el fuente), así que el buscador de la
+    // bandeja —que está enfocado— no pierde ni un carácter. Y no esconde nada
+    // sola: la primera pulsación PREGUNTA (ver `toggleSelectedHidden`).
+    if (key.ctrl && es("x")) {
+      commands.toggleSelectedHidden();
+      return;
+    }
+
     // El buscador se lee EN VIVO y no del snapshot: éste está cacheado hasta el
     // próximo flush (D3), así que un `?` apretado dentro de los 33 ms de haber
     // tipeado vería el campo vacío y abriría la ayuda en vez de escribirse.

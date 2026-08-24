@@ -13,6 +13,10 @@
 //   kill -USR1 <pid>  ⇒ le PONE el candado al chat abierto (como el `chats.lock`
 //                       que llega por app-state mientras lo estás leyendo)
 //   kill -USR2 <pid>  ⇒ se lo saca
+//
+// Sirve igual para el ocultamiento A MANO (`^X`): con `WACOSAS_CANDADO_CODE` ya
+// hay código fijado y la tecla anda; sin la variable, la demo arranca SIN código
+// y `^X` contesta que hay que fijarlo con `^P` primero.
 const RAIZ = "/home/gon/projects/wacosas";
 
 const { openDb } = await import(`${RAIZ}/src/db/open.ts`);

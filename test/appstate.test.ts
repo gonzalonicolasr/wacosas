@@ -27,6 +27,8 @@ import {
   createAppStateSync,
   ESPERA_MANUAL_MS,
   ESPERA_TRAS_ABRIR_MS,
+  leerAviso,
+  leerAvisoSync,
   MAX_REPARACIONES,
 } from "../src/wa/appstate";
 import { loadAuth } from "../src/wa/auth";
@@ -110,7 +112,32 @@ type Opts = {
   resync?: (names: readonly WAPatchName[]) => Promise<void>;
   /** El estado local LANZA (no hay socket, por ejemplo). */
   estadoLanza?: boolean;
+  /**
+   * Colecciones que baileys vuelve a ESTACIONAR en cada resync, avisándolo por el
+   * logger tal como lo hace de verdad (`Socket/chats.js:522`). Es la simulación
+   * de "la clave sigue sin llegar": el aviso cae DENTRO del `await resync`, que
+   * es exactamente cuándo llega en producción.
+   */
+  trabadas?: WAPatchName[];
+  /**
+   * `creds.accountSyncCounter`. `undefined` = el banco NO cablea la reparación
+   * de fondo (como los tests viejos); `null` = cableada pero sin creds cargadas.
+   */
+  contador?: number | null;
+  /** La marca de `meta`: la reparación ya se intentó alguna vez. */
+  yaReparado?: boolean;
+  /** Qué contesta `resetSyncCounter` (por defecto, que pudo). */
+  resetOk?: boolean;
+  /** Borrar el estado local LANZA (no hay socket, permisos). */
+  ceroLanza?: boolean;
 };
+
+/** El aviso literal de baileys cuando estaciona una colección. */
+const parking = (col: string, v: number) =>
+  `${col} blocked on missing key from v${v}, parking after 2 attempts`;
+
+/** Las colecciones, en el orden en que las nombra `COLECCIONES`. */
+const enOrden = (ns: readonly string[]): WAPatchName[] => COLECCIONES.filter((n) => ns.includes(n));
 
 function banco(opts: Opts = {}) {
   const logPath = join(tmp, `appstate-${nBanco++}.log`);
@@ -126,15 +153,62 @@ function banco(opts: Opts = {}) {
   const estados = opts.estados ?? [REAL];
   let lecturas = 0;
 
+  /** Lo que hizo la reparación de fondo: resets pedidos, reconexiones y marcas. */
+  const fondo = { resets: 0, reconexiones: 0, marcas: 0 };
+  let reparadoEnMeta = opts.yaReparado === true;
+  // Las cinco van juntas: sin `contador` el banco arma el módulo como antes de
+  // la reparación (que es el caso de los tests viejos).
+  const deFondo =
+    opts.contador === undefined
+      ? {}
+      : {
+          syncCounter: () => opts.contador ?? null,
+          resetSyncCounter: async () => {
+            fondo.resets++;
+            return opts.resetOk !== false;
+          },
+          reconnect: () => {
+            fondo.reconexiones++;
+          },
+          yaReparado: () => reparadoEnMeta,
+          marcarReparado: () => {
+            fondo.marcas++;
+            reparadoEnMeta = true;
+          },
+        };
+
+  /** Colecciones a las que se les borró el estado local, y con qué llamadas. */
+  const ceros: WAPatchName[][] = [];
+  const borradas = new Set<string>();
+
   const app = createAppStateSync({
     log,
+    ...deFondo,
+    resetLocalState: async (names) => {
+      if (opts.ceroLanza) throw new Error("no se pudo borrar el estado local");
+      ceros.push([...names]);
+      for (const n of names) borradas.add(n);
+    },
     localState: async () => {
       if (opts.estadoLanza) throw new Error("no hay conexión con WhatsApp");
       const i = Math.min(lecturas++, estados.length - 1);
-      return estados[i]!;
+      const base = estados[i]!;
+      if (borradas.size === 0) return base;
+      // Lo que de verdad pasa después de borrar el archivo: esa colección deja
+      // de tener estado local.
+      const out = { ...base };
+      for (const n of borradas) delete out[n];
+      return out;
     },
     resync: async (names) => {
       pedidos.push([...names]);
+      for (const n of names) {
+        // Como baileys: el `warn` de la colección trabada sale DURANTE el resync.
+        if (opts.trabadas?.includes(n)) app.onAviso(parking(n, 23));
+        // Y la que NO está trabada entra: si se había pedido desde cero, el
+        // snapshot vuelve a dejarle estado local.
+        else borradas.delete(n);
+      }
       if (opts.resync) await opts.resync(names);
     },
     schedule: agenda.schedule,
@@ -148,6 +222,10 @@ function banco(opts: Opts = {}) {
     reloj,
     pedidos,
     toasts,
+    /** El mismo objeto que se pasó: se puede cambiar a mitad de un test. */
+    opts,
+    fondo,
+    ceros,
     texto: () => readFileSync(logPath, "utf8"),
     /** Abre la conexión, corre lo agendado y deja asentar las promesas. */
     async abrirYCorrer() {
@@ -167,9 +245,10 @@ test("con colecciones sin estado local pide EXACTAMENTE esas, y no las que ya es
   await b.abrirYCorrer();
 
   expect(b.pedidos).toEqual([FALTAN_REAL]);
-  // `regular_high` NO se pide sola: ya tiene estado, y encima está estacionada por
-  // una clave que sólo puede mandar el teléfono. Pedirla sería una consulta que no
-  // puede salir bien.
+  // `regular_high` NO se pide: ya tiene estado y —hasta donde este banco sabe— está
+  // al día, así que WhatsApp la mantiene sola con los `server_sync`. Lo que sí la
+  // vuelve a poner en la lista es enterarse de que quedó ESTACIONADA (los tests de
+  // más abajo), que es un dato que sólo llega por el `warn` de baileys.
   expect(b.pedidos[0]).not.toContain("regular_high");
 });
 
@@ -336,6 +415,340 @@ test("la tecla está ESPACIADA: apretarla de nuevo enseguida no le pregunta nada
   expect(b.pedidos).toHaveLength(2);
 });
 
+// ── colecciones ESTACIONADAS: el reporte que mentía ─────────────────────────
+//
+// La foto de la cuenta real: las cinco colecciones TIENEN estado local, pero dos
+// quedaron trabadas por una clave que sólo puede mandar el teléfono. Antes eso se
+// leía `resueltas=5 faltan=ninguna` y `appstate.completo` apagaba la reparación
+// para todo el proceso.
+
+/** Las cinco con estado local, como en la cuenta real después del `Ctrl-N`. */
+const TODAS_CON_ESTADO = Object.fromEntries(COLECCIONES.map((n) => [n, { version: 7 }]));
+const TRABADAS: WAPatchName[] = ["regular_high", "regular_low"];
+
+test("`leerAviso` distingue las tres frases de baileys y se hace la sorda con el resto", () => {
+  expect(leerAviso(parking("regular_high", 23))).toEqual({ name: "regular_high", estacionada: true });
+  expect(leerAviso("synced regular_low to v69")).toEqual({ name: "regular_low", estacionada: false });
+  expect(leerAviso("restored state of critical_block from snapshot to v3 with mutations")).toEqual({
+    name: "critical_block",
+    estacionada: false,
+  });
+
+  // Las otras líneas de baileys no dicen nada sobre estacionamiento. Ojo con la
+  // tercera: nombra una colección y NO es un `synced`.
+  for (const otra of [
+    "Doing app state sync",
+    "App state sync complete",
+    "regular has more patches...",
+    "resyncing regular_low from v68",
+    // ⚠️ La trampa: el PRIMER fallo por clave que falta dice casi lo mismo y NO
+    // es un estacionamiento (baileys todavía va a reintentar con snapshot,
+    // `Socket/chats.js:528`). Está en el log de la cuenta real, tres líneas
+    // arriba del `parking`.
+    "regular_high blocked on missing key from v23, retrying with snapshot",
+    "failed to sync regular from v2, giving up",
+    "Closing stale open session for new outgoing prekey bundle",
+    "",
+  ]) {
+    expect({ otra, leido: leerAviso(otra) }).toEqual({ otra, leido: null });
+  }
+  // Y un nombre inventado tampoco entra: el conjunto sólo puede tener las cinco.
+  expect(leerAviso(parking("regular_altisimo", 1))).toBe(null);
+});
+
+test("con una colección estacionada NO hay `appstate.completo` (aunque las cinco tengan estado)", async () => {
+  const b = banco({ estados: [TODAS_CON_ESTADO], trabadas: TRABADAS });
+  // Como llega de verdad: baileys lo avisó durante SU sincronización, antes de
+  // que este módulo mire nada.
+  for (const n of TRABADAS) b.app.onAviso(parking(n, 23));
+
+  await b.abrirYCorrer();
+
+  const t = b.texto();
+  // Esto es el bug: con las cinco "con estado" se daba por terminado.
+  expect(t).not.toContain("appstate.completo");
+  // Se piden justamente las trabadas: es lo único que puede destrabarlas.
+  expect(b.pedidos).toEqual([enOrden(TRABADAS)]);
+  // Y el log dice la verdad: ninguna resuelta, y con nombre y apellido.
+  expect(t).toContain("appstate.estacionada coleccion=regular_high");
+  expect(t).toContain("resueltas=0");
+  expect(t).toContain(`faltan=${enOrden(TRABADAS).join(",")}`);
+  expect(t).toContain(`estacionadas=${enOrden(TRABADAS).join(",")}`);
+});
+
+test("el reparador NO se apaga con una estacionada, pero se topea (nada de loop)", async () => {
+  const b = banco({ estados: [TODAS_CON_ESTADO], trabadas: TRABADAS });
+  for (const n of TRABADAS) b.app.onAviso(parking(n, 23));
+
+  // Ocho reconexiones. Sin el arreglo, la primera decía "completo" y no salía
+  // NINGUNA consulta; sin tope, saldrían ocho.
+  for (let i = 0; i < 8; i++) await b.abrirYCorrer();
+
+  expect(b.pedidos).toHaveLength(MAX_REPARACIONES);
+  const t = b.texto();
+  expect(t).toContain("appstate.tope_alcanzado");
+  expect(t).toContain(`estacionadas=${enOrden(TRABADAS).join(",")}`);
+  // El tope se dice CON la salida: a partir de acá la destraba el usuario.
+  expect(t).toContain("salida=Ctrl-N");
+  // Y "sin novedades" NO aplica: una estacionada que no trae nada es lo
+  // esperado, no una colección vacía de la que no vale la pena preguntar más.
+  expect(t).not.toContain("appstate.sin_novedades");
+});
+
+test("cuando la clave llega, la colección se destraba sola y ahí sí hay `completo`", async () => {
+  const b = banco({ estados: [TODAS_CON_ESTADO], trabadas: TRABADAS });
+  for (const n of TRABADAS) b.app.onAviso(parking(n, 23));
+  await b.abrirYCorrer();
+  expect(b.pedidos).toHaveLength(1);
+
+  // El teléfono mandó el `APP_STATE_SYNC_KEY_SHARE`: baileys re-sincroniza las
+  // trabadas por su cuenta (`Socket/chats.js:1115-1128`) y lo cuenta así.
+  b.app.onAviso("app state sync key arrived, re-syncing blocked collections");
+  for (const n of TRABADAS) b.app.onAviso(`synced ${n} to v${70}`);
+  // Ya no se traban: la clave está.
+  b.opts.trabadas = [];
+
+  await b.abrirYCorrer();
+  expect(b.texto()).toContain("appstate.destrabada coleccion=regular_high");
+  // Se pide UNA vez más —el estado local se había borrado para pedirlas desde
+  // cero— y ahí entran: `resueltas=2` y nada estacionado.
+  expect(b.pedidos).toHaveLength(2);
+  expect(b.texto()).toContain("resueltas=2 faltan=ninguna estacionadas=ninguna");
+
+  // Y con todo al día no sale ninguna consulta más.
+  await b.abrirYCorrer();
+  expect(b.pedidos).toHaveLength(2);
+});
+
+test("a mano, el aviso del pie no dice `sincronizada` cuando quedó algo trabado", async () => {
+  const b = banco({ estados: [TODAS_CON_ESTADO], trabadas: TRABADAS });
+  b.app.force();
+  await microtareas();
+  await microtareas();
+
+  expect(b.pedidos).toEqual([[...COLECCIONES]]);
+  expect(b.toasts.some((t) => t.includes("sin la clave"))).toBe(true);
+  expect(b.toasts.some((t) => t === "agenda sincronizada")).toBe(false);
+});
+
+test("un aviso de baileys nunca puede romper nada (lo llama el logger)", () => {
+  const b = banco();
+  // Basura, vacío y algo que no es un string: ninguno lanza ni ensucia el conjunto.
+  for (const x of ["", "cualquier cosa", null as unknown as string, 42 as unknown as string]) {
+    expect(() => b.app.onAviso(x)).not.toThrow();
+  }
+});
+
+// ── la reparación de FONDO: rehabilitar el sync completo de baileys ─────────
+//
+// La causa raíz: el `awaitingSyncTimeout` de 20 s (hardcodeado) saltó en la
+// primera conexión —899 chats tardan más en empezar a llegar— y baileys se
+// auto-incrementó `accountSyncCounter`, que es el número que apaga para siempre
+// su sincronización inicial completa. Poniéndolo en 0 y reconectando, la
+// rehace. Los tests miran las dos mitades: que se dispare con el diagnóstico
+// puesto, y que NO se dispare (ni se repita) en ningún otro caso.
+
+test("con app-state incompleto y el contador en 1, resetea y reconecta (una vez)", async () => {
+  const b = banco({ estados: [REAL, REAL], contador: 1 });
+  await b.abrirYCorrer();
+
+  expect(b.fondo.resets).toBe(1);
+  expect(b.fondo.reconexiones).toBe(1);
+  // La marca queda ANTES de tocar nada: el próximo arranque no lo repite.
+  expect(b.fondo.marcas).toBe(1);
+  // Y NO se pidió ningún resync: la reconexión se lo llevaría puesto igual.
+  expect(b.pedidos).toEqual([]);
+
+  const t = b.texto();
+  expect(t).toContain("appstate.sync_completo_reparando");
+  expect(t).toContain("contador=1");
+  expect(t).toContain("appstate.sync_completo_reconectando");
+  expect(b.toasts.some((x) => x.includes("sincronización inicial"))).toBe(true);
+});
+
+test("después de reconectar NO se vuelve a reparar: sigue el camino normal", async () => {
+  const b = banco({ estados: [REAL, REAL], contador: 1 });
+  await b.abrirYCorrer();
+  expect(b.fondo.reconexiones).toBe(1);
+
+  // La reconexión abre otra vez (es lo que hace el controlador de verdad).
+  await b.abrirYCorrer();
+  await b.abrirYCorrer();
+
+  expect(b.fondo.resets).toBe(1);
+  expect(b.fondo.reconexiones).toBe(1);
+  // Ahora sí sale el resync de siempre, con su tope.
+  expect(b.pedidos).toEqual([FALTAN_REAL]);
+});
+
+test("con todo al día NO se toca el contador (el falso positivo que hay que evitar)", async () => {
+  const todas = Object.fromEntries(COLECCIONES.map((n) => [n, { version: 7 }]));
+  const b = banco({ estados: [todas], contador: 3 });
+  await b.abrirYCorrer();
+
+  // Es el caso de la mayoría de las cuentas: el contador está en 1 porque el
+  // sync SÍ se hizo. Resetearlo ahí sería un sync completo al pedo por arranque.
+  expect(b.fondo.resets).toBe(0);
+  expect(b.fondo.marcas).toBe(0);
+  expect(b.fondo.reconexiones).toBe(0);
+  expect(b.texto()).toContain("appstate.completo");
+});
+
+test("con el contador ya en 0 no hay nada que reparar (baileys va a intentarlo solo)", async () => {
+  const b = banco({ estados: [REAL, REAL], contador: 0 });
+  await b.abrirYCorrer();
+
+  expect(b.fondo.resets).toBe(0);
+  expect(b.fondo.marcas).toBe(0);
+  // Y el camino de siempre sigue andando.
+  expect(b.pedidos).toEqual([FALTAN_REAL]);
+});
+
+test("sin creds cargadas (contador `null`) no se toca nada a ciegas", async () => {
+  const b = banco({ estados: [REAL, REAL], contador: null });
+  await b.abrirYCorrer();
+  expect(b.fondo.resets).toBe(0);
+  expect(b.fondo.marcas).toBe(0);
+});
+
+test("la marca de `meta` la frena aunque el diagnóstico dé (no se repite por arranque)", async () => {
+  const b = banco({ estados: [REAL, REAL], contador: 1, yaReparado: true });
+  await b.abrirYCorrer();
+
+  expect(b.fondo.resets).toBe(0);
+  expect(b.fondo.reconexiones).toBe(0);
+  expect(b.pedidos).toEqual([FALTAN_REAL]);
+});
+
+test("si el reset falla, queda marcado igual y NO se reconecta", async () => {
+  const b = banco({ estados: [REAL, REAL], contador: 1, resetOk: false });
+  await b.abrirYCorrer();
+
+  expect(b.fondo.resets).toBe(1);
+  // La marca va antes: un reset que no se pudo escribir no puede convertirse en
+  // un intento por arranque.
+  expect(b.fondo.marcas).toBe(1);
+  expect(b.fondo.reconexiones).toBe(0);
+  expect(b.texto()).toContain("appstate.sync_completo_no_reseteado");
+  // Y como no hubo reconexión, la reparación de siempre sigue su curso.
+  expect(b.pedidos).toEqual([FALTAN_REAL]);
+});
+
+test("la reparación tampoco corre con app-state estacionado si ya se hizo", async () => {
+  // Estacionadas + contador en 1 = el diagnóstico completo de la cuenta real.
+  const todas = Object.fromEntries(COLECCIONES.map((n) => [n, { version: 7 }]));
+  const b = banco({ estados: [todas], trabadas: TRABADAS, contador: 1 });
+  for (const n of TRABADAS) b.app.onAviso(parking(n, 23));
+
+  await b.abrirYCorrer();
+  expect(b.fondo.resets).toBe(1);
+  expect(b.pedidos).toEqual([]);
+
+  // La clave sigue sin llegar: después de la reconexión se vuelve a estacionar y
+  // ahí ya es el camino normal (con su tope), sin más reconexiones.
+  for (let i = 0; i < 5; i++) await b.abrirYCorrer();
+  expect(b.fondo.reconexiones).toBe(1);
+  expect(b.pedidos).toHaveLength(MAX_REPARACIONES);
+  expect(b.texto()).toContain("appstate.tope_alcanzado");
+});
+
+// ── pedir una estacionada DESDE CERO (la misma stanza, otra pregunta) ───────
+
+test("antes de reintentar una estacionada se borra su estado local", async () => {
+  const todas = Object.fromEntries(COLECCIONES.map((n) => [n, { version: 7 }]));
+  const b = banco({ estados: [todas], trabadas: TRABADAS });
+  for (const n of TRABADAS) b.app.onAviso(parking(n, 23));
+
+  await b.abrirYCorrer();
+
+  // Se borró el estado local de las trabadas —y de NINGUNA otra— antes de pedir.
+  expect(b.ceros).toEqual([enOrden(TRABADAS)]);
+  expect(b.texto()).toContain(`appstate.desde_cero colecciones=${enOrden(TRABADAS).join(",")}`);
+  // Y en el mismo intento se piden: no es una consulta extra, es la misma con la
+  // versión en cero (que es lo que hace que WhatsApp mande el snapshot).
+  expect(b.pedidos).toEqual([enOrden(TRABADAS)]);
+});
+
+test("el pedido desde cero es UNO por colección: si el snapshot tampoco entra, no se repite", async () => {
+  const todas = Object.fromEntries(COLECCIONES.map((n) => [n, { version: 7 }]));
+  const b = banco({ estados: [todas], trabadas: TRABADAS });
+  for (const n of TRABADAS) b.app.onAviso(parking(n, 23));
+
+  for (let i = 0; i < 5; i++) await b.abrirYCorrer();
+
+  expect(b.ceros).toHaveLength(1);
+  expect(b.pedidos).toHaveLength(MAX_REPARACIONES);
+  // ⚠️ Sin el arreglo de `pendientes`, la colección borrada + estacionada se
+  // leía como "WhatsApp no tiene nada acá" y la reparación se apagaba en la
+  // primera vuelta por el corte de "sin novedades".
+  expect(b.texto()).not.toContain("appstate.sin_novedades");
+  expect(b.texto()).toContain("appstate.tope_alcanzado");
+});
+
+test("si no se puede borrar el estado local, se pide igual (desde la versión vieja)", async () => {
+  const todas = Object.fromEntries(COLECCIONES.map((n) => [n, { version: 7 }]));
+  const b = banco({ estados: [todas], trabadas: TRABADAS, ceroLanza: true });
+  for (const n of TRABADAS) b.app.onAviso(parking(n, 23));
+
+  await b.abrirYCorrer();
+
+  expect(b.ceros).toEqual([]);
+  expect(b.texto()).toContain("appstate.desde_cero_fallido");
+  expect(b.pedidos).toEqual([enOrden(TRABADAS)]);
+});
+
+test("enterarse de que algo se trabó vuelve a agendar el chequeo (sin esperar otra conexión)", async () => {
+  // Las cinco con estado y nada trabado: el chequeo da "completo" y se apaga.
+  const todas = Object.fromEntries(COLECCIONES.map((n) => [n, { version: 7 }]));
+  const b = banco({ estados: [todas] });
+  await b.abrirYCorrer();
+  expect(b.texto()).toContain("appstate.completo");
+  expect(b.agenda.hay()).toBe(false);
+
+  // Y AHORA WhatsApp empuja un cambio y baileys estaciona la colección. Es el
+  // caso real: las tres del log de la cuenta se trabaron 10, 17 y 20 minutos
+  // después de abrir, no en los primeros 30 s.
+  b.app.onAviso(parking("regular_low", 68));
+  b.app.onAviso(parking("regular_high", 23));
+  // Un chequeo agendado, UNO solo (dos avisos no son dos chequeos).
+  expect(b.agenda.esperas()).toEqual([ESPERA_TRAS_ABRIR_MS]);
+
+  b.agenda.correr();
+  await microtareas();
+  await microtareas();
+  await microtareas();
+  expect(b.pedidos).toEqual([enOrden(["regular_high", "regular_low"])]);
+});
+
+test("`leerAvisoSync` reconoce cómo le fue a la sincronización inicial de baileys", () => {
+  expect(leerAvisoSync("First connection, awaiting history sync notification with a 20s timeout.")).toBe(
+    "esperando_historial",
+  );
+  expect(leerAvisoSync("Doing app state sync")).toBe("app_state_corriendo");
+  expect(
+    leerAvisoSync("App state sync complete, transitioning to Online state and flushing buffer"),
+  ).toBe("app_state_ok");
+  expect(leerAvisoSync("Timeout in AwaitingInitialSync, forcing state to Online and flushing buffer")).toBe(
+    "timeout_sin_historial",
+  );
+  expect(
+    leerAvisoSync("Reconnection with existing sync data, skipping history sync wait. Transitioning to Online."),
+  ).toBe("salteado_por_contador");
+  expect(leerAvisoSync("cualquier otra cosa")).toBe(null);
+});
+
+test("las fases de baileys quedan en el log (es lo que dice si la reparación sirvió)", () => {
+  const b = banco({ contador: 1 });
+  b.app.onAviso("Timeout in AwaitingInitialSync, forcing state to Online and flushing buffer");
+  b.app.onAviso("Doing app state sync");
+  b.app.onAviso("App state sync complete, transitioning to Online state and flushing buffer");
+
+  const t = b.texto();
+  expect(t).toContain("appstate.sync_baileys fase=timeout_sin_historial");
+  expect(t).toContain("appstate.sync_baileys fase=app_state_corriendo");
+  expect(t).toContain("appstate.sync_baileys fase=app_state_ok");
+});
+
 // ── el contrato con baileys ─────────────────────────────────────────────────
 
 test("baileys sigue exponiendo lo que este módulo usa (`resyncAppState` + el estado local)", async () => {
@@ -360,6 +773,37 @@ test("baileys sigue exponiendo lo que este módulo usa (`resyncAppState` + el es
   expect(COLECCIONES.every((n) => estado[n] === null)).toBe(true);
 
   await sock.end(undefined).catch(() => {});
+});
+
+test("el aviso que leemos sigue siendo el que baileys escribe (y sigue sin haber otra forma)", () => {
+  // Este módulo depende del TEXTO de un `logger.warn` de baileys, que es un
+  // acoplamiento feo pero es el único que hay: si mañana cambia la frase, el que
+  // avisa es este test y no un usuario mirando una bandeja con números.
+  const chats = readFileSync(
+    join(import.meta.dir, "..", "node_modules", "baileys", "lib", "Socket", "chats.js"),
+    "utf8",
+  );
+
+  // Las tres frases, tal cual están en el fuente (con sus interpolaciones).
+  expect(chats).toContain(
+    "blocked on missing key from v${states[name].version}, parking after ${attemptsMap[name]} attempts",
+  );
+  expect(chats).toContain("synced ${name} to v${newState.version}");
+  expect(chats).toContain("restored state of ${name} from snapshot to v${newState.version}");
+
+  // Y la razón de leer un log en vez de preguntar: `blockedCollections` es un
+  // `Set` LOCAL del closure y no sale en lo que devuelve el socket.
+  expect(chats).toContain("const blockedCollections = new Set()");
+  const devuelto = chats.slice(chats.lastIndexOf("return {"));
+  expect(devuelto).not.toContain("blockedCollections");
+
+  // Lo que arma nuestro parser tiene que matchear lo que arma esa plantilla.
+  const comoLoEscribe = (name: string, version: number, attempts: number) =>
+    `${name} blocked on missing key from v${version}, parking after ${attempts} attempts`;
+  expect(leerAviso(comoLoEscribe("regular_low", 68, 2))).toEqual({
+    name: "regular_low",
+    estacionada: true,
+  });
 });
 
 test("una colección que vuelve en `null` cuenta como faltante", async () => {

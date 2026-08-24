@@ -88,9 +88,13 @@ export function puedeAvanzar(actual: MessageStatus, nuevo: MessageStatus): boole
 }
 
 /**
- * Los dos motivos por los que un chat no se lista (§4.1, tabla `jid_flags`):
- * `blocked` = contacto bloqueado, `locked` = chat con candado (Chat Lock). Son
+ * Los dos motivos que llegan DE WHATSAPP (§4.1, tabla `jid_flags`): `blocked` =
+ * contacto bloqueado, `locked` = chat con candado (Chat Lock). Son
  * INDEPENDIENTES: sacar uno no saca el otro.
+ *
+ * El tercer motivo —el chat que el usuario escondió a mano— NO está acá: vive en
+ * `jid_hides` (`setHidden`/`isManuallyHidden`), justamente para que WhatsApp y el
+ * usuario no se pisen.
  */
 export type JidFlags = { blocked: boolean; locked: boolean };
 
@@ -155,8 +159,29 @@ export type Repo = {
   setBlocked(jid: string, blocked: boolean): void;
   /** Candado de un chat (`chats.lock`). Independiente del bloqueo. */
   setLocked(jid: string, locked: boolean): void;
+  /**
+   * El chat que el usuario escondió A MANO (`^X`), que NO es lo mismo que el
+   * candado de WhatsApp: va a `jid_hides` y ninguno de los dos pisa al otro
+   * (§4.1). Se esconde igual y se revela con el mismo código.
+   *
+   * Al desmarcar se borra también la fila de la identidad HERMANA: si no,
+   * esconder por el `@lid` y desmarcar por el número dejaría el chat escondido y
+   * la tecla parecería rota.
+   */
+  setHidden(jid: string, hidden: boolean): void;
+  /** ¿Este jid (o su hermana) está escondido a mano? Nada que ver con `chats.lock`. */
+  isManuallyHidden(jid: string): boolean;
   /** Cómo está marcado un jid. Los dos en `false` si no tiene fila. */
   jidFlags(jid: string): JidFlags;
+  /**
+   * Un valor de `meta`, o `null`. Es la tabla clave/valor donde ya vive
+   * `schema_version`: sirve para las marcas que tienen que sobrevivir al
+   * proceso y que no son de ningún chat (hoy, "la reparación del sync completo
+   * de app-state ya se intentó", ver `wa/appstate.ts`).
+   */
+  getMeta(key: string): string | null;
+  /** Escribe (o pisa) un valor de `meta`. */
+  setMeta(key: string, value: string): void;
   insertMessage(m: MappedMessage): { inserted: boolean; id: number };
   touchChatActivity(jid: string, ts: number, preview: string, fromMe: boolean): void;
   bumpUnread(jid: string, delta: number): void;
@@ -220,7 +245,7 @@ const COLS_CHAT =
 const FROM_CHAT = "FROM chats c LEFT JOIN contacts k ON k.jid = c.jid";
 const COLS_MSG = "id, chat_jid, wa_id, from_me, sender_jid, sender_name, ts, kind, body, attachment, status, error";
 
-// ── lo que NO se muestra: bloqueados y con candado (§4.1, `jid_flags`) ───────
+// ── lo que NO se muestra: bloqueados, con candado y escondidos a mano ────────
 //
 // El filtro vive ACÁ, en el repo, y no en `filtrarChats`/`coincideChat`
 // (`state/commands.ts`). Es una sola decisión que cubre las CUATRO puertas por
@@ -236,9 +261,14 @@ const COLS_MSG = "id, chat_jid, wa_id, from_me, sender_jid, sender_name, ts, kin
 // número —o al revés—. Como `linkJids` escribe las dos direcciones, alcanza con
 // UN salto: se mira la fila del propio jid y la de su hermana. Los dos joins son
 // búsquedas por PK sobre una tabla de decenas de filas.
+// Las dos últimas son los ocultamientos A MANO (`jid_hides`, §4.1): misma
+// estructura —el propio jid y su hermana— porque el usuario esconde el chat que
+// tiene a la vista y ése puede ser cualquiera de las dos identidades.
 const JOIN_OCULTOS = `LEFT JOIN jid_aliases x ON x.jid = c.jid
      LEFT JOIN jid_flags   f ON f.jid = c.jid
-     LEFT JOIN jid_flags   g ON g.jid = x.alt_jid`;
+     LEFT JOIN jid_flags   g ON g.jid = x.alt_jid
+     LEFT JOIN jid_hides   h ON h.jid = c.jid
+     LEFT JOIN jid_hides   i ON i.jid = x.alt_jid`;
 // ⚠️ El `?` es `revealLocked` (1/0): "el usuario escribió el código en el
 // buscador, mostrame también los que tienen candado". Va como PARÁMETRO y no
 // como dos sentencias distintas para que el plan de la consulta sea uno solo y
@@ -247,8 +277,15 @@ const JOIN_OCULTOS = `LEFT JOIN jid_aliases x ON x.jid = c.jid
 // El bloqueo NO se revela nunca: el código del candado es del CANDADO. Que
 // alguien esté bloqueado no es un chat escondido detrás de un código, es una
 // persona con la que el usuario decidió no hablar.
+//
+// El ocultamiento A MANO (`jid_hides`) va adentro del MISMO paréntesis que el
+// candado, y eso es la definición de la feature: un chat que el usuario escondió
+// con `^X` se comporta exactamente como uno con candado de WhatsApp —no se lista
+// y vuelve escribiendo el mismo código—. Lo único que los distingue es de dónde
+// vinieron (tablas distintas), para que ninguno pueda pisar al otro.
 const VISIBLE = `COALESCE(f.blocked, 0) = 0 AND COALESCE(g.blocked, 0) = 0
-       AND (? = 1 OR (COALESCE(f.locked, 0) = 0 AND COALESCE(g.locked, 0) = 0))`;
+       AND (? = 1 OR (COALESCE(f.locked, 0) = 0 AND COALESCE(g.locked, 0) = 0
+                      AND h.jid IS NULL AND i.jid IS NULL))`;
 
 /** El `?` de `VISIBLE`. Sin argumento, los chats con candado siguen escondidos. */
 const ver = (revealLocked: boolean | undefined): number => (revealLocked ? 1 : 0);
@@ -429,6 +466,19 @@ export function createRepo(db: Database): Repo {
   const qBarrerFlags = db.query<null, []>("DELETE FROM jid_flags WHERE blocked = 0 AND locked = 0");
   const qFlags = db.query<{ blocked: number; locked: number }, [string]>(
     "SELECT blocked, locked FROM jid_flags WHERE jid = ?",
+  );
+
+  // El ocultamiento a mano: la fila EXISTE o no existe. Nada de banderas —y por
+  // eso tampoco hace falta barrer— y, sobre todo, nada que compartir con
+  // `jid_flags`: son dos orígenes distintos (§4.1).
+  const qOcultar = db.query<null, [string]>("INSERT OR IGNORE INTO jid_hides (jid) VALUES (?)");
+  const qMostrar = db.query<null, [string]>("DELETE FROM jid_hides WHERE jid = ?");
+  const qOculto = db.query<{ jid: string }, [string]>("SELECT jid FROM jid_hides WHERE jid = ?");
+
+  const qGetMeta = db.query<{ value: string }, [string]>("SELECT value FROM meta WHERE key = ?");
+  const qSetMeta = db.query<null, [string, string]>(
+    `INSERT INTO meta (key, value) VALUES (?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
   );
 
   const qInsertMessage = db.query<{ id: number }, any>(
@@ -612,6 +662,29 @@ export function createRepo(db: Database): Repo {
       if (!locked) qBarrerFlags.run();
     },
 
+    // No toca `jid_flags` ni de casualidad: un `chats.lock` de WhatsApp y esto
+    // son dos hechos distintos sobre el mismo chat y tienen que poder convivir.
+    setHidden(jid, hidden) {
+      if (!jid) return;
+      if (hidden) {
+        qOcultar.run(jid);
+        return;
+      }
+      // Las DOS identidades: la fila pudo escribirse por el `@lid` y el usuario
+      // estar mirando el chat que vive bajo el número (o al revés). Sin esto,
+      // `^X` para desmarcar no haría volver el chat y parecería una tecla rota.
+      qMostrar.run(jid);
+      const alt = qAltJid.get(jid)?.alt_jid;
+      if (alt) qMostrar.run(alt);
+    },
+
+    isManuallyHidden(jid) {
+      if (!jid) return false;
+      if (qOculto.get(jid)) return true;
+      const alt = qAltJid.get(jid)?.alt_jid;
+      return !!alt && !!qOculto.get(alt);
+    },
+
     jidFlags(jid) {
       const f = qFlags.get(jid);
       return { blocked: f?.blocked === 1, locked: f?.locked === 1 };
@@ -624,12 +697,23 @@ export function createRepo(db: Database): Repo {
       if (!jid) return false;
       const alt = qAltJid.get(jid)?.alt_jid;
       for (const j of alt ? [jid, alt] : [jid]) {
+        // Escondido a mano: se comporta EXACTAMENTE como el candado (el mismo
+        // código lo revela), sólo que la marca la puso el usuario acá.
+        if (!revealLocked && qOculto.get(j)) return true;
         const f = qFlags.get(j);
         if (!f) continue;
         if (f.blocked === 1) return true;
         if (f.locked === 1 && !revealLocked) return true;
       }
       return false;
+    },
+
+    getMeta(key) {
+      return qGetMeta.get(key)?.value ?? null;
+    },
+
+    setMeta(key, value) {
+      qSetMeta.run(key, value);
     },
 
     // Si el chat no existe, el FK aborta: un mensaje huérfano sería invisible en
