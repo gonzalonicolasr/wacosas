@@ -76,6 +76,7 @@ const EVENTOS = [
   "contacts.update",
   "groups.upsert",
   "groups.update",
+  "lid-mapping.update",
 ] as const satisfies readonly (keyof BaileysEventMap)[];
 
 // ── logger de Baileys ───────────────────────────────────────────────────────
@@ -574,6 +575,11 @@ export function createWaController(deps: WaDeps): WaController {
       s.ev.on(
         "messaging-history.set",
         guardado("messaging-history.set", (h: BaileysEventMap["messaging-history.set"]) => {
+          // Los pares LID ↔ número van PRIMERO: son el mapeo que le da sentido a
+          // los nombres que vienen atrás. WhatsApp manda los nombres de la agenda
+          // pegados al LID y los chats bajo el número; sin esto, la bandeja
+          // muestra números (`Utils/history.js:42`).
+          ingest.push({ kind: "aliases", pairs: h?.lidPnMappings ?? [] });
           ingest.push({ kind: "chats", chats: h?.chats ?? [] });
           ingest.push({ kind: "contacts", contacts: h?.contacts ?? [] });
           ingest.push({ kind: "messages", msgs: h?.messages ?? [], source: "history" });
@@ -628,6 +634,18 @@ export function createWaController(deps: WaDeps): WaController {
         "groups.update",
         guardado("groups.update", (groups: BaileysEventMap["groups.update"]) => {
           ingest.push({ kind: "groups", groups });
+        }),
+      );
+
+      // El par LID ↔ número que baileys aprende por su cuenta: del app-state
+      // (`pnForLidChatAction`, `Utils/chat-utils.js:806`) o de un mensaje
+      // entrante (`Socket/messages-recv.js:260`). Es la misma equivalencia que
+      // trae el history sync, pero EN VIVO: un contacto que se renombra o un chat
+      // que aparece después de la sincronización inicial.
+      s.ev.on(
+        "lid-mapping.update",
+        guardado("lid-mapping.update", (par: BaileysEventMap["lid-mapping.update"]) => {
+          ingest.push({ kind: "aliases", pairs: [par] });
         }),
       );
     } catch (e) {

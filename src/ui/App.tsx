@@ -12,8 +12,6 @@
 //     snapshot está cacheado y sólo cambia de identidad en el flush coalescido
 //     (D3), que es lo que le pone techo a los renders (RNF-5).
 //
-// Lo que TODAVÍA no cuelga de acá, con su tarea: `<SearchOverlay/>` (16). El
-// hueco está marcado abajo.
 import type { KeyEvent, ScrollBoxRenderable } from "@opentui/core";
 import { useKeyboard, useTerminalDimensions } from "@opentui/react";
 import { useEffect, useRef, useState } from "react";
@@ -29,6 +27,7 @@ import { ALTO_HEADER, Header } from "./Header";
 import { ayudaScrollea, Help } from "./Help";
 import { HINTS_BANDEJA, Inbox } from "./Inbox";
 import { Login, metodoDe } from "./Login";
+import { type ApiBusqueda, HINTS_BUSQUEDA, SearchOverlay } from "./SearchOverlay";
 import { Splash } from "./Splash";
 import { MIN_COLS, MIN_ROWS, TooSmall } from "./TooSmall";
 import { BG, BORDER, ELEVATED, SURFACE, WARN } from "./theme";
@@ -40,8 +39,11 @@ import { BG, BORDER, ELEVATED, SURFACE, WARN } from "./theme";
  * `<textarea>`—, así que el handler global tiene que saber que no le tocan a él.
  * Sin esto, cada flecha escrita en el campo movería también el cursor de la
  * bandeja.
+ *
+ * `search` es la búsqueda global (CA-12.1): tapa el cuerpo entero, se lleva el
+ * foco del teclado y ni la bandeja ni la conversación se pintan mientras dura.
  */
-type Modo = "browse" | "help" | "compose";
+type Modo = "browse" | "help" | "compose" | "search";
 /** Un panel por vez cuando la terminal es angosta (§7.2). */
 type PanelMini = "inbox" | "convo";
 type Disposicion = "wide" | "compact" | "mini";
@@ -130,6 +132,10 @@ export function App({
   // tiene el buscador de la bandeja, CA-5.1), así que las teclas de scroll salen
   // de acá y llegan por la ref.
   const convoRef = useRef<ScrollBoxRenderable | null>(null);
+  // Misma historia con la búsqueda global: el teclado es UNO solo y vive acá, así
+  // que mover la selección y abrir un resultado se le piden al overlay por esta
+  // ref (§7.4.2). Lo que no se maneja acá cae en su `<input>`.
+  const busquedaRef = useRef<ApiBusqueda | null>(null);
 
   const disposicion = disposicionDe(width);
 
@@ -227,6 +233,18 @@ export function App({
     if (modo === "help") commands.setInboxQuery("");
   }, [modo]);
 
+  /**
+   * La ÚNICA salida de la búsqueda global. `restaurar` es el `Esc` de CA-12.8
+   * —la bandeja vuelve como estaba—; sin él se abrió un resultado y la bandeja
+   * se queda donde la dejó el salto (CA-12.3). En `mini` hay un panel por vez,
+   * así que abrir un resultado también trae la conversación a la vista.
+   */
+  const salirDeBusqueda = (restaurar: boolean): void => {
+    commands.closeSearch(restaurar);
+    setModo("browse");
+    if (!restaurar && disposicion === "mini") setPanelMini("convo");
+  };
+
   useKeyboard((key: KeyEvent) => {
     const n = key?.name ?? "";
     const seq = key?.sequence ?? "";
@@ -311,6 +329,33 @@ export function App({
       return;
     }
 
+    // ── búsqueda global (CA-12.*) ───────────────────────────────────────────
+    // Sólo las teclas de NAVEGACIÓN: el texto lo escribe el `<input>` del
+    // overlay, que recibe todo lo que no se maneje acá (incluido el `?`, que
+    // adentro de una búsqueda es un carácter más y no la ayuda).
+    if (modo === "search") {
+      // CA-12.8: vuelve a la bandeja con el mismo chat seleccionado y el mismo
+      // filtro que tenía antes de abrir la búsqueda.
+      if (es("escape")) {
+        salirDeBusqueda(true);
+        return;
+      }
+      // CA-12.3: abre el chat posicionado en el mensaje encontrado. Si no había
+      // nada que abrir (lista vacía), la tecla no hace nada y no se sale.
+      if (enter) {
+        busquedaRef.current?.abrir();
+        return;
+      }
+      const paginaHits = Math.max(1, filasVisibles - 2);
+      if (es("up") || (key.ctrl && es("k"))) busquedaRef.current?.mover(-1);
+      else if (es("down") || (key.ctrl && es("j")) || es("linefeed")) busquedaRef.current?.mover(1);
+      else if (es("pageup")) busquedaRef.current?.mover(-paginaHits);
+      else if (es("pagedown")) busquedaRef.current?.mover(paginaHits);
+      else if (es("home")) busquedaRef.current?.mover(-SALTO_EXTREMO);
+      else if (es("end")) busquedaRef.current?.mover(SALTO_EXTREMO);
+      return;
+    }
+
     if (modo === "help") {
       // La ayuda se traga el resto de las teclas; `Esc` y `?` la cierran (CA-19.3).
       if (es("escape") || es("?")) {
@@ -355,6 +400,27 @@ export function App({
     // resuelve CUÁL era: la vista no tiene por qué salir a buscarlo.
     if (key.ctrl && es("y")) {
       commands.retrySend();
+      return;
+    }
+
+    // CA-11.5: marcar leído el chat seleccionado SIN abrirlo. Es un
+    // `Ctrl-<letra>` y el buscador de la bandeja está enfocado, pero no hay
+    // choque: `Ctrl-L` no está en las teclas del `<input>` de OpenTUI y su
+    // `handleKeyPress` devuelve `false` para cualquier combinación con `ctrl`
+    // que no tenga binding (verificado en el fuente, `index.js:5198`).
+    if (key.ctrl && es("l")) {
+      commands.markSelectedRead();
+      return;
+    }
+
+    // CA-12.1: la búsqueda global. Es un `Ctrl-<letra>` con el buscador de la
+    // bandeja enfocado, pero `Ctrl-G` no está entre las teclas de edición del
+    // `<input>` de OpenTUI (§7.3), así que no le come nada al texto.
+    if (key.ctrl && es("g")) {
+      // El estado de la bandeja se guarda ACÁ, antes de cambiar de modo, para
+      // poder devolverlo con `Esc` (CA-12.8).
+      commands.openSearch();
+      setModo("search");
       return;
     }
 
@@ -435,10 +501,16 @@ export function App({
     ayudaScrollea({ logPath, mini: disposicion === "mini", filas: filasVisibles });
 
   // El pie es UNA línea de 80 columnas y no entra todo: con un chat abierto se
-  // cambia `^R reconectar` por las teclas de scroll, que son las que el usuario
-  // necesita AHÍ. `Ctrl-R` sigue en la ayuda y, cuando de verdad hace falta, lo
-  // nombra el banner de conexión (`MOTIVO_CONEXION_REEMPLAZADA`).
-  const cola = convo.jid ? "? ayuda · ^C salir" : "? ayuda · ^R reconectar · ^C salir";
+  // cambian `^R reconectar` y `^G buscar` por las teclas de scroll, que son las
+  // que el usuario necesita AHÍ.
+  //
+  // ⚠️ `^G buscar` (tarea 16) entró en el lugar de `^R reconectar`, no encima:
+  // sin chat abierto el pie mide 68 de los 78 que entran y sumarlo lo dejaba en
+  // 80. De los dos, `^R` es el que NO hace falta descubrir por el pie —cuando de
+  // verdad sirve lo nombra el banner de conexión
+  // (`MOTIVO_CONEXION_REEMPLAZADA`)—, mientras que una búsqueda global que no se
+  // anuncia en ningún lado no existe. Los dos siguen en la ayuda (`?`).
+  const cola = convo.jid ? "? ayuda · ^C salir" : "? ayuda · ^G buscar · ^C salir";
   // ⚠️ Con un chat abierto esta línea mide EXACTAMENTE 78 caracteres, que es lo
   // que entra a 80 columnas (RNF-1) descontando el padding. No es holgura: el
   // próximo hint que se sume tiene que sacar otro.
@@ -446,11 +518,13 @@ export function App({
   const hints =
     modo === "compose"
       ? `${HINTS_COMPOSER} · ^C salir`
-      : modo === "help"
-        ? `${scrollAyuda ? "↑↓ desplazar · " : ""}^R reconectar · Esc / ? cerrar la ayuda`
-        : !verBandeja
-          ? `↑↓ scroll · ^E escribí · Esc bandeja · ${cola}`
-          : `${HINTS_BANDEJA}${teclasChat} · ${cola}`;
+      : modo === "search"
+        ? `${HINTS_BUSQUEDA} · ^C salir`
+        : modo === "help"
+          ? `${scrollAyuda ? "↑↓ desplazar · " : ""}^R reconectar · Esc / ? cerrar la ayuda`
+          : !verBandeja
+            ? `↑↓ scroll · ^E escribí · Esc bandeja · ${cola}`
+            : `${HINTS_BANDEJA}${teclasChat} · ${cola}`;
 
   return (
     <box flexDirection="column" width="100%" height="100%" backgroundColor={BG}>
@@ -471,6 +545,17 @@ export function App({
           filas={filasVisibles}
           mini={disposicion === "mini"}
           cajaRef={ayudaRef}
+        />
+      ) : modo === "search" ? (
+        /* §7.1: el overlay REEMPLAZA el cuerpo (no se dibuja encima). La bandeja
+           y la conversación se desmontan, así que el `<input>` de la búsqueda es
+           el único con foco y al cerrarla el de la bandeja se remonta y lo
+           recupera — el mismo camino que ya hace la ayuda. */
+        <SearchOverlay
+          ancho={width - 2}
+          alto={filasVisibles}
+          apiRef={busquedaRef}
+          onAbrir={() => salirDeBusqueda(false)}
         />
       ) : (
         <box flexDirection="row" flexGrow={1}>

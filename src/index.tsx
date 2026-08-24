@@ -153,6 +153,12 @@ try {
   await new Promise<never>(() => {});
 }
 
+// `config.json` (R3: sin pantalla de ajustes, se edita a mano). Se lee acá —una
+// vez, antes de la interfaz— porque lo único que hay adentro es `readReceipts`,
+// y de eso depende si el recibo de lectura sale o no (CA-11.3).
+const { loadConfig } = await import("./boot/config");
+const config = loadConfig(paths.configPath, log);
+
 const { createRepo } = await import("./db/repo");
 const { store } = await import("./state/store");
 
@@ -225,11 +231,29 @@ if (qrPngPath) {
 }
 
 // ── máquina (después del render: baileys tarda en cargar) ────────────────────
+const { createIdentityResolver } = await import("./wa/identity");
 const { createIngest } = await import("./wa/ingest");
+const { createReadReceipts } = await import("./wa/read");
 const { createSendQueue } = await import("./wa/send");
 const { createWaController } = await import("./wa/socket");
 
 let wa: import("./wa/socket").WaController;
+// El rescate de nombres por identidad doble (LID ↔ número). Se lee por función,
+// igual que `wa`: el ingest lo necesita como hook y el resolver necesita la cola
+// del ingest, así que uno de los dos tiene que existir después del otro.
+let identity: import("./wa/identity").IdentityResolver;
+// Los recibos van PRIMERO porque el ingest los necesita como hook (§6.2). Lee el
+// socket por función, igual que la cola de envío: acá el controlador todavía no
+// existe (se necesitan mutuamente).
+const read = createReadReceipts({
+  repo,
+  log,
+  wa: {
+    isOpen: () => wa?.isOpen() ?? false,
+    socket: () => wa?.socket() ?? null,
+  },
+  enabled: config.readReceipts,
+});
 const ingest = createIngest({
   repo,
   store,
@@ -241,6 +265,22 @@ const ingest = createIngest({
   // por función, como `selfJid`: cuando esto se define el controlador todavía no
   // existe. Sin socket devuelve "" y el grupo queda como estaba.
   groupSubject: async (jid) => (await wa?.socket()?.groupMetadata(jid))?.subject ?? "",
+  // CA-11.7: los mensajes que entran al chat abierto nunca figuran sin leer, así
+  // que su recibo no sale de `markRead` — lo manda el ingest (§6.2).
+  pushReadReceipt: read.pushReadReceipt,
+  // Identidades `@lid` con nombre y sin número conocido: las resuelve
+  // `wa/identity.ts` contra el store de baileys (consulta LOCAL) y el par vuelve
+  // por la cola del ingest.
+  requestAlias: (lids) => identity?.request(lids),
+});
+identity = createIdentityResolver({
+  repo,
+  log,
+  push: ingest.push,
+  // `getPNsForLIDs` lee la caché y los archivos de `creds/`: NO manda ninguna
+  // stanza a WhatsApp (`Signal/lid-mapping.js`). Sin socket todavía, devuelve
+  // vacío y la identidad se rescata en la próxima corrida.
+  pnForLids: async (lids) => (await wa?.socket()?.signalRepository?.lidMapping?.getPNsForLIDs(lids)) ?? [],
 });
 // La cola de envío y el controlador se necesitan MUTUAMENTE (la cola le pide el
 // socket; el socket le pide el `getMessage` de §8.6), así que la cola lo lee a
@@ -264,7 +304,25 @@ wa = createWaController({
   getMessage: send.getMessage,
 });
 
-configureCommands({ repo, wa, store, log, send, shutdown });
+// El barrido de identidades arranca cuando la conexión ABRE, no antes: el store
+// de baileys vive colgado del socket. Se engancha al store —igual que `--qr-png`—
+// para no meterle otra responsabilidad al ciclo de vida de la conexión, y sólo
+// dispara en el FLANCO (de cerrado a abierto): el slice se flushea seguido y
+// barrer en cada flush sería leer la base de gusto.
+let conexionAbierta = false;
+store.subscribe("conn", () => {
+  const abierta = store.getSnapshot("conn").state === "open";
+  if (abierta === conexionAbierta) return;
+  conexionAbierta = abierta;
+  if (abierta) identity.sweep();
+});
 
-log.info("boot.listo", { version, db: paths.dbPath, ms: Math.round(performance.now()) });
+configureCommands({ repo, wa, store, log, send, read, shutdown });
+
+log.info("boot.listo", {
+  version,
+  db: paths.dbPath,
+  recibos: config.readReceipts,
+  ms: Math.round(performance.now()),
+});
 wa.start();

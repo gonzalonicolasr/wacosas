@@ -34,10 +34,19 @@ const ATAJOS: Array<[string, string]> = [
 ];
 
 const ATAJOS_BANDEJA: Array<[string, string]> = [
-  ["escribir", "filtrar por nombre o número, sin acentos"],
+  // Los dos buscadores JUNTOS en un renglón, y no sólo por el alto: son la misma
+  // pregunta a dos escalas —lo que se ve y todo lo guardado— y así se lee de una.
+  // ⚠️ `^G` no podía ser una fila propia: a 80×20 el cuerpo son 14 filas y lo
+  // esencial de la ayuda mide exactamente 14, así que un renglón más la mandaba
+  // al scroll en una terminal donde hoy entra entera.
+  ["escribir · ^G", "filtrar por nombre/número · buscar en todo el historial"],
   ["↑ ↓ · ^K ^J", "mover la selección (la rueda también)"],
   ["PgUp PgDn", "saltar de a una pantalla (Inicio / Fin, a las puntas)"],
-  ["⏎ · doble click", "abrir el chat seleccionado"],
+  // Las dos teclas van JUNTAS en un renglón (mismo criterio que las de
+  // redacción): sumar `^L` en una fila propia mandaba la ayuda a 21 líneas
+  // contra 20 de alto a 80×24, y ahí `lineasQueEntran` tira los renglones en
+  // blanco de las tres secciones para ahorrar uno solo.
+  ["⏎ · ^L", "abrir el chat (o doble click) · marcarlo leído sin abrir"],
   ["Tab", "filtrar: todos / no leídos / grupos"],
   ["Esc", "limpiar el buscador"],
 ];

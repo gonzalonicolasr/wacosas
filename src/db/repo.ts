@@ -16,6 +16,7 @@ import { parseSnippet } from "../lib/fts";
 import type {
   AttachmentInfo,
   ChatRow,
+  ContactRow,
   MappedMessage,
   MessageRow,
   MessageStatus,
@@ -91,6 +92,17 @@ export type Repo = {
   listChats(limit?: number): ChatRow[];
   countsByFilter(): Counts;
   getChat(jid: string): ChatRow | null;
+  /** Una fila de la agenda, o `null`. Se lee para prestarle el nombre a la otra identidad. */
+  getContact(jid: string): ContactRow | null;
+  /** La otra identidad del mismo humano (LID ↔ número), o `null` si no se conoce. */
+  altJid(jid: string): string | null;
+  /**
+   * Los contactos que TIENEN nombre y cuya identidad hermana todavía no
+   * conocemos: es la lista que el barrido de `wa/identity.ts` le pasa al store
+   * de baileys. Sin límite a propósito — `contacts` son cientos de filas y se
+   * consulta una vez por conexión, no por tecla.
+   */
+  contactsMissingAlias(): string[];
   /** Una fila por su id de WhatsApp: el estado para la escalera y el texto del reintento. */
   getMessageByWaId(chatJid: string, waId: string): MessageRow | null;
   lastMessages(jid: string, limit?: number): MessageRow[];
@@ -104,6 +116,8 @@ export type Repo = {
   /** `contactName` NO se acepta: es derivado del `LEFT JOIN` con la agenda. */
   upsertChat(c: Partial<Omit<ChatRow, "contactName">> & { jid: string }): void;
   upsertContact(jid: string, name: string, phone: string): void;
+  /** Anota que estos dos jids son la misma persona. Escribe las DOS direcciones. */
+  linkJids(a: string, b: string): void;
   insertMessage(m: MappedMessage): { inserted: boolean; id: number };
   touchChatActivity(jid: string, ts: number, preview: string, fromMe: boolean): void;
   bumpUnread(jid: string, delta: number): void;
@@ -234,6 +248,20 @@ export function createRepo(db: Database): Repo {
      FROM chats`,
   );
   const qGetChat = db.query<FilaChat, [string]>(`SELECT ${COLS_CHAT} ${FROM_CHAT} WHERE c.jid = ?`);
+  const qGetContact = db.query<ContactRow, [string]>(
+    "SELECT jid, name, phone FROM contacts WHERE jid = ?",
+  );
+  const qAltJid = db.query<{ alt_jid: string }, [string]>(
+    "SELECT alt_jid FROM jid_aliases WHERE jid = ?",
+  );
+  // El `LEFT JOIN … IS NULL` es "los que todavía no tienen hermana". La tabla es
+  // chica (cientos de filas) y esto se consulta una vez por conexión.
+  const qSinAlias = db.query<{ jid: string }, []>(
+    `SELECT k.jid FROM contacts k
+     LEFT JOIN jid_aliases a ON a.jid = k.jid
+     WHERE k.name <> '' AND a.jid IS NULL
+     ORDER BY k.jid`,
+  );
   // Por el índice único (chat_jid, wa_id): es una búsqueda puntual, no un scan.
   const qPorWaId = db.query<FilaMensaje, [string, string]>(
     `SELECT ${COLS_MSG} FROM messages WHERE chat_jid = ? AND wa_id = ?`,
@@ -293,6 +321,13 @@ export function createRepo(db: Database): Repo {
        name       = CASE WHEN excluded.name  <> '' THEN excluded.name  ELSE contacts.name  END,
        phone      = CASE WHEN excluded.phone <> '' THEN excluded.phone ELSE contacts.phone END,
        updated_at = unixepoch()`,
+  );
+
+  // La equivalencia se pisa si cambió: WhatsApp puede rehacer el mapeo de una
+  // identidad, y quedarnos con el viejo sería mostrar el nombre de otro.
+  const qUpsertAlias = db.query<null, [string, string]>(
+    `INSERT INTO jid_aliases (jid, alt_jid) VALUES (?, ?)
+     ON CONFLICT(jid) DO UPDATE SET alt_jid = excluded.alt_jid, updated_at = unixepoch()`,
   );
 
   const qInsertMessage = db.query<{ id: number }, any>(
@@ -356,6 +391,18 @@ export function createRepo(db: Database): Repo {
     getChat(jid) {
       const f = qGetChat.get(jid);
       return f ? aChatRow(f) : null;
+    },
+
+    getContact(jid) {
+      return qGetContact.get(jid) ?? null;
+    },
+
+    altJid(jid) {
+      return qAltJid.get(jid)?.alt_jid ?? null;
+    },
+
+    contactsMissingAlias() {
+      return qSinAlias.all().map((f) => f.jid);
     },
 
     getMessageByWaId(chatJid, waId) {
@@ -432,6 +479,13 @@ export function createRepo(db: Database): Repo {
 
     upsertContact(jid, name, phone) {
       qUpsertContact.run(jid, name, phone);
+    },
+
+    // Las dos direcciones, siempre: quien pregunta tiene un jid en la mano y no
+    // sabe si es el LID o el número.
+    linkJids(a, b) {
+      qUpsertAlias.run(a, b);
+      qUpsertAlias.run(b, a);
     },
 
     // Si el chat no existe, el FK aborta: un mensaje huérfano sería invisible en

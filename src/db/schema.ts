@@ -53,6 +53,27 @@ CREATE TABLE IF NOT EXISTS contacts (
   updated_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
+-- Las DOS identidades del mismo humano: el LID (\`…@lid\`) y el número
+-- (\`…@s.whatsapp.net\`). No es cosmético — es la razón por la que casi ningún
+-- chat mostraba nombre: WhatsApp manda los nombres de la agenda pegados al LID
+-- (\`lidContactAction\`, \`Utils/chat-utils.js:833\`) y los chats muchas veces
+-- vienen bajo el número, así que el \`LEFT JOIN contacts ON contacts.jid =
+-- chats.jid\` de \`listChats\` no encontraba nada. Medido sobre la cuenta real:
+-- 463 contactos con número, NINGUNO con nombre; los 32 nombres, todos en filas
+-- \`@lid\`.
+--
+-- Se guarda en las DOS direcciones (dos filas por par) para que buscar la
+-- hermana de un jid sea siempre un golpe a la PK.
+--
+-- Lo que esta tabla **no** hace: fusionar chats. Los mensajes siguen colgando de
+-- su \`chat_jid\` original y las dos identidades siguen siendo dos filas de
+-- \`chats\` (R7); acá sólo se comparte el NOMBRE.
+CREATE TABLE IF NOT EXISTS jid_aliases (
+  jid        TEXT PRIMARY KEY,
+  alt_jid    TEXT NOT NULL,
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
 CREATE TABLE IF NOT EXISTS messages (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   chat_jid    TEXT    NOT NULL REFERENCES chats(jid) ON DELETE CASCADE,
@@ -99,12 +120,16 @@ END;
 export type Migracion = { v: number; sql: string };
 
 /**
- * Vacío en la v1. Cuando haga falta cambiar el esquema se agrega
- * `{ v: 2, sql: "ALTER TABLE …" }` y se sube `CURRENT_VERSION`.
+ * Sigue vacío. La v2 agregó la tabla `jid_aliases` y **no necesita migración**:
+ * es un `CREATE TABLE IF NOT EXISTS` más, y `migrate()` corre el `SCHEMA_SQL`
+ * entero en cada arranque, así que la base de la v1 la crea sola al abrirla.
+ * Lo que sí necesitaría una entrada acá es un `ALTER TABLE` sobre una tabla que
+ * ya existe (renombrar o tipar distinto una columna).
  */
 export const MIGRATIONS: Migracion[] = [];
 
-export const CURRENT_VERSION = 1;
+/** v2: `jid_aliases` (equivalencia LID ↔ número). Ver el DDL más arriba. */
+export const CURRENT_VERSION = 2;
 
 /** Lee `meta.schema_version`; si no está todavía, la base es nueva ⇒ 0. */
 function versionGuardada(db: Database): number {

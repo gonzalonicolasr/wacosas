@@ -18,7 +18,7 @@
 //   · **NADA toca la cuenta real de WhatsApp**: no hay socket de verdad en todo
 //     el archivo.
 import { beforeEach, describe, expect, test } from "bun:test";
-import { proto } from "baileys";
+import { ACCOUNT_RESTRICTED_TEXT, proto } from "baileys";
 import type { WAMessageUpdate } from "baileys";
 
 import type { Logger } from "../src/boot/log";
@@ -27,7 +27,7 @@ import { createRepo, ORDEN_ESTADO, puedeAvanzar, type Repo } from "../src/db/rep
 import { SEND_MAX_ATTEMPTS } from "../src/lib/backoff";
 import { MAX_PER_WINDOW, MIN_GAP_MS } from "../src/lib/ratelimit";
 import { createStore, type Store } from "../src/state/store";
-import { createIngest } from "../src/wa/ingest";
+import { createIngest, MOTIVO_ACK_RECHAZO, MOTIVO_ACK_RESTRINGIDA } from "../src/wa/ingest";
 import {
   AVISO_EN_COLA,
   createSendQueue,
@@ -619,9 +619,9 @@ describe("el estado de entrega no retrocede", () => {
     });
   }
 
-  const ackDe = (status: number): WAMessageUpdate => ({
+  const ackDe = (status: number, stub?: string[]): WAMessageUpdate => ({
     key: { remoteJid: ANTO, id: WA, fromMe: true },
-    update: { status },
+    update: { status, ...(stub ? { messageStubParameters: stub } : {}) },
   });
 
   test("el ERROR ack baja un `sent` a `failed` y lo deja al alcance de Ctrl-Y", () => {
@@ -630,7 +630,7 @@ describe("el estado de entrega no retrocede", () => {
     repo.setMessageStatus(ANTO, WA, "sent", null);
     expect(estado()).toBe("sent");
 
-    ingest.push({ kind: "msg-updates", updates: [ackDe(proto.WebMessageInfo.Status.ERROR)] });
+    ingest.push({ kind: "msg-updates", updates: [ackDe(proto.WebMessageInfo.Status.ERROR, ["403"])] });
     ingest.drainNow();
 
     expect(estado()).toBe("failed");
@@ -638,10 +638,37 @@ describe("el estado de entrega no retrocede", () => {
     // del chat (`commands.retrySend`). Antes devolvía "no hay ningún envío
     // fallado en este chat" sobre un mensaje que WhatsApp había rechazado.
     expect(repo.openSends().map((m) => m.waId)).toEqual([WA]);
-    // ⚠️ El MOTIVO todavía llega vacío: el update trae el código en
-    // `messageStubParameters` (`[attrs.error]`) y la rama `msg-updates` de
-    // `wa/ingest.ts` no lo pasa a `setMessageStatus`. Es una línea en ingest.ts,
-    // que es de la tarea 15: queda anotado como pendiente, no se toca acá.
+    // Y con el MOTIVO adelante (tarea 15): el código viene en
+    // `messageStubParameters` (`[attrs.error]`) y `ui/MessageRow.tsx` lo pinta
+    // al lado del `✗`. Sin esto el usuario veía la cruz sin ninguna explicación.
+    expect(repo.getMessageByWaId(ANTO, WA)?.error).toBe(`${MOTIVO_ACK_RECHAZO} (403)`);
+  });
+
+  test("un rechazo por cuenta restringida se explica distinto", () => {
+    const ingest = ingestReal();
+    repo.setMessageStatus(ANTO, WA, "sent", null);
+    // El otro formato que emite baileys (`Socket/messages-recv.js:1563`): el
+    // código + el texto de la restricción. Cambia qué hacer —reintentar con
+    // `Ctrl-Y` no destraba una cuenta limitada—, así que se dice distinto.
+    ingest.push({
+      kind: "msg-updates",
+      updates: [ackDe(proto.WebMessageInfo.Status.ERROR, ["479", ACCOUNT_RESTRICTED_TEXT])],
+    });
+    ingest.drainNow();
+
+    expect(repo.getMessageByWaId(ANTO, WA)?.error).toBe(`${MOTIVO_ACK_RESTRINGIDA} (479)`);
+  });
+
+  test("un ack que AVANZA limpia el motivo del intento anterior", () => {
+    const ingest = ingestReal();
+    repo.setMessageStatus(ANTO, WA, "failed", "algo viejo");
+    // `Ctrl-Y` lo vuelve a mandar y esta vez sale: la fila no puede quedarse con
+    // el texto del fallo anterior colgando.
+    repo.setMessageStatus(ANTO, WA, "pending", null);
+    ingest.push({ kind: "msg-updates", updates: [ackDe(proto.WebMessageInfo.Status.DELIVERY_ACK)] });
+    ingest.drainNow();
+
+    expect(estado()).toBe("delivered");
     expect(repo.getMessageByWaId(ANTO, WA)?.error).toBe(null);
   });
 

@@ -411,7 +411,7 @@
     llega después del "leído" de otro y bajaría el estado.
   - depends-on: 13
 
-- [ ] 15. Implementar marcar como leído, recibos de lectura y contadores
+- [x] 15. Implementar marcar como leído, recibos de lectura y contadores
   - covers: CA-10.1, CA-11.1, CA-11.2, CA-11.3, CA-11.4, CA-11.5, CA-11.6, CA-11.7, CA-14.3
   - files: `src/wa/read.ts`, `src/state/commands.ts` (`markRead`), `src/wa/ingest.ts` (rama
     `chat-updates` → `setUnread`), `test/read.test.ts`
@@ -476,6 +476,15 @@
   - depends-on: 13
 
 - [ ] 17. Implementar instancia única y cierre ordenado
+  - ⚠️ **tres cabos sueltos de la revisión de la 15** (chicos, ninguno bloquea): (a) el comentario
+    de `read.ts:36-40` explica mal el cap — 200 claves en un 1:1 son **una sola stanza**
+    (`aggregateMessageKeysNotFromMe` agrupa por `remoteJid:participant`), el cap sirve para grupos y
+    para el tamaño del nodo, no para evitar una ráfaga; (b) **`pushReadReceipt` no tiene cap**: 400
+    mensajes de una al chat abierto salieron enteros, asimetría sin justificar contra `markRead`;
+    (c) documentar en `commands.ts:378` que la guarda `unreadCount > 0` **pospone** la ráfaga y deja
+    sin recibo el caso "sync de historial con el chat abierto". El arreglo de fondo de (c) sería que
+    `aplicarChat`, al forzar 0 en el chat abierto, use `clearUnread(jid, ultimoId)` en vez de
+    `upsertChat({unreadCount:0})`, así `unread_count` y `last_read_id` dejan de contradecirse.
   - ✅ **cerrado por la revisión de la tarea 14 — el foco que se robaba el mouse**: el renderer se
     creaba con `autoFocus` (default `true`), así que un click izquierdo enfocaba el primer ancestro
     focusable; el `<scrollbox>` de la conversación **es** focusable ⇒ clickear la conversación le
@@ -583,6 +592,13 @@
       columna menos de las que se dibujan** (`dibujo = layout + 1`): un texto que se pasa por un
       carácter se mide en dos filas y se pinta en una ⇒ **fila en blanco fantasma** + el último
       carácter encima de la barra. El padding NO lo arregla; fijarle el ancho a la fila sí.
+    · **§5.4 (design.md:282) dice que `read.ts` hace "markRead local + recibos"** — hace **sólo** el
+      recibo; el `clearUnread` local quedó en `commands.markRead`. §8.5 tampoco refleja el cap de
+      claves ni la guarda de `unreadCount > 0`.
+    · **Gotcha nuevo para §7.4**: un agendador que ejecute **en el acto** rompe el store —
+      `flush()` limpia `cancelarFlush` y el `markDirty` que lo llamó se lo reescribe después,
+      dejándolo colgado y **matando todos los flush siguientes** (medido: 1 notify en vez de 5).
+      En tests, agendador manual.
     · **El prior art de `wa-worker` está mal y conviene dejarlo escrito**: `fetchLatestBaileysVersion`
       **nunca rechaza** — atrapa todo y devuelve la versión bundleada con un `error` adentro, y
       descarta el `signal`. Un `try/catch` alrededor es código muerto. Hay que mirar `r.error`.

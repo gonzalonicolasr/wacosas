@@ -29,10 +29,12 @@
 //     también, y el peor tick de esa misma prueba bajó a **9,6 ms**. `400` sigue
 //     siendo el techo de filas; el tiempo es el otro techo.
 import {
+  ACCOUNT_RESTRICTED_TEXT,
   getContentType,
   isJidGroup,
   isJidNewsletter,
   isJidStatusBroadcast,
+  isLidUser,
   jidDecode,
   jidNormalizedUser,
   normalizeMessageContent,
@@ -44,6 +46,7 @@ import type {
   ChatUpdate,
   Contact,
   GroupMetadata,
+  LIDMapping,
   MessageUserReceiptUpdate,
   WAMessage,
   WAMessageUpdate,
@@ -56,6 +59,7 @@ import { oneLine } from "../lib/fmt";
 import type { Cancelar, Store } from "../state/store";
 
 import { isRevoke, mapMessage, previewFor, resolveChatName, type MapCtx } from "./map";
+import type { ReadTarget } from "./read";
 
 /** Techo de filas por vuelta del drenador (design §5.7, D4). */
 export const MAX_ROWS_PER_TICK = 400;
@@ -97,7 +101,14 @@ export type IngestJob =
    * demanda. Lo único que se aprovecha hoy es el **subject**: es el nombre del
    * grupo, y sin él la bandeja muestra "grupo sin nombre" (CA-4.8).
    */
-  | { kind: "groups"; groups: Partial<GroupMetadata>[] };
+  | { kind: "groups"; groups: Partial<GroupMetadata>[] }
+  /**
+   * Pares LID ↔ número: las dos caras del mismo humano. Llegan por
+   * `messaging-history.set` (`lidPnMappings`), por `lid-mapping.update` y por la
+   * respuesta del store de baileys que pide `wa/identity.ts`. No fusionan nada:
+   * sólo dejan que el nombre de la agenda se vea desde las dos identidades.
+   */
+  | { kind: "aliases"; pairs: LIDMapping[] };
 
 export type Ingest = {
   /** Encola. O(1), nunca async, nunca lanza. */
@@ -128,6 +139,33 @@ export type IngestDeps = {
    * lanzar hacia adentro del drenador.
    */
   groupSubject?(jid: string): Promise<string>;
+  /**
+   * Recibo de lectura de los mensajes que acaban de entrar al chat ABIERTO
+   * (`pushReadReceipt` de §6.2). Opcional: sin ella el chat se marca leído en
+   * local igual, sólo que el otro lado no ve el tilde azul.
+   *
+   * Mismo contrato que `groupSubject`: es RED, así que se llama **fuera** de la
+   * transacción y **una sola vez por vuelta** con todas las claves juntas —una
+   * llamada por mensaje sería una ráfaga de stanzas en el sync inicial, justo el
+   * ritmo que evita R8—.
+   */
+  pushReadReceipt?(chatJid: string, msgs: ReadTarget[]): void;
+  /**
+   * Identidades `@lid` que TIENEN nombre en la agenda y cuya hermana
+   * `@s.whatsapp.net` todavía no conocemos (`wa/identity.ts` la resuelve contra
+   * el store de baileys y devuelve el par por esta misma cola). Opcional: sin
+   * ella el ingest funciona igual, sólo que sin el rescate a demanda.
+   *
+   * Mismo contrato que `groupSubject`: se llama **fuera** de la transacción,
+   * **una sola vez por identidad** y **nunca** puede lanzar hacia adentro del
+   * drenador. Va con todas las identidades de la vuelta juntas —una llamada por
+   * contacto sería una ráfaga durante el sync inicial—.
+   *
+   * Sólo se reportan `@lid`: la vuelta contraria (número → LID) es una consulta
+   * USync a WhatsApp (`Signal/lid-mapping.js`, `pnToLIDFunc`) y no sirve para
+   * nada acá, porque los nombres de la agenda viven del lado del LID.
+   */
+  requestAlias?(lids: string[]): void;
   /** Reloj en ms. Default `Date.now` (mismo criterio que `state/store.ts`). */
   now?: () => number;
   /** Agendador del drenador. Default `setTimeout`; el test le pasa uno manual. */
@@ -172,6 +210,8 @@ function itemsDe(job: IngestJob): readonly unknown[] {
       return lista(job.receipts);
     case "groups":
       return lista(job.groups);
+    case "aliases":
+      return lista(job.pairs);
     default:
       return [];
   }
@@ -214,6 +254,35 @@ const ESTADO_POR_ACK: Record<number, MessageStatus> = {
 function estadoDe(v: unknown): MessageStatus | null {
   const n = typeof v === "number" ? v : Number.NaN;
   return Number.isFinite(n) && Object.hasOwn(ESTADO_POR_ACK, n) ? ESTADO_POR_ACK[n]! : null;
+}
+
+/** Lo que el usuario lee al lado del `✗` cuando WhatsApp rechazó el mensaje. */
+export const MOTIVO_ACK_RECHAZO = "WhatsApp rechazó el mensaje";
+export const MOTIVO_ACK_RESTRINGIDA = "cuenta restringida por WhatsApp";
+
+/**
+ * El motivo del ERROR ack, sacado de `messageStubParameters`.
+ *
+ * Baileys emite el rechazo como `messages.update` con `status: ERROR` y
+ * `messageStubParameters: [attrs.error]` —o `[attrs.error, ACCOUNT_RESTRICTED_TEXT]`
+ * cuando la cuenta quedó limitada— desde un solo lugar
+ * (`Socket/messages-recv.js:1563`). Sin esto la fila queda con `error = null` y
+ * el usuario ve el `✗` sin ninguna explicación: sabe que no salió, no sabe si
+ * fue un 403, un 479 o que WhatsApp le limitó la cuenta (lo segundo cambia qué
+ * hacer: reintentar con `Ctrl-Y` no arregla una restricción).
+ *
+ * El texto sale corto a propósito: `ui/MessageRow.tsx` lo recorta a 40.
+ */
+export function motivoAckError(params: unknown): string {
+  const partes = lista(params as unknown[])
+    .map((p) => oneLine(texto(p)))
+    .filter((p) => p !== "");
+  const restringida = partes.some((p) => p.includes(ACCOUNT_RESTRICTED_TEXT));
+  const base = restringida ? MOTIVO_ACK_RESTRINGIDA : MOTIVO_ACK_RECHAZO;
+  // El primero es el código (`403`, `479`); si el que vino es el texto de la
+  // restricción, no hay código que mostrar y el motivo va pelado.
+  const codigo = partes[0] && partes[0] !== ACCOUNT_RESTRICTED_TEXT ? partes[0] : "";
+  return codigo ? `${base} (${codigo})` : base;
 }
 
 /**
@@ -265,6 +334,8 @@ export function createIngest(deps: IngestDeps): Ingest {
   const ahora = deps.now ?? Date.now;
   const agendar = deps.schedule ?? agendarReal;
   const pedirSubjectRemoto = deps.groupSubject;
+  const mandarRecibo = deps.pushReadReceipt;
+  const pedirHermanaRemota = deps.requestAlias;
 
   /** Trabajos, consumidos por índice: `shift()` sería O(n) por trabajo. */
   let cola: Entrada[] = [];
@@ -300,6 +371,26 @@ export function createIngest(deps: IngestDeps): Ingest {
   /** Grupos a preguntar cuando cierre la transacción de la vuelta en curso. */
   let subjectsPendientes: string[] = [];
 
+  /**
+   * Pares LID ↔ número ya escritos en esta sesión. La equivalencia no cambia, y
+   * sin esta memoria un chat con 5.000 mensajes haría 5.000 escrituras idénticas
+   * (cada sobre trae `remoteJidAlt`).
+   */
+  const paresVistos = new Set<string>();
+  /** Identidades ya reportadas a `requestAlias`: se pregunta UNA vez por sesión. */
+  const hermanasPedidas = new Set<string>();
+  /** Identidades a reportar cuando cierre la transacción de la vuelta en curso. */
+  let hermanasPendientes: string[] = [];
+
+  /**
+   * Mensajes del chat ABIERTO que entraron en esta vuelta y todavía no tienen
+   * recibo (§6.2). Como el chat abierto sólo lo cambia la interfaz —y la
+   * interfaz no puede correr en el medio de una vuelta, que es sincrónica de
+   * punta a punta—, todos los de una misma vuelta son del mismo chat.
+   */
+  let recibosPendientes: ReadTarget[] = [];
+  let recibosChat: string | null = null;
+
   // Slices a marcar sucios. Se juntan durante la vuelta y se avisan UNA vez, ya
   // cerrada la transacción: el store coalesce igual (D3), pero así el flush
   // nunca puede leer la base a mitad de un chunk.
@@ -313,6 +404,123 @@ export function createIngest(deps: IngestDeps): Ingest {
   function marcar(chatJid: string, convo: boolean): void {
     sucioInbox = true;
     if (convo && chatJid === openChatJid()) sucioConvo = true;
+  }
+
+  // ── identidad doble: LID ↔ número ────────────────────────────────────────
+  //
+  // WhatsApp está migrando a un identificador que no es el teléfono (el LID) y
+  // manda los nombres de la AGENDA pegados a él (`lidContactAction`,
+  // `Utils/chat-utils.js:833`), mientras que el CHAT viene muchas veces bajo el
+  // número. Como `listChats` resuelve el nombre con
+  // `LEFT JOIN contacts ON contacts.jid = chats.jid`, ese chat no encontraba
+  // nunca su nombre y la bandeja mostraba el número.
+  //
+  // Se arregla acá, en el ingest, y no al pintar la fila: resolverlo al leer
+  // costaría una consulta por fila y por frame, y el pedido al store de baileys
+  // es asíncrono (el render no puede esperar). Todo lo que sigue corre DENTRO de
+  // la transacción salvo `pedirHermanas()`.
+
+  /** Los dos jids normalizados de un par, o `null` si el par no tiene sentido. */
+  function parNormalizado(unJid: string, otroJid: string): [string, string] | null {
+    const a = jidNormalizedUser(unJid || undefined);
+    const b = jidNormalizedUser(otroJid || undefined);
+    if (!a || !b || a === b) return null;
+    // Un grupo no tiene identidad hermana, y un par tiene que ser entre
+    // identidades de DISTINTO tipo (lid ↔ número): dos números o dos lids es
+    // basura que llegó de afuera.
+    if (isJidGroup(a) || isJidGroup(b)) return null;
+    if (!!isLidUser(a) === !!isLidUser(b)) return null;
+    return [a, b];
+  }
+
+  /**
+   * Anota que dos jids son la misma persona. Devuelve `true` sólo la PRIMERA
+   * vez que se ve el par: el llamador aprovecha eso para no repetir el trabajo
+   * de propagar el nombre en cada mensaje.
+   */
+  function vincular(unJid: string, otroJid: string): boolean {
+    const par = parNormalizado(unJid, otroJid);
+    if (!par) return false;
+    const clave = par[0] < par[1] ? `${par[0]}|${par[1]}` : `${par[1]}|${par[0]}`;
+    if (paresVistos.has(clave)) return false;
+    paresVistos.add(clave);
+    repo.linkJids(par[0], par[1]);
+    return true;
+  }
+
+  /**
+   * El nombre de la agenda también se copia a `chats.name` —además de quedar en
+   * `contacts`— porque hay una pantalla que lee esa columna a pelo, sin el JOIN:
+   * los resultados de la búsqueda global (`repo.searchMessages`).
+   *
+   * Sólo si el chat EXISTE (upsertear crearía un chat por cada contacto de la
+   * agenda, que es justo lo que §5.1 prohíbe) y sólo si todavía no tiene nombre
+   * propio: un subject o un `pushName` que ya está no se pisa.
+   */
+  function ponerNombreEnChat(jid: string, nombre: string): boolean {
+    if (!nombre) return false;
+    const chat = repo.getChat(jid);
+    if (!chat || chat.name) return false;
+    repo.upsertChat({ jid, name: nombre });
+    return true;
+  }
+
+  /**
+   * Le presta el nombre de la agenda a la identidad que no lo tiene. Nunca al
+   * revés y nunca pisando: si las dos ya tienen nombre, cada una se queda con el
+   * suyo (el de la otra puede ser de otra época o de otra fuente).
+   */
+  function propagarNombre(a: string, b: string): boolean {
+    const nombreA = oneLine(texto(repo.getContact(a)?.name));
+    const nombreB = oneLine(texto(repo.getContact(b)?.name));
+    if (nombreA === nombreB) return false; // los dos igual, o los dos vacíos
+    if (nombreA && nombreB) return false; // cada uno con el suyo: no se toca
+    const nombre = nombreA || nombreB;
+    const destino = nombreA ? b : a;
+    repo.upsertContact(destino, nombre, "");
+    // Los DOS lados: el que recibió el nombre y el que ya lo tenía (su chat
+    // puede seguir con `chats.name` vacío, y de ahí sale el título de un hit de
+    // la búsqueda global).
+    ponerNombreEnChat(a, nombre);
+    ponerNombreEnChat(b, nombre);
+    return true;
+  }
+
+  /**
+   * Propaga usando la hermana que ya esté anotada en la base. `pedirSiFalta`
+   * sólo lo pone `aplicarContacto`: es el único que sabe si hay un nombre que
+   * valga la pena rescatar.
+   */
+  function propagarDe(jid: string, pedirSiFalta = false): void {
+    const hermana = repo.altJid(jid);
+    if (!hermana) {
+      if (pedirSiFalta) anotarSinHermana(jid);
+      return;
+    }
+    if (propagarNombre(jid, hermana)) sucioInbox = true;
+  }
+
+  /**
+   * Anota una identidad `@lid` con nombre y sin hermana conocida. Corre DENTRO
+   * de la transacción (sólo empuja a una lista); el pedido sale en
+   * `pedirHermanas()`, ya cerrado el chunk.
+   *
+   * El `Set` se marca acá y no cuando vuelve la respuesta: así se pregunta una
+   * sola vez aunque el contacto llegue diez veces, y también si el store no
+   * tenía nada.
+   */
+  function anotarSinHermana(jid: string): void {
+    if (!pedirHermanaRemota || hermanasPedidas.has(jid) || !isLidUser(jid)) return;
+    hermanasPedidas.add(jid);
+    hermanasPendientes.push(jid);
+  }
+
+  /** `aliases`: el par que resolvió el store de baileys, el history o el app-state. */
+  function aplicarAlias(par: LIDMapping): void {
+    const p = parNormalizado(texto(par?.lid), texto(par?.pn));
+    if (!p) return;
+    vincular(p[0], p[1]);
+    if (propagarNombre(p[0], p[1])) sucioInbox = true;
   }
 
   /** Borrado por su autor (CA-6.9): NO inserta, ACTUALIZA el mensaje original. */
@@ -362,6 +570,15 @@ export function createIngest(deps: IngestDeps): Ingest {
     // preguntarlo al cerrar la transacción.
     anotarGrupoSinNombre(fila.chatJid);
 
+    // `key.remoteJidAlt` es la OTRA identidad del mismo chat 1:1, y viene en el
+    // sobre (`Utils/decode-wa-message.js:180`): la fuente de mapeo más barata que
+    // hay —sincrónica, sin red y sin base—. Sólo se propaga la PRIMERA vez que
+    // se ve el par; el nombre que llegue después lo reparte `aplicarContacto`.
+    // El `if` de afuera es por el camino caliente: la mayoría de los sobres no
+    // trae identidad alternativa y no hay por qué normalizar dos jids de gusto.
+    const hermana = texto(m?.key?.remoteJidAlt);
+    if (hermana && vincular(fila.chatJid, hermana)) propagarDe(fila.chatJid);
+
     const { inserted, id } = repo.insertMessage(fila);
     // Ya estaba: re-sync o eco de un envío propio. NO se vuelve a tocar la
     // actividad ni los contadores (CA-14.2, CA-14.4).
@@ -372,8 +589,17 @@ export function createIngest(deps: IngestDeps): Ingest {
     if (!fila.fromMe && source !== "history") {
       // Con el chat abierto el contador se mantiene en 0 y el `last_read_id`
       // avanza: nunca hay un bump que después haya que deshacer (CA-11.7).
-      if (fila.chatJid === openChatJid()) repo.clearUnread(fila.chatJid, id);
-      else repo.bumpUnread(fila.chatJid, 1);
+      if (fila.chatJid === openChatJid()) {
+        repo.clearUnread(fila.chatJid, id);
+        // Y como nunca figuró sin leer, `markRead` no tiene de dónde sacarlo
+        // después: el recibo de ESTE mensaje se anota acá y sale al cerrar la
+        // transacción (§6.2). Sólo `notify`/`append`, nunca el historial: un
+        // recibo por un mensaje viejo le mentiría al otro sobre cuándo lo leíste.
+        if (mandarRecibo) {
+          recibosChat = fila.chatJid;
+          recibosPendientes.push({ waId: fila.waId, senderJid: fila.senderJid });
+        }
+      } else repo.bumpUnread(fila.chatJid, 1);
     }
 
     marcar(fila.chatJid, true);
@@ -388,7 +614,12 @@ export function createIngest(deps: IngestDeps): Ingest {
     // chat. Vacío NO se manda: el upsert pisaría un nombre bueno con nada.
     const nombre = oneLine(texto(c?.name));
     const ts = segundos(c?.conversationTimestamp);
-    const noLeidos = cuenta(c?.unreadCount);
+    // CA-11.7: el chat que se está MIRANDO se queda en 0. El contador del sync
+    // de historial es el del servidor, que no sabe que lo tenés abierto: sin
+    // esta línea, estar parado en un chat mientras entra el sync te lo dejaba
+    // con 7 sin leer (reproducido). Vale para el `0` también, así que se fuerza
+    // en vez de mirar lo que vino.
+    const noLeidos = jid === openChatJid() ? 0 : cuenta(c?.unreadCount);
 
     repo.upsertChat({
       jid,
@@ -400,6 +631,14 @@ export function createIngest(deps: IngestDeps): Ingest {
       ...(noLeidos !== null ? { unreadCount: noLeidos } : {}),
     });
     sucioInbox = true;
+
+    // La conversación del history sync trae las dos identidades al lado
+    // (`Utils/history.js:67`): gratis, sin red. Las dos llamadas se evalúan
+    // siempre —nada de `||` con corto circuito—: una conversación puede traer
+    // las dos y perder una sería perder el mapeo.
+    const porLid = vincular(jid, texto(c?.lidJid));
+    const porPn = vincular(jid, texto(c?.pnJid));
+    if (porLid || porPn) propagarDe(jid);
   }
 
   /**
@@ -431,14 +670,29 @@ export function createIngest(deps: IngestDeps): Ingest {
     const tel = texto(c?.phoneNumber) || texto(jidDecode(jid)?.user);
     if (!nombre && !tel) return;
     repo.upsertContact(jid, nombre, tel);
+
+    // La ficha suele traer LAS DOS identidades adentro (`lid` y `phoneNumber`
+    // son jids enteros, `Utils/sync-action-utils.js:18`): otro mapeo gratis. Se
+    // prueban las dos porque una de ellas es el propio `id` del contacto.
+    vincular(jid, texto(c?.lid));
+    vincular(jid, texto(c?.phoneNumber));
+
+    // Y acá SIEMPRE se propaga, aunque el par ya estuviera anotado: este evento
+    // es justo el que puede traer un nombre que antes no existía.
+    if (nombre && ponerNombreEnChat(jid, nombre)) sucioInbox = true;
+    propagarDe(jid, nombre !== "");
   }
 
   /**
    * `chats.update`. Se aplica SÓLO el "quedó en cero" (CA-11.6, otro dispositivo
    * marcó leído): un `unreadCount` POSITIVO acá es un DELTA, no un absoluto
-   * (`Utils/process-message.js:196` emite `unreadCount: 1` por mensaje), y
-   * tomarlo como absoluto pisaría el contador real. El resto de este evento lo
-   * cablea la tarea 15.
+   * (`Utils/process-message.js:196` emite `unreadCount: 1` por mensaje, y
+   * `Utils/event-buffer.js:613` los SUMA al mergear), y tomarlo como absoluto
+   * pisaría el contador real.
+   *
+   * Y no se manda ningún recibo de vuelta: si el chat quedó leído es porque otro
+   * dispositivo de la cuenta ya lo acusó (CA-11.6). El contador ABSOLUTO del
+   * servidor no llega por acá sino por `chats.upsert` (`aplicarChat`).
    */
   function aplicarChatUpdate(u: ChatUpdate): void {
     const jid = jidNormalizedUser(u?.id ?? undefined);
@@ -467,7 +721,15 @@ export function createIngest(deps: IngestDeps): Ingest {
     const waId = texto(u.key.id);
     if (!chatJid || !waId) return;
 
-    repo.setMessageStatus(chatJid, waId, estado);
+    // El MOTIVO sólo viaja en el rechazo: en cualquier otro estado el cuarto
+    // argumento va `null` y limpia el error de un intento anterior (un `Ctrl-Y`
+    // que salió bien no puede quedar con el texto del que falló).
+    repo.setMessageStatus(
+      chatJid,
+      waId,
+      estado,
+      estado === "failed" ? motivoAckError(u.update?.messageStubParameters) : null,
+    );
     if (chatJid === openChatJid()) sucioConvo = true;
   }
 
@@ -505,6 +767,8 @@ export function createIngest(deps: IngestDeps): Ingest {
         return aplicarRecibo(item as MessageUserReceiptUpdate);
       case "groups":
         return aplicarGrupo(item as Partial<GroupMetadata>);
+      case "aliases":
+        return aplicarAlias(item as LIDMapping);
     }
   }
 
@@ -543,6 +807,43 @@ export function createIngest(deps: IngestDeps): Ingest {
     const jids = subjectsPendientes;
     subjectsPendientes = [];
     for (const jid of jids) pedirSubject(jid);
+  }
+
+  /**
+   * Dispara el recibo de lectura anotado en la vuelta. **Fuera** de la
+   * transacción, sin `await` y con la lista vaciada ANTES de llamar: si el hook
+   * lanzara (no debería: `wa/read.ts` atrapa todo), el próximo chunk no tiene
+   * que reintentar un recibo que ya se pidió.
+   */
+  function mandarRecibos(): void {
+    const msgs = recibosPendientes;
+    const chat = recibosChat;
+    recibosPendientes = [];
+    recibosChat = null;
+    if (!mandarRecibo || !chat || msgs.length === 0) return;
+    try {
+      mandarRecibo(chat, msgs);
+    } catch (e) {
+      log.warn("ingest.recibo_fallido", { motivo: motivo(e) });
+    }
+  }
+
+  /**
+   * Reporta las identidades sin hermana anotadas en la vuelta. **Fuera** de la
+   * transacción, en UNA sola llamada con todas juntas y con la lista vaciada
+   * ANTES de llamar: si el hook lanzara, el próximo chunk no tiene que
+   * reintentar un pedido que ya salió. Quien decide cuándo y en qué lotes se
+   * consulta de verdad es `wa/identity.ts`.
+   */
+  function pedirHermanas(): void {
+    const lids = hermanasPendientes;
+    hermanasPendientes = [];
+    if (!pedirHermanaRemota || lids.length === 0) return;
+    try {
+      pedirHermanaRemota(lids);
+    } catch (e) {
+      log.warn("ingest.alias_pedido_fallido", { motivo: motivo(e) });
+    }
   }
 
   function pedirSubject(jid: string): void {
@@ -622,6 +923,11 @@ export function createIngest(deps: IngestDeps): Ingest {
       // rollback y la cola ya avanzó. Se pierde ese chunk, pero no se entra en
       // un loop reintentando lo mismo para siempre.
       log.error("ingest.chunk_fallido", { filas: aplicados, motivo: motivo(e) });
+      // Y los recibos de ese chunk se tiran: esos mensajes no quedaron en la
+      // base, así que el usuario NO los vio. Avisarle al otro que los leíste
+      // sería mentirle sobre algo que él ve en su teléfono.
+      recibosPendientes = [];
+      recibosChat = null;
     }
 
     // La cola se vacía sola en cuanto se alcanza: es el caso normal y evita
@@ -639,6 +945,8 @@ export function createIngest(deps: IngestDeps): Ingest {
 
     // La red va DESPUÉS de la transacción, siempre (ver `pedirSubjects`).
     pedirSubjects();
+    pedirHermanas();
+    mandarRecibos();
 
     if (fallos > 0) log.warn("ingest.items_fallidos", { fallos, motivo: primerFallo });
     // Los avisos de la cola llena se juntan y salen acá: `push` no puede pagar

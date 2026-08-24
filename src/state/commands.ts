@@ -9,12 +9,13 @@
 // se escape en un handler de teclado se lleva puesto el render.
 //
 // Hoy están los del esqueleto (tarea 9), los de vinculación (tarea 10), los de
-// la bandeja —selección, filtro y buscador— (tarea 12) y los de envío (tarea
-// 14). La búsqueda global la agrega la 16.
+// la bandeja —selección, filtro y buscador— (tarea 12), los de envío (tarea 14),
+// los de leído (tarea 15) y los de la búsqueda global (tarea 16).
 import type { Logger } from "../boot/log";
 import type { Repo } from "../db/repo";
 import type { ChatRow } from "../db/types";
 import { fold } from "../lib/fmt";
+import type { ReadReceipts } from "../wa/read";
 import type { SendQueue } from "../wa/send";
 import type { WaController } from "../wa/socket";
 import type { InboxFilter, LinkSnapshot, Store } from "./store";
@@ -30,6 +31,16 @@ export type CommandDeps = {
    * romper. En producción SIEMPRE viene (la cablea el entry).
    */
   send?: SendQueue;
+  /**
+   * Recibos de lectura (tarea 15). Opcional por el mismo motivo que `send`: sin
+   * ella el chat se marca leído en LOCAL igual —que es todo lo que necesita un
+   * test de interfaz— y no sale ninguna llamada a WhatsApp.
+   *
+   * ⚠️ Se inyecta y no se importa: `wa/read.ts` arrastra baileys (~260 ms de
+   * import) y este módulo lo carga la interfaz, que tiene que estar en pantalla
+   * en menos de 1 s (CA-13.1). El `import type` de arriba se borra al compilar.
+   */
+  read?: ReadReceipts;
   /**
    * Cierre del proceso. Hoy es el mínimo que deja la terminal usable; la tarea 17
    * lo reemplaza por el apagado ordenado de §6.6 sin tocar a los llamadores.
@@ -136,9 +147,39 @@ export function etiquetaChat(chat: Pick<ChatRow, "jid" | "name" | "contactName" 
 }
 
 /**
+ * ¿Este chat coincide con lo que se tipeó? `aguja` viene YA plegada (`fold`).
+ *
+ * ⚠️ **Es el predicado que iguala a los dos buscadores** (decisión de la tarea
+ * 16). El de la bandeja miraba sólo la etiqueta VISIBLE + el jid, mientras que
+ * `repo.searchChats` mira `chats.name`, `contacts.name` y el jid: un chat cuyo
+ * `pushName` quedó tapado por el nombre de la agenda (chat "Pepe", agenda
+ * "José") **no era encontrable por `pepe` en la bandeja pero sí en la búsqueda
+ * global** — la misma query daba distinto según dónde se escribiera.
+ *
+ * Se resolvió hacia el LADO AMPLIO —se busca por cualquier nombre que WhatsApp
+ * conozca del chat, no sólo por el que se ve—, porque el otro lado (recortar la
+ * búsqueda global a la etiqueta visible) esconde un chat que el usuario tiene
+ * derecho a encontrar por el nombre que la persona se puso. La etiqueta visible
+ * se sigue mirando: es la que cubre los fallbacks que no salen de ninguna
+ * columna (`+549…`, `~lid`, `grupo sin nombre`).
+ */
+export function coincideChat(
+  chat: Pick<ChatRow, "jid" | "name" | "contactName" | "isGroup">,
+  aguja: string,
+): boolean {
+  if (!aguja) return true;
+  return (
+    fold(etiquetaChat(chat)).includes(aguja) ||
+    fold(String(chat?.name ?? "")).includes(aguja) ||
+    fold(String(chat?.contactName ?? "")).includes(aguja) ||
+    fold(String(chat?.jid ?? "")).includes(aguja)
+  );
+}
+
+/**
  * Los chats que la bandeja muestra AHORA: primero el filtro de tabs (CA-5.5,
  * CA-10.4) y después el texto del buscador (CA-5.2), que compara sin acentos ni
- * mayúsculas contra el nombre VISIBLE y contra el jid (o sea, contra el número).
+ * mayúsculas (ver `coincideChat`).
  *
  * Se filtra en memoria y no con `repo.searchChats` a propósito: `inbox.chats` ya
  * está en RAM, es la MISMA lista que se está viendo, y una consulta por tecla
@@ -150,7 +191,7 @@ export function filtrarChats(chats: ChatRow[], filtro: InboxFilter, query: strin
   for (const c of chats) {
     if (filtro === "unread" && c.unreadCount <= 0) continue;
     if (filtro === "groups" && !c.isGroup) continue;
-    if (aguja && !fold(etiquetaChat(c)).includes(aguja) && !fold(c.jid).includes(aguja)) continue;
+    if (!coincideChat(c, aguja)) continue;
     salida.push(c);
   }
   return salida;
@@ -204,8 +245,18 @@ export type Commands = {
   closeChat(): void;
   /** Abre el chat seleccionado en la bandeja (`⏎`, CA-6.1). Sin selección no hace nada. */
   openSelectedChat(): void;
-  /** Marca leído SOLO en local; el recibo a WhatsApp lo agrega la tarea 15 (CA-11.3). */
+  /**
+   * Marca el chat como leído: contador a 0 en la base (CA-11.1) y recibo de
+   * lectura a WhatsApp si están habilitados (CA-11.2/11.3). Lo llama `openChat`.
+   */
   markRead(jid: string): void;
+  /**
+   * `Ctrl-L` (CA-11.5): marca leído el chat SELECCIONADO de la bandeja, sin
+   * abrirlo. Resuelve cuál es acá y no en la vista por lo mismo que
+   * `openSelectedChat`: la lista visible depende del filtro y del buscador, y de
+   * eso sabe este módulo.
+   */
+  markSelectedRead(): void;
   /**
    * Manda un texto al chat (CA-8.2). Devuelve el motivo cuando NO se mandó, para
    * que el composer sepa que tiene que conservar el texto (CA-8.7).
@@ -227,6 +278,25 @@ export type Commands = {
   cycleInboxFilter(): void;
   /** Texto del buscador de la bandeja (CA-5.2). `""` vuelve a la lista completa (CA-5.4). */
   setInboxQuery(query: string): void;
+  /**
+   * `Ctrl-G`: entra a la búsqueda global. Guarda el estado de la bandeja
+   * —chat seleccionado, filtro y texto del buscador— para poder devolverlo tal
+   * cual con `Esc` (CA-12.8), y arranca con la lista vacía.
+   */
+  openSearch(): void;
+  /**
+   * Texto de la búsqueda global (CA-12.1). Llega YA debounceado desde la vista
+   * (RNF-7): el store resuelve `buildFtsQuery` + FTS en el flush siguiente, así
+   * que acá no hay ni una consulta.
+   */
+  search(query: string): void;
+  /**
+   * Sale de la búsqueda global. Con `restaurar` (el `Esc` de CA-12.8) la bandeja
+   * vuelve exactamente a como estaba; sin él —el `⏎` que saltó a un mensaje
+   * (CA-12.3)— se la deja donde la dejó el salto, que es donde el usuario quiso
+   * terminar.
+   */
+  closeSearch(restaurar?: boolean): void;
   /** Conecta en el acto, salteando el backoff (CA-15.5). */
   reconnectNow(): void;
   /** Alterna QR ↔ código a mano (`Tab`, CA-2.6). NO toca el socket (D11). */
@@ -243,6 +313,15 @@ export type Commands = {
 
 /** Último teléfono VÁLIDO usado: lo reusa el `Ctrl-R` de "código nuevo" (CA-2.5). */
 let ultimoTelefono = "";
+
+/**
+ * Cómo estaba la bandeja al abrir la búsqueda global, para el `Esc` (CA-12.8).
+ *
+ * Vive acá y no en un `useState` de la vista porque es estado de la MÁQUINA —lo
+ * que hay que devolverle al store—, y porque el overlay se desmonta al salir:
+ * guardarlo adentro sería guardarlo en algo que muere justo cuando hace falta.
+ */
+let bandejaGuardada: ReturnType<Store["inboxUi"]> | null = null;
 
 /** Fases que la elección manual de método puede reescribir sin pisar nada. */
 const FASES_EN_CURSO = new Set(["checking", "need-link", "qr-waiting", "qr-shown", "pairing-phone", "pairing-shown"]);
@@ -338,15 +417,54 @@ export const commands: Commands = {
     });
   },
 
+  openSearch() {
+    if (!deps) return;
+    // El estado se lee EN VIVO y no del snapshot cacheado (D3): la misma tecla
+    // que abre la búsqueda pudo haber sido precedida por otra dentro del mismo
+    // frame de 33 ms, y restaurar un filtro viejo sería peor que no restaurar.
+    bandejaGuardada = deps.store.inboxUi();
+    // La búsqueda arranca EN BLANCO: los resultados de la vez anterior no son
+    // "la lista anterior" de nadie (CA-12.4) y además serían 200 filas vivas.
+    deps.store.setSearchQuery("");
+  },
+
+  search(query) {
+    deps?.store.setSearchQuery(String(query ?? ""));
+  },
+
+  closeSearch(restaurar = true) {
+    if (!deps) return;
+    const previo = bandejaGuardada;
+    bandejaGuardada = null;
+    deps.store.setSearchQuery("");
+    if (restaurar && previo) deps.store.setInboxUi(previo);
+  },
+
   markRead(jid) {
     if (!deps || !jid) return;
     const chat = deps.repo.getChat(jid);
     if (!chat) return;
-    // El último mensaje de la ventana es el tope de lectura: de ahí salen las
-    // keys del recibo que manda la tarea 15 (CA-11.1).
+    // El último mensaje del chat es el tope de lectura (CA-11.1).
     const ultimo = deps.repo.lastMessages(jid, 1)[0];
+    // LOCAL PRIMERO, y sin depender de nada más: el recibo es best effort y el
+    // chat tiene que quedar leído pase lo que pase con la red (CA-11.4).
     deps.repo.clearUnread(jid, ultimo ? ultimo.id : chat.lastReadId);
     deps.store.markDirty("inbox");
+
+    // El recibo cubre lo que estaba SIN leer, o sea desde el `last_read_id`
+    // ANTERIOR (por eso se lee `chat` antes del `clearUnread`).
+    //
+    // Y sólo si de verdad había algo sin leer: con el contador en 0 el chat ya
+    // fue acusado —o lo marcó leído otro dispositivo (CA-11.6), que deja el
+    // contador en 0 sin tocar `last_read_id`—, y mandar el recibo igual sería
+    // una ráfaga de stanzas por mensajes que el otro ya vio en azul (R8).
+    if (chat.unreadCount > 0) deps.read?.markRead(jid, chat.lastReadId);
+  },
+
+  markSelectedRead() {
+    if (!deps) return;
+    const { actual } = vistaBandeja(deps);
+    if (actual) commands.markRead(actual);
   },
 
   send(jid, text) {

@@ -26,10 +26,10 @@ const ATAJOS_GLOBALES = [
   "Ctrl-C · Ctrl-Q salir",
 ];
 const ATAJOS_BANDEJA = [
-  "escribir        filtrar por nombre o número, sin acentos",
+  "escribir · ^G   filtrar por nombre/número · buscar en todo el historial",
   "↑ ↓ · ^K ^J     mover la selección (la rueda también)",
   "PgUp PgDn       saltar de a una pantalla (Inicio / Fin, a las puntas)",
-  "⏎ · doble click abrir el chat seleccionado",
+  "⏎ · ^L          abrir el chat (o doble click) · marcarlo leído sin abrir",
   "Tab             filtrar: todos / no leídos / grupos",
   "Esc             limpiar el buscador",
 ];

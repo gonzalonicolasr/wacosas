@@ -8,6 +8,14 @@
 //
 //   kill -USR2 <pid>  ⇒ entra un mensaje nuevo al chat abierto (como el ingest)
 //   kill -USR1 <pid>  ⇒ reabre el chat abierto anclado a un mensaje viejo
+//
+//   WACOSAS_DEMO_RECIBOS=0     recibos de lectura apagados (config.readReceipts)
+//   WACOSAS_DEMO_SYNC=<n>      a los 2 s entra un `chats.upsert` del sync de
+//                              historial con `unreadCount: n` para el chat
+//                              abierto, por el ingest REAL (tarea 15, CA-11.7)
+//   WACOSAS_DEMO_ACK=<código>  WhatsApp RECHAZA el primer mensaje que se mande
+//                              desde el campo: `messages.update` con
+//                              `status: ERROR` y ese código (tarea 15)
 const RAIZ = "/home/gon/projects/wacosas";
 
 const { openDb } = await import(`${RAIZ}/src/db/open.ts`);
@@ -122,7 +130,11 @@ store.bootstrap(repo);
 store.setLink({ phase: "linked", qr: null, pairingCode: null, reason: null });
 store.setConn({ state: "open" });
 
-const renderer = await createCliRenderer({ exitOnCtrlC: false, exitSignals: [] });
+// `autoFocus:false` espejado de `src/index.tsx` (tarea 14): con el default, un
+// click izquierdo enfoca el primer ancestro focusable —el `<scrollbox>` de la
+// conversación—, y el buscador de la bandeja y el campo de redacción se quedan
+// mudos. Sin esta línea la demo muestra el bug que la aplicación ya no tiene.
+const renderer = await createCliRenderer({ exitOnCtrlC: false, exitSignals: [], autoFocus: false });
 const log = { info() {}, warn() {}, error() {}, path: "/tmp/wacosas-demo13.log" };
 
 // ── envío (tarea 14) ────────────────────────────────────────────────────────
@@ -156,12 +168,38 @@ const send = createSendQueue({
   },
 });
 
+// ── leído (tarea 15) ────────────────────────────────────────────────────────
+// Los recibos REALES contra un socket FALSO: ⚠️ un recibo de lectura lo VE la
+// otra persona, así que acá no puede haber socket de verdad ni de casualidad. Lo
+// que "sale" se escribe en un archivo para poder mirarlo desde afuera.
+const { createReadReceipts } = await import(`${RAIZ}/src/wa/read.ts`);
+const RUTA_RECIBOS = process.env.WACOSAS_DEMO_RECIBOS_LOG ?? "/tmp/wacosas-demo15-recibos.log";
+const { appendFileSync } = await import("node:fs");
+
+const sockLeido = {
+  async readMessages(keys: Array<{ remoteJid: string; id: string; participant?: string }>) {
+    appendFileSync(
+      RUTA_RECIBOS,
+      `readMessages ${keys.length} claves · chat=${keys[0]?.remoteJid} ids=${keys
+        .map((k) => k.id)
+        .join(",")}\n`,
+    );
+  },
+};
+const read = createReadReceipts({
+  repo,
+  log: log as never,
+  wa: { isOpen: () => !offline, socket: () => (offline ? null : (sockLeido as never)) },
+  enabled: process.env.WACOSAS_DEMO_RECIBOS !== "0",
+});
+
 configureCommands({
   repo,
   wa: { reconnectNow() {}, async requestPairingCode() {} } as never,
   store,
   log: log as never,
   send,
+  read,
   shutdown(code = 0) {
     try {
       renderer.destroy();
@@ -174,6 +212,58 @@ const abrir = process.env.WACOSAS_DEMO_OPEN;
 if (abrir) {
   const ancla = process.env.WACOSAS_DEMO_ANCHOR;
   commands.openChat(abrir, ancla ? { anchorId: Number(ancla) } : undefined);
+}
+
+// ── el ingest REAL, para los dos escenarios de la tarea 15 ──────────────────
+const { createIngest } = await import(`${RAIZ}/src/wa/ingest.ts`);
+const ingest = createIngest({
+  repo,
+  store,
+  log: log as never,
+  selfJid: () => "5491133445566:12@s.whatsapp.net",
+  openChatJid: () => store.openChatJid(),
+  pushReadReceipt: read.pushReadReceipt,
+});
+
+// El sync de historial entrando con el chat ABIERTO (CA-11.7, punto 4 del ⚠️ de
+// la tarea 15): el `unreadCount` del `chats.upsert` es el ABSOLUTO del servidor,
+// que no sabe que lo estás mirando.
+const sync = Number(process.env.WACOSAS_DEMO_SYNC ?? 0);
+if (sync > 0) {
+  setTimeout(() => {
+    const jid = store.openChatJid() ?? ANTO;
+    ingest.push({
+      kind: "chats",
+      chats: [{ id: jid, unreadCount: sync, conversationTimestamp: ahora }] as never,
+    });
+  }, 2_000);
+}
+
+// El ERROR ack: WhatsApp acusa la stanza y la RECHAZA. Llega siempre DESPUÉS del
+// `sent` (`relayMessage` vuelve apenas manda), así que se espera a que aparezca
+// un mensaje propio en `sent` en vez de dispararlo por reloj.
+const ack = process.env.WACOSAS_DEMO_ACK;
+if (ack) {
+  const { proto } = await import("baileys");
+  const buscar = setInterval(() => {
+    const jid = store.openChatJid();
+    if (!jid) return;
+    const fila = repo.lastMessages(jid, 20).find((m) => m.fromMe && m.status === "sent");
+    if (!fila) return;
+    clearInterval(buscar);
+    ingest.push({
+      kind: "msg-updates",
+      updates: [
+        {
+          key: { remoteJid: jid, id: fila.waId, fromMe: true },
+          update: {
+            status: proto.WebMessageInfo.Status.ERROR,
+            messageStubParameters: [ack],
+          },
+        },
+      ] as never,
+    });
+  }, 300);
 }
 
 // Un mensaje entrante al chat abierto, por el mismo camino que el ingest:

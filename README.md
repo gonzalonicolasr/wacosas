@@ -76,6 +76,20 @@ Los directorios de datos y de estado se crean solos al arrancar, con permisos `0
 
 Para desvincular la sesión y empezar de cero: cerrá wacosas y borrá `~/.local/share/wacosas/creds/`.
 
+## Configuración
+
+No hay pantalla de ajustes: `config.json` se edita a mano y se lee **una vez, al arrancar** (o sea
+que hay que reiniciar wacosas para que un cambio tome efecto). No existir es normal: sin el archivo
+valen los defaults. Si el JSON está mal formado se usan los defaults y queda una línea en el log.
+
+```json
+{ "readReceipts": true }
+```
+
+| Clave | Default | Qué hace |
+| --- | --- | --- |
+| `readReceipts` | `true` | Manda el recibo de lectura a WhatsApp cuando marcás un chat como leído — o sea, **el otro te ve el doble tilde azul**. En `false` el chat se marca leído sólo en tu máquina y no sale ni una llamada a WhatsApp. |
+
 ## Teclas
 
 Pendiente: se documentan cuando esté la interfaz (tarea 18 del plan).
@@ -99,7 +113,16 @@ contacto te escribe una vez desde cada una, lo vas a ver dos veces en la bandeja
 partido. Los chats con lid se listan como `~1234567890` —con `~` y **sin** el `+`— justamente para
 que se note que eso no es un número al que puedas llamar.
 
-Por qué no se resolvió: fusionarlas de verdad no es leer un campo más. Hay que elegir una identidad
+**Lo que sí se comparte entre las dos identidades es el NOMBRE**, y no es un detalle: WhatsApp manda
+los nombres de tu agenda pegados al lid, mientras que muchos chats vienen bajo el número, así que sin
+esto la bandeja te mostraba números casi en todos lados. wacosas anota la equivalencia
+`lid ↔ número` cuando la ve —viene en el sobre de cada mensaje, en la ficha de cada contacto y en la
+sincronización inicial— y le presta el nombre a la identidad que no lo tiene. Para los chats que ya
+estaban guardados sin nombre, al conectar hace un barrido preguntándole a Baileys por la identidad
+hermana: es una consulta **local** (lee `creds/`, no manda nada a WhatsApp), en lotes espaciados y una
+sola vez por identidad.
+
+Por qué la fusión no se resolvió: fusionarlas de verdad no es leer un campo más. Hay que elegir una identidad
 canónica, **mover** los mensajes ya persistidos de un `chat_jid` al otro, sumar los contadores de no
 leídos, y que el envío salga siempre por la identidad que el otro lado espera. Es una migración de
 datos, no un ajuste de la vista, y se hace mal si se hace a medias. Queda anotado como el riesgo R7

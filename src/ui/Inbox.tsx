@@ -314,5 +314,14 @@ export function Inbox({
   );
 }
 
-/** Teclas de la bandeja para el pie (`App` las concatena con las globales). */
-export const HINTS_BANDEJA = "↑↓ mover · ⏎ abrir · Tab filtro";
+/**
+ * Teclas de la bandeja para el pie (`App` las concatena con las globales).
+ *
+ * ⚠️ Con un chat abierto el pie mide EXACTAMENTE 78 caracteres, que es lo que
+ * entra a 80 columnas (RNF-1): cada hint nuevo tiene que sacar otro. `^L leído`
+ * (tarea 15, CA-11.5) entró en el lugar de `↑↓ mover` —los dos miden lo mismo,
+ * así que el pie sigue en 78— porque de los dos es el que NO se adivina: que las
+ * flechas muevan el cursor de una lista lo sabe cualquiera, y siguen figurando
+ * en la ayuda (`?`) junto con `^K`/`^J`.
+ */
+export const HINTS_BANDEJA = "⏎ abrir · ^L leído · Tab filtro";

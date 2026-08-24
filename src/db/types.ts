@@ -47,6 +47,17 @@ export type ChatRow = {
   lastReadId: number;
 };
 
+/**
+ * Una fila de la agenda (`contacts`). Se lee para prestarle el nombre a la otra
+ * identidad del mismo humano (LID ↔ número): la agenda de WhatsApp llega pegada
+ * a una sola de las dos y el chat puede estar bajo la otra.
+ */
+export type ContactRow = {
+  jid: string;
+  name: string;
+  phone: string;
+};
+
 export type AttachmentInfo = {
   /** Lo que se muestra en lugar del archivo: "📷 imagen", "🎤 audio 0:12", … */
   label: string;

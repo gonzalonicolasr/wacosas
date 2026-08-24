@@ -279,11 +279,17 @@ export function createStore(opts: StoreOpts = {}): Store {
   }
 
   function construirSearch(): SearchSnapshot {
-    const match = repo ? buildFtsQuery(consulta) : "";
-    if (!repo || match === "") return { query: consulta, hits: [], chats: [] };
+    if (!repo || consulta.trim() === "") return { query: consulta, hits: [], chats: [] };
+    // ⚠️ Los CHATS se buscan aunque no quede ningún término FTS-able (tarea 16).
+    // `buildFtsQuery` parte por "todo lo que no sea letra ni número", así que una
+    // query de puros símbolos —un emoji, `+549`— se queda en `''` y ahí NO hay
+    // mensajes que buscar. Pero el chat sí se puede encontrar: buscar `🌻` en la
+    // bandeja encuentra "anto 🌻" y acá decía "sin coincidencias", la misma query
+    // con dos respuestas distintas según dónde se escribiera.
+    const match = buildFtsQuery(consulta);
     return {
       query: consulta,
-      hits: repo.searchMessages(match, LIMITE_HITS),
+      hits: match === "" ? [] : repo.searchMessages(match, LIMITE_HITS),
       chats: repo.searchChats(consulta, LIMITE_CHATS_HIT),
     };
   }
