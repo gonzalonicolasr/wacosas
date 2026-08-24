@@ -51,17 +51,34 @@
 // **La reparación**: poner `accountSyncCounter` en 0 y reconectar, para que
 // baileys rehaga su sincronización inicial completa. Sin desvincular y sin
 // tocar el historial local (`wa/socket.ts`, `resetSyncCounter`). Se hace **una
-// sola vez por cuenta** —queda marcado en `meta`, sobrevive al proceso— y sólo
+// sola vez por sesión** —queda marcado en `meta`, sobrevive al proceso— y sólo
 // cuando el diagnóstico da: falta app-state Y el contador está en la posición
 // que impide rehacerlo. Con todo sincronizado no se toca nada.
 //
-// ⚠️ **Lo que la reparación no puede hacer**: traer las CLAVES de app-state que
-// falten. Si el sync completo corre pero el patch viene cifrado con una clave
-// que el teléfono nunca compartió, se vuelve a estacionar igual (ver abajo).
-// Por eso el resultado queda escrito en el log —las tres frases con las que
-// baileys cuenta cómo le fue (`appstate.sync_baileys`)—: es la diferencia entre
-// "el sync no corría" y "corre pero falta la clave", que son dos problemas
-// distintos y sólo el primero es nuestro.
+// ── ⚠️ HASTA DÓNDE LLEGA (probado EN VIVO con la cuenta real) ──────────────
+//
+// **El reset del contador NO alcanzó.** Poner el contador en 0 devuelve a
+// baileys a `AwaitingInitialSync`, pero para pasar a `Syncing` —y recién ahí
+// corre `doAppStateSync`— hace falta ADEMÁS que llegue una notificación de
+// historial, y **el servidor no se la manda a un dispositivo ya vinculado**
+// (lo dice el propio baileys en `Socket/chats.js:1086-1088`). Resultado medido:
+// vuelve a saltar el timeout de 20 s y el contador vuelve a 1.
+//
+// **Lo que sí funcionó fue re-vincular.** La clave de app-state que faltaba sólo
+// la comparte el teléfono al enlazar (`APP_STATE_SYNC_KEY_SHARE`,
+// `Utils/process-message.js:278-293`; el pedido `APP_STATE_SYNC_KEY_REQUEST`
+// existe en el proto pero baileys **no lo implementa**). Después de re-vincular
+// aparecieron **3** claves donde había 2 y llegaron los **11 chats con candado**
+// —`lockChatAction` viaja por `regular_low`, una de las colecciones que estaba
+// estacionada—.
+//
+// Entonces, ¿para qué se queda esto? Porque es **necesario pero no suficiente**:
+// con el contador en 1 baileys no rehace el sync completo NI cuando la clave
+// llega, y el costo está topeado en una reconexión por sesión. Lo que sí cambia
+// de verdad es el LOG: las frases con las que baileys cuenta cómo le fue
+// (`appstate.sync_baileys fase=…`) son las que distinguen "el sync no corría"
+// de "corre pero falta la clave" — y esa distinción es la que mandó a
+// re-vincular en vez de seguir buscando del lado del cliente.
 //
 // ── LO QUE HACE ESTE MÓDULO ─────────────────────────────────────────────────
 //

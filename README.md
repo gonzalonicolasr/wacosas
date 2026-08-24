@@ -143,13 +143,21 @@ momento, toda conexión posterior saltea el sync completo: no lo arregla reinici
 pasa, la bandeja te muestra números en vez de nombres —en la cuenta con la que se encontró esto eran
 844 contactos con sólo 32 nombres— y los candados no llegan nunca.
 
-**wacosas lo detecta y lo repara solo**: si al conectar ve que falta app-state *y* que ese contador
-está en la posición que impide rehacerlo, lo pone en 0, reconecta y deja que Baileys haga su
-sincronización completa como si fuera la primera vez. **No hace falta desvincular.** Se hace **una
-sola vez por sesión** (queda anotado en la base) y nunca si la sincronización está sana: resetear el
-contador con todo en orden sería un sync completo de más en cada arranque. En el log queda todo
-(`appstate.sync_completo_*`) y también en qué terminó del lado de Baileys
-(`appstate.sync_baileys fase=…`).
+**wacosas lo detecta y lo intenta reparar solo**: si al conectar ve que falta app-state *y* que ese
+contador está en la posición que impide rehacerlo, lo pone en 0, reconecta y deja que Baileys haga su
+sincronización completa como si fuera la primera vez. Se hace **una sola vez por sesión** (queda
+anotado en la base) y nunca si la sincronización está sana: resetear el contador con todo en orden
+sería un sync completo de más en cada arranque. En el log queda todo (`appstate.sync_completo_*`) y
+también en qué terminó del lado de Baileys (`appstate.sync_baileys fase=…`).
+
+⚠️ **Ese reset no siempre alcanza, y conviene saberlo antes de esperar magia.** Probado en vivo: con
+el contador en 0, Baileys vuelve a esperar el historial, pero **el servidor no le manda ninguna
+notificación de historial a un dispositivo ya vinculado**, así que vuelve a saltar el timeout de 20 s
+y el contador vuelve a 1. Si además falta una **clave** de app-state (ver el párrafo siguiente), lo
+único que la trae es **desvincular y volver a vincular**: esa clave la comparte el teléfono cuando
+enlaza el dispositivo, y no hay forma de pedirla después. En la cuenta donde se encontró todo esto,
+después de re-vincular aparecieron 3 claves donde había 2 y llegaron los 11 chats con candado. El
+historial local **no se pierde** al re-vincular (la base es aparte de `creds/`).
 
 wacosas lo repara solo: **30 segundos después de conectar** mira qué colecciones no quedaron al día y
 le pide a WhatsApp **sólo esas**. Si la sincronización de Baileys anduvo bien, no encuentra nada que
@@ -168,9 +176,12 @@ colección.
 Si ni así entra, la reparación vuelve a pedirla hasta el tope de tres y frena: insistir cada 30 s
 sería martillar sin poder ganar nunca. Cuando frena queda dicho en el log
 (`appstate.tope_alcanzado … salida=Ctrl-N`). **`Ctrl-N`** vuelve a pedir las cinco colecciones a mano,
-que es lo único que destraba una estacionada si la clave llegó; si después de un `Ctrl-N` seguís
-viendo números, la clave no llegó, y la salida es desvincular y volver a vincular
-(`~/.local/share/wacosas/creds/`), que le pide todo de cero al teléfono.
+que es lo único que destraba una estacionada si la clave llegó.
+
+Y si después de un `Ctrl-N` seguís viendo números —o chats con candado que no se esconden—, la clave
+no llegó: **la salida probada es desvincular y volver a vincular** (borrar
+`~/.local/share/wacosas/creds/` y escanear de nuevo), que es cuando el teléfono comparte las claves de
+app-state. El historial local no se toca.
 
 Ojo con una diferencia que el log tardó en decir bien: una colección estacionada **tiene** datos
 locales (viejos), así que no alcanza con mirar si hay archivo para saber si está al día. Hoy el log
