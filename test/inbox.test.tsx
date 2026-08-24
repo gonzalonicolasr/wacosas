@@ -386,10 +386,17 @@ describe("render de la bandeja", () => {
   });
 
   test("ninguna fila crece a dos líneas al pasarle el mouse por encima (CA-19.7)", async () => {
-    // El bug que cubre esto: un evento de mouse vuelve a MEDIR el `<text>`, y
-    // sin `wrapMode="none"` la fila se envuelve, empuja a las de abajo y la
-    // lista queda corrida. Se pasa por las tres filas, incluida la del preview
-    // con emoji, que es la más larga.
+    // Lo que cubre esto es CA-19.7 tal cual: pasar el mouse no puede cambiar la
+    // altura de una fila. Se pasa por las tres, incluida la del preview con
+    // emoji, que es la más larga.
+    //
+    // ⚠️ El mecanismo que este test decía cubrir ("un evento de mouse vuelve a
+    // MEDIR el `<text>`") es FALSO en OpenTUI 0.4.2: se probó con `mockMouse`
+    // sobre un `<text>` que envuelve, sin `height` ni `wrapMode`, y el frame sale
+    // byte por byte idéntico (§7.4 del diseño). El wrap ocurre en el LAYOUT, sin
+    // que nadie toque el mouse. El test se queda igual —es la garantía del
+    // criterio, y sigue siendo cierta— pero no hay que leerlo como prueba de que
+    // el mouse re-mide nada.
     const { t } = await montar(46, 6);
     const antes = t.captureCharFrame();
     for (let y = 1; y <= 3; y++) {

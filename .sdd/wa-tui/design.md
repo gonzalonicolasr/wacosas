@@ -2,6 +2,32 @@
 
 > Documento de diseño técnico para `.sdd/wa-tui/requirements.md` (19 historias, 116 criterios
 > `CA-<h>.<n>`, 14 `RNF`). Trazabilidad completa al final. **Esto es diseño, no implementación.**
+>
+> ### ⚠️ Sincronizado con lo construido (tarea 18)
+>
+> Este documento se escribió **antes** de implementar. Todo lo que la construcción demostró que
+> estaba mal ya está corregido acá, marcado con ⚠️ y con la versión vieja a la vista, para que nadie
+> "arregle" el código hacia lo que decía el diseño. Lo más gordo, con su sección:
+>
+> | Qué decía | Qué es | Dónde |
+> |---|---|---|
+> | `mapMessage` devuelve fila para el revoke | Devuelve `null` para **todo** `protocolMessage`; el revoke es `isRevoke()`, llamado en **las dos** ramas del ingest | §5.4, §8.4 |
+> | `shouldSyncHistoryMessage: () => false` "no negociable" | Era **el bug**: dejaba la bandeja vacía. Se saca y se usa el default de baileys | §5.6 |
+> | `pino({ level: "silent" })` | Era **el otro bug**: escondía el aviso que explicaba por qué no bajaba la agenda. Logger propio al archivo, nivel `warn` | §5.6 |
+> | 400 filas por tick | 400 filas **o 8 ms**, lo que llegue primero. El corte por tiempo es obligatorio | D4, §5.7 |
+> | Tabs al `title` del panel en `compact` | Quedan en el **encabezado** siempre; lo que se achica es la etiqueta | §7.2 |
+> | Un evento de mouse re-mide el `<text>` | **Falso** en OpenTUI 0.4.2 | §7.4 |
+> | `justifyContent="center"` come una fila | **Falso** | §7.4 |
+> | `Ctrl-J` == `⏎` en terminal legacy (R6) | **Falso**: `linefeed` vs `return` | §7.3, R6 |
+> | `<ErrorScreen>` para "instancia tomada" | No se hizo, a propósito: una línea y `exit(3)` | §7.1 |
+> | `chats_fts` | No existe (recorte 1/R1): los nombres se buscan con `fold`+`includes` | §4.1, §12 |
+> | Paginado hacia arriba (CA-6.8) | No se hizo (recorte 2/R2): ventana fija de 500 | §12 |
+> | `read.ts` = "markRead local + recibos" | **Sólo** el recibo | §5.4, §8.5 |
+> | CA-15.2: todo lo que no sea 401/500/515 va a backoff | Dos excepciones más con acción `halt`: **440** y **403** | §6.5, requirements |
+>
+> Además se sumaron tres tablas (`jid_aliases`, `jid_flags`, `jid_hides`, §4.1), el `stop()` del
+> ingest y de la cola de envío (§5.7/§5.8), el `SearchSnapshot` que nunca se definió (§5.5), y una
+> sección nueva con **lo que baileys no hace** aunque su API sugiera que sí (§8.8).
 
 ---
 
@@ -125,12 +151,18 @@ suelto en ≤33 ms (imperceptible) y convierte una ráfaga de 500 upserts en **u
 **Decisión.** Todo evento de Baileys que implique escritura entra a una cola FIFO en memoria
 (`wa/ingest.ts`). Los handlers de Baileys hacen **cero** trabajo async: validan el guard de socket
 vigente, empujan el job y vuelven. Un drenador corre con `setTimeout(0)` y en cada vuelta procesa
-**hasta `MAX_ROWS_PER_TICK = 400` filas** dentro de **una** `db.transaction()`; si queda cola,
-se re-agenda con otro `setTimeout(0)` en lugar de seguir en el mismo tick.
+**hasta `MAX_ROWS_PER_TICK = 400` filas *o* `MAX_MS_PER_TICK = 8` ms —lo que llegue primero—** dentro
+de **una** `db.transaction()`; si queda cola, se re-agenda con otro `setTimeout(0)` en lugar de seguir
+en el mismo tick.
+
+⚠️ **El corte por tiempo no es un extra**: sobre una base con 50.000 mensajes ya indexados, 400 filas
+en una sola transacción llegaron a **38 ms** (el commit dispara un merge del índice FTS), casi el
+doble del presupuesto de RNF-5. Con el corte por tiempo el peor tick de esa misma prueba bajó a
+**9,6 ms**. Detalle en §5.7.
 
 **Por qué.** `bun:sqlite` es **síncrono**: insertar 5.000 mensajes de un saque congela el event loop
-y con él el teclado. Chunkeando a 400 filas por transacción cada ventana de bloqueo queda en el orden
-del milisegundo y el loop respira entre chunks: el tecleo se atiende (RNF-5). La transacción por
+y con él el teclado. Chunkeando a 400 filas **u 8 ms** por transacción cada ventana de bloqueo queda
+en el orden del milisegundo y el loop respira entre chunks: el tecleo se atiende (RNF-5). La transacción por
 chunk es lo que hace que el sync inicial no tarde minutos (una transacción por INSERT sería ~100x más
 lento).
 
@@ -250,13 +282,14 @@ agregado tiene que justificarse acá.
 
 ## 3. Estructura de archivos del repo
 
-Todo **NUEVO** (el repo está vacío).
+Todo **NUEVO** (el repo está vacío). Los `+++` son archivos que **no estaban en el diseño** y que
+aparecieron construyendo; los `NEW` cuya descripción cambió llevan la corrección en la línea.
 
 ```
 wacosas/
 ├── package.json                 NEW  deps exactas + scripts (start, test)
 ├── tsconfig.json                NEW  jsx: react-jsx, jsxImportSource: @opentui/react (copia de miscosas)
-├── install.sh                   NEW  instalador idempotente sin sudo; genera ~/.local/bin/wacosas y wc
+├── install.sh                   NEW  instalador idempotente sin sudo; genera ~/.local/bin/wacosas y `wa`
 ├── README.md                    NEW  uso, teclas, arquitectura, AVISO de que la base NO se cifra (RNF-12)
 ├── .gitignore                   NEW
 ├── src/
@@ -267,6 +300,8 @@ wacosas/
     │   ├── stderr.ts            NEW  dup2(fd2) vía bun:ffi (D9)
     │   ├── log.ts               NEW  logger append + rotación 5 MB + allowlist de campos
     │   ├── lock.ts              NEW  instancia única (pidfile + kill(pid,0) + /proc/<pid>/cmdline)
+    │   ├── config.ts           +++  lee config.json una vez (readReceipts); defaults si falta o está roto
+    │   ├── lockcode.ts         +++  código del candado: scrypt + sal, comparación en tiempo constante
     │   └── shutdown.ts          NEW  cierre ordenado idempotente + señales + uncaughtException
     ├── db/
     │   ├── schema.ts            NEW  DDL como string (§4) + PRAGMAs + migrate() idempotente
@@ -279,7 +314,9 @@ wacosas/
     │   ├── map.ts               NEW  PURO: WAMessage → MappedMessage (testeable sin socket)
     │   ├── ingest.ts            NEW  cola serializada + chunking + escritura + markDirty
     │   ├── send.ts              NEW  cola de envío, rate limit, reintentos, sentCache para getMessage
-    │   ├── read.ts              NEW  markRead local + recibos de lectura
+    │   ├── read.ts              NEW  SÓLO los recibos de lectura (el markRead local vive en commands)
+    │   ├── appstate.ts         +++  reparación de las colecciones de app-state (nombres, candados)
+    │   ├── identity.ts         +++  resuelve la identidad hermana LID ↔ número (consulta LOCAL)
     │   └── qr.ts                NEW  PURO: payload → matriz half-block + medidas
     ├── state/
     │   ├── store.ts             NEW  slices, snapshots cacheados, markDirty + flush coalescido
@@ -299,21 +336,27 @@ wacosas/
         ├── Header.tsx           NEW  marca + buscador + tabs con contadores + badge de conexión
         ├── Footer.tsx           NEW  hints de teclas / toast efímero
         ├── Inbox.tsx            NEW  lista de chats (filas height=1, wrapMode="none")
-        ├── Conversation.tsx     NEW  scrollbox sticky-bottom + paginado hacia arriba
+        ├── Conversation.tsx     NEW  scrollbox sticky-bottom (ventana fija de 500, SIN paginado: R2)
         ├── MessageRow.tsx       NEW  una burbuja: hora, autor, cuerpo/placeholder, estado
         ├── Composer.tsx         NEW  textarea con keyBindings invertidos + borradores
-        ├── SearchOverlay.tsx    NEW  búsqueda global FTS con debounce
+        ├── SearchOverlay.tsx    NEW  búsqueda global con debounce (mensajes por FTS + chats por nombre)
         ├── Login.tsx            NEW  máquina de vinculación (QR ↔ código)
         ├── QrView.tsx           NEW  pinta la matriz de wa/qr.ts
         ├── PairingView.tsx      NEW  input de teléfono + código XXXX-XXXX + timer 120 s
         ├── Help.tsx             NEW  atajos + ruta del log
+        ├── LockCode.tsx        +++  pantalla de `^P`: fijar el código (se pintan •, nunca los dígitos)
         ├── TooSmall.tsx         NEW  pantalla "agrandá la terminal" (RNF-2)
-        └── ErrorScreen.tsx      NEW  base corrupta / lock tomado (CA-13.6, CA-18.2)
-└── test/                        NEW  bun test sobre los módulos PUROS + db
-    ├── map.test.ts  placeholder.test.ts  fts.test.ts  fmt.test.ts
-    ├── backoff.test.ts  ratelimit.test.ts  qr.test.ts
-    ├── db.test.ts        (schema idempotente, dedupe, FTS, contadores)
-    └── store.test.ts     (coalescing: 500 upserts ⇒ 1 notify)
+        └── ErrorScreen.tsx      NEW  SÓLO base corrupta (CA-13.6). El lock tomado es una línea + exit(3)
+├── test/                        NEW  bun test: módulos puros, db, máquina y UI (25 archivos, 554 tests)
+│   ├── map.test.ts  placeholder.test.ts  fts.test.ts  fmt.test.ts  identity.test.ts
+│   ├── backoff.test.ts  ratelimit.test.ts  qr.test.ts  lockcode.test.ts  auth.test.ts
+│   ├── db.test.ts        (schema idempotente, dedupe, FTS, contadores, ocultos)
+│   ├── store.test.ts     (coalescing: 500 upserts ⇒ 1 notify)
+│   ├── ingest.test.ts  send.test.ts  read.test.ts  socket.test.ts  appstate.test.ts
+│   ├── lock.test.ts  shutdown.test.ts  log.test.ts  paths.test.ts
+│   ├── search.bench.test.ts  (50.000 filas: la búsqueda tiene que dar ≤ 200 ms)
+│   └── ui.test.tsx  inbox.test.tsx  conversation.test.tsx   (render real + frames)
+└── tools/                      +++  demos manuales (demo.tsx, demo-candado.tsx): NO son tests
 ```
 
 **`package.json`** (dependencias exactas, sin agregados):
@@ -321,14 +364,20 @@ wacosas/
 ```json
 {
   "name": "wacosas", "private": true, "type": "module",
-  "scripts": { "start": "bun run src/index.tsx", "test": "bun test" },
+  "scripts": { "start": "bun run src/index.tsx", "test": "bun test", "typecheck": "tsc --noEmit" },
   "dependencies": {
-    "@opentui/core": "0.4.2", "@opentui/react": "0.4.2", "react": "^19.2.0",
-    "baileys": "7.0.0-rc14", "qrcode": "^1.5.4", "pino": "^9.0.0"
+    "@opentui/core": "0.4.2", "@opentui/react": "0.4.2", "react": "19.2.8",
+    "baileys": "7.0.0-rc14", "qrcode": "1.5.4", "pino": "9.14.0"
   },
-  "devDependencies": { "@types/qrcode": "^1.5.5", "@types/react": "^19.0.0" }
+  "devDependencies": {
+    "@types/bun": "1.3.14", "@types/qrcode": "1.5.6", "@types/react": "19.2.18", "typescript": "5.9.3"
+  }
 }
 ```
+
+Lo construido quedó con **las mismas seis dependencias** (D12 se respetó: cero deps nuevas), pero
+**todas pineadas exactas, sin `^`** —no sólo baileys— y con dos `devDependencies` más
+(`typescript` + `@types/bun`) para el `bun run typecheck`, que no producen nada en runtime.
 
 ---
 
@@ -341,7 +390,9 @@ log en `$XDG_STATE_HOME/wacosas` (default `~/.local/state/wacosas`).
 ~/.local/share/wacosas/
 ├── wacosas.sqlite            (+ -wal, -shm)
 ├── creds/                    useMultiFileAuthState (dir 0700, archivos 0600)
-├── config.json               { "readReceipts": true, "splash": true }
+├── config.json               { "readReceipts": true }   ← ⚠️ `splash` NO existe: es el flag --no-splash
+├── lock-code.json          +++ sal + hash scrypt del código del candado (nunca los dígitos)
+├── qr.png                  +++ sólo con --qr-png: el QR vigente como imagen (0600)
 └── wacosas.lock              pid de la instancia viva
 ~/.local/state/wacosas/
 ├── wacosas.log               destino del dup2 + logger propio
@@ -354,6 +405,10 @@ todo archivo que cree el proceso nace `0600` y todo directorio `0700`, incluidos
 directorios raíz (por si ya existían con permisos laxos de una instalación previa).
 
 ### 4.1 DDL completo (verificado en bun:sqlite 1.3.14, ver V8)
+
+> **Actualizado con lo construido (tarea 18).** Sobre el DDL original se sumaron tres tablas que este
+> diseño no había previsto —`jid_aliases`, `jid_flags`, `jid_hides`— y se **sacó** `chats_fts` con sus
+> tres triggers (recorte 1 de §10, R1). El esquema real vive en `src/db/schema.ts`; abajo está al día.
 
 ```sql
 -- PRAGMAs (se aplican en db/open.ts, en este orden, antes del DDL)
@@ -386,6 +441,44 @@ CREATE TABLE IF NOT EXISTS contacts (
   name       TEXT    NOT NULL DEFAULT '',               -- name || notify || verifiedName
   phone      TEXT    NOT NULL DEFAULT '',
   updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+-- ── las tres tablas que el diseño original no tenía ───────────────────────
+-- Las dos identidades del mismo humano: el LID (`…@lid`) y el número
+-- (`…@s.whatsapp.net`). No es cosmético: WhatsApp manda los nombres de la agenda
+-- pegados al LID (`lidContactAction`) y los chats muchas veces vienen bajo el
+-- número, así que sin esto la bandeja mostraba casi todo como `+54911…`. Se
+-- guarda en las DOS direcciones (dos filas por par) para que buscar la hermana de
+-- un jid sea siempre un golpe a la PK. **No fusiona chats** (R7): sólo comparte
+-- el NOMBRE.
+CREATE TABLE IF NOT EXISTS jid_aliases (
+  jid        TEXT PRIMARY KEY,
+  alt_jid    TEXT NOT NULL,
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+-- Los dos motivos por los que un chat NO se lista y que vienen de WhatsApp:
+-- `blocked` (contacto bloqueado, llega por `blocklist.update`) y `locked` (Chat
+-- Lock, llega por `chats.lock`). Son independientes entre sí. Tabla aparte y no
+-- columnas de `chats` porque un jid bloqueado puede no tener chat (y crear la
+-- fila sería una fila fantasma) y porque el estado llega pegado a UNA de las dos
+-- identidades: las consultas lo cruzan con `jid_aliases`.
+CREATE TABLE IF NOT EXISTS jid_flags (
+  jid        TEXT PRIMARY KEY,
+  blocked    INTEGER NOT NULL DEFAULT 0,
+  locked     INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+-- El tercer motivo, el único que NO viene de WhatsApp: el usuario escondió el
+-- chat a mano con `^X`. Se comporta como un candado y se revela con el MISMO
+-- código, pero vive aparte porque `jid_flags` es el espejo de lo que dice
+-- WhatsApp y sus escrituras PISAN el valor anterior: con los dos orígenes en la
+-- misma columna, levantar el candado del teléfono borraría el ocultamiento
+-- manual. Acá la fila existe o no existe.
+CREATE TABLE IF NOT EXISTS jid_hides (
+  jid        TEXT PRIMARY KEY,
+  created_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -426,25 +519,16 @@ CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE OF body ON messages BEGIN
   INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body);
 END;
 
--- ── FTS5: nombres de chat (CA-12.1 exige buscar también por nombre) ───────
-CREATE VIRTUAL TABLE IF NOT EXISTS chats_fts USING fts5(
-  name, content='chats', content_rowid='rowid',
-  tokenize='unicode61 remove_diacritics 2'
-);
-CREATE TRIGGER IF NOT EXISTS chats_ai AFTER INSERT ON chats BEGIN
-  INSERT INTO chats_fts(rowid, name) VALUES (new.rowid, new.name);
-END;
-CREATE TRIGGER IF NOT EXISTS chats_ad AFTER DELETE ON chats BEGIN
-  INSERT INTO chats_fts(chats_fts, rowid, name) VALUES ('delete', old.rowid, old.name);
-END;
-CREATE TRIGGER IF NOT EXISTS chats_au AFTER UPDATE OF name ON chats BEGIN
-  INSERT INTO chats_fts(chats_fts, rowid, name) VALUES ('delete', old.rowid, old.name);
-  INSERT INTO chats_fts(rowid, name) VALUES (new.rowid, new.name);
-END;
+-- ── FTS5: nombres de chat ─────────────────────────────────────────────────
+-- NO EXISTE. `chats_fts` y sus tres triggers eran el recorte 1 de §10 y se
+-- tomó (R1): los nombres se buscan con `fold()` + `includes` sobre `chats.name`,
+-- `contacts.name` y el jid, tanto en el filtro de la bandeja (CA-5.2) como en la
+-- búsqueda global (`repo.searchChats`, §6.4). `test/db.test.ts` verifica que la
+-- tabla no esté, para que nadie la reintroduzca sin decidirlo.
 ```
 
-**Nota sobre los triggers de UPDATE.** Son `AFTER UPDATE OF body` / `OF name` a propósito: un
-`UPDATE` de `status` (que ocurre en cada confirmación de envío) **no** debe reindexar nada.
+**Nota sobre el trigger de UPDATE.** Es `AFTER UPDATE OF body` a propósito: un `UPDATE` de `status`
+(que ocurre en cada confirmación de envío) **no** debe reindexar nada.
 
 ### 4.2 Creación y migración idempotente (CA-13.4, CA-13.5)
 
@@ -452,8 +536,11 @@ END;
 
 1. `db.exec(SCHEMA_SQL)` — todo es `IF NOT EXISTS`, correr dos veces es un no-op (verificado).
 2. Leer `meta.schema_version` (ausente ⇒ 0). Aplicar en orden las migraciones `> version` de un array
-   `MIGRATIONS: { v: number; sql: string }[]` (vacío en v1; existe para que la v2 no tenga que
-   inventar el mecanismo). Cada migración corre dentro de una transacción.
+   `MIGRATIONS: { v: number; sql: string }[]`. Cada migración corre dentro de una transacción.
+   **Lo construido llegó a `CURRENT_VERSION = 4`** con una sola migración (v3: borrar el chat `0@…`
+   de los avisos oficiales, que se colaba como `+0`). Las tablas nuevas de la v3 y la v4 **no**
+   necesitan entrada: son `CREATE TABLE IF NOT EXISTS` y el `SCHEMA_SQL` corre entero en cada
+   arranque. Lo que sí necesitaría una migración es tocar una tabla que ya existe.
 3. Escribir `meta.schema_version = CURRENT_VERSION`.
 4. `PRAGMA quick_check` — si falla, se lanza `DbCorruptError { path, reason }` que `index.tsx`
    convierte en `<ErrorScreen>` + `exit(2)` (CA-13.6). **Nunca** un stack trace crudo sobre la
@@ -585,8 +672,23 @@ export function resolveChatName(input: {
 ```
 
 `mapMessage` devuelve `null` (se descarta sin persistir) para: `status@broadcast`, newsletters,
-`protocolMessage` que no sea revoke, `reactionMessage`, y mensajes sin `key.remoteJid`.
+**todo** `protocolMessage` (el revoke incluido), `reactionMessage`, mensajes sin `key.remoteJid` y
+mensajes sin `key.id` (sin id no hay dedupe posible).
 Cualquier `getContentType` desconocido cae en `kind: "unsupported"` y **se persiste igual** (CA-7.5).
+
+> ⚠️ **Corrección (tarea 18): el revoke NO sale de `mapMessage`.** El diseño original decía que
+> `mapMessage` devolvía una fila para el revoke; **no lo hace y no debe hacerlo**: un revoke
+> *actualiza* un mensaje que ya está, no inserta uno nuevo, y si insertara, el
+> `ON CONFLICT DO NOTHING` del índice único se comería el borrado (la fila vieja gana y el mensaje
+> nunca se marca como eliminado). El revoke se pregunta con **`isRevoke()` aparte, y se llama en las
+> DOS ramas del ingest**: `messages` (forma cruda: `message.protocolMessage.type === REVOKE`, con el
+> id de la víctima en `protocolMessage.key.id`) y `msg-updates` (forma aplanada que reemite baileys:
+> `messageStubType === REVOKE` con el id de la víctima ya en `key.id`). Si una sola de las dos lo
+> preguntara, el borrado se perdería por el otro camino. Ver también §8.4.
+>
+> Detalle que costó encontrar y que el código deja fijado: al reconstruir el sobre para preguntar por
+> la forma aplanada, el `key` va **después** del spread (`{ ...u.update, key: u.key }`). Al revés, el
+> `key` del `protocolMessage` pisa al de la víctima y se borra el mensaje equivocado — o ninguno.
 
 ### 5.5 `state/store.ts`
 
@@ -608,7 +710,20 @@ export type InboxSnapshot = { chats: ChatRow[]; counts: { all: number; unread: n
 export type ConvoSnapshot = {
   jid: string | null; messages: MessageRow[]; hasMoreAbove: boolean; anchorId: number | null;
 };
-export type UiSnapshot = { toast: { text: string; at: number } | null; connBanner: string | null };
+// ⚠️ Faltaba en el diseño original (§6.4 ya hacía `markDirty("search")` sobre un slice sin tipo).
+// Se definió en la tarea 6 y así quedó: `query` es el texto CRUDO del usuario; los mensajes salen
+// por FTS5 (`searchMessages`, tope 200) y los chats por `fold()`+`includes` (`searchChats`, tope
+// 20) — no por `chats_fts`, que no existe (R1).
+export type SearchSnapshot = { query: string; hits: SearchHit[]; chats: ChatRow[] };
+// El slice `ui` creció con el resto de las tareas: además de `toast` y `connBanner` lleva el filtro
+// y el texto del buscador de la bandeja, el `selectedJid` (CA-4.4), los `drafts` por jid (CA-8.6, el
+// diseño no los definía) y `lockedRevealed`. Los tres últimos son SÓLO memoria: nada de eso se
+// escribe en disco.
+export type UiSnapshot = {
+  toast: { text: string; at: number } | null; connBanner: string | null;
+  inboxFilter: "all" | "unread" | "groups"; inboxQuery: string; selectedJid: string | null;
+  drafts: Record<string, string>; lockedRevealed: boolean;
+};
 
 export function subscribe(slice: Slice, cb: () => void): () => void;
 export function getSnapshot<S extends Slice>(s: S): SnapshotOf<S>;   // CACHEADO: misma identidad hasta el flush
@@ -657,21 +772,44 @@ export function createWaController(deps: {
 }): WaController;
 ```
 
-Opciones del socket — **no negociables**, salen del prior art:
+Opciones del socket. **Dos de las que el diseño daba por "no negociables" eran el bug** — están
+tachadas abajo y explicadas después:
 
 ```ts
 makeWASocket({
   ...(version ? { version } : {}),                 // fetchLatestBaileysVersion (CA-1.2/RNF-10)
   auth: state,
   browser: Browsers.ubuntu("Chrome"),              // WA rechaza clientes sin browser
-  logger: pino({ level: "silent" }),               // CA-16.2
+  logger: createBaileysLogger(log, "warn", onAviso),  // CA-16.2: al ARCHIVO, no a pantalla
   markOnlineOnConnect: false,                      // CA-15.8
-  syncFullHistory: false,
-  shouldSyncHistoryMessage: () => false,
+  syncFullHistory: false,                          // decisión del usuario: "reciente, no todo"
+  // shouldSyncHistoryMessage: () => false,        ← ⛔ SACADO: dejaba la bandeja vacía
   generateHighQualityLinkPreview: false,
   getMessage: async (key) => sentCache.get(key.id ?? "") ?? undefined,   // §8.6
 });
 ```
+
+⚠️ **`shouldSyncHistoryMessage: () => false` era el bug, no una optimización.** Venía del prior art y
+dejaba la bandeja **vacía para siempre**: 0 chats, 0 mensajes, 0 contactos con la sesión conectada de
+verdad. En el fuente de baileys, `Socket/chats.js:931` hace
+`shouldSyncHistoryMessage(historyMsg) && PROCESSABLE_HISTORY_TYPES.includes(...)`: con `() => false`
+el `&&` corta **siempre**, `messaging-history.set` no se emite nunca y el ingest no recibe una sola
+fila. El default de baileys (`Defaults/index.js:65`) es
+`({ syncType }) => syncType !== HistorySyncType.FULL`, o sea "aceptá todo menos el volcado completo",
+que es exactamente lo que queremos. Los dos flags **no son el mismo**: `syncFullHistory` es lo que
+*pedimos* (viaja como `requireFullSync` en el nodo de registro) y `shouldSyncHistoryMessage` es lo
+que *aceptamos* de lo que llega. Corolario: si alguna vez se prende `syncFullHistory: true`, hay que
+poner además un `shouldSyncHistoryMessage` propio que acepte `FULL`, o se descarga y se tira.
+
+⚠️ **`pino({ level: "silent" })` también era el bug.** CA-16.2 pide que nada salga por pantalla, no
+que baileys se calle: con el logger mudo, el aviso que explicaba por qué la agenda no bajaba
+(`"blocked on missing key … parking after 2 attempts"`) no existía en ningún lado y el diagnóstico
+tardó horas. Lo que hay es un `BaileysLogger` propio (`createBaileysLogger`) que escribe en **nuestro
+archivo de log** con nivel `warn`, soporta el `.child({...})` que baileys hace en varias capas, y
+además le pasa cada aviso como texto pelado a un oyente (`onAviso`) que usa `wa/appstate.ts` para
+detectar las colecciones estacionadas. No es un `pino` con destino a un archivo a propósito: pino
+escribiría por su cuenta a un fd y lo único que no puede pasar es que algo toque stdout/stderr crudo
+mientras la TUI pinta.
 
 ### 5.7 `wa/ingest.ts`
 
@@ -688,13 +826,27 @@ export type Ingest = {
   push(job: IngestJob): void;      // O(1), nunca async, nunca throw
   drainNow(): void;                // usado por el cierre ordenado (CA-17.1)
   pendingRows(): number;           // métrica para la UI ("sincronizando… N")
+  stop(): void;                    // ⚠️ el diseño no lo definía: lo necesita §6.6
 };
 export function createIngest(deps: { repo: Repo; store: Store; log: Logger; selfJid(): string;
                                      openChatJid(): string | null }): Ingest;
 ```
 
-Constantes: `MAX_ROWS_PER_TICK = 400`, `MAX_QUEUE_JOBS = 10_000` (si se supera, se loguea y se
-descartan los `history` más viejos — nunca los `notify`).
+`stop()` corta el ingreso: después de llamarlo no entra trabajo nuevo ni se agenda otro tick. Lo usa
+el paso 2 del cierre ordenado, antes del `drainNow()` final; sin él, un `messages.upsert` que llega
+mientras se cierra volvería a agendar un timer y el proceso no muere.
+
+Constantes: `MAX_ROWS_PER_TICK = 400`, **`MAX_MS_PER_TICK = 8`**, `MAX_QUEUE_JOBS = 10_000` (si se
+supera, se loguea y se descartan los `history` más viejos — nunca los `notify`).
+
+⚠️ **El corte por TIEMPO es obligatorio, no una optimización** (esto le faltaba a §5.7 y a D4, que
+decían sólo "400 filas"). Medido: 400 filas sobre una base recién creada son ~14 ms, pero sobre una
+base con 50.000 mensajes ya indexados una vuelta llegó a **38 ms** —el commit de una transacción
+grande dispara un merge del índice FTS—, o sea el doble del presupuesto de 20 ms de RNF-5. Con el
+corte por tiempo las transacciones quedan más chicas, los merges también, y el peor tick de esa misma
+prueba bajó a **9,6 ms**. Las 400 filas siguen siendo el techo de *cantidad*; el tiempo es el otro
+techo. La primera fila de cada vuelta se aplica siempre, aunque el reloj ya esté vencido, así la cola
+siempre avanza.
 
 ### 5.8 `wa/send.ts`
 
@@ -704,9 +856,16 @@ export type SendQueue = {
   enqueue(chatJid: string, text: string): { ok: true; waId: string } | { ok: false; reason: string };
   retry(chatJid: string, waId: string): void;
   inFlight(): Promise<void> | null;      // para el tope de 2 s del cierre (CA-17.7)
+  stop(): void;                          // ⚠️ el diseño no lo definía: lo necesita §6.6
   size(): number;
 };
 ```
+
+`stop()` corta el ingreso de trabajo nuevo y vacía la cola. Sin él, el worker seguiría tomando el
+mensaje siguiente con su espera de 1 s del rate limit y el tope de 2 s del cierre no alcanzaría nunca
+(un solo mensaje encolado ya lo excede). El que ya está en la red se termina —eso es lo que espera
+`inFlight()`— y los que no salieron los deja `failed` con motivo el propio cierre
+(`boot/shutdown.ts`), porque sus filas ya están persistidas como `pending` desde el `enqueue`.
 
 ### 5.9 `boot/*`
 
@@ -722,8 +881,15 @@ type Fields = Record<string, string | number | boolean | null>;   // NUNCA cuerp
 export function createLogger(path: string, maxBytes = 5 * 1024 * 1024): Logger;
 
 // lock.ts — CA-18.*
-export type LockResult = { ok: true; release(): void } | { ok: false; pid: number };
-export function acquireLock(lockPath: string): LockResult;
+// ⚠️ La forma real lleva la marca ajena entera (pid + cmdline) y un `aviso` para el caso "no se pudo
+// escribir el pidfile" (directorio de sólo lectura): ahí se arranca igual —quedarse sin app es peor
+// que el riesgo de dos instancias— y queda la línea en el log.
+export type Marca = { pid: number; cmdline: string };
+export type Lock = { path: string; pid: number; release(): void };
+export type ResultadoLock =
+  | { ok: true;  lock: Lock;  aviso: string | null }
+  | { ok: false; ajena: Marca };
+export function acquireLock(lockPath: string, opts?: LockOpts): ResultadoLock;
 
 // shutdown.ts — CA-17.*
 export function installShutdown(deps: { renderer: CliRenderer; wa: WaController; ingest: Ingest;
@@ -791,19 +957,26 @@ sock.ev "messages.upsert"
   └─ guard s !== current ⇒ return                                     (CA-15.6)
   └─ ingest.push({kind:"messages", msgs, source: type})               ← O(1), vuelve YA
        ...
-     drenador (setTimeout 0, ≤400 filas por vuelta, 1 transacción):
+     drenador (setTimeout 0, ≤400 filas u 8 ms por vuelta, 1 transacción):
        para cada msg:
+         rev = isRevoke(msg);  if (rev) { revokeMessage(...); continue }   ← ⚠️ PRIMERO (§5.4)
          map = mapMessage(msg, ctx);  if (!map) continue              (CA-7.5 persiste "unsupported")
+         if (map.kind === "unsupported" && sin contenido renderizable) continue   ← §8.8, stub CIPHERTEXT
          upsertChat(chatJid, {name resuelto, is_group})               ← FK exige el chat primero
          { inserted } = insertMessage(map)                            ← ON CONFLICT DO NOTHING (CA-14.2)
          if (!inserted) continue                                       ← re-sync: NO reabre contadores (CA-14.4)
          touchChatActivity(jid, ts, previewFor(map), fromMe)          (CA-4.1/4.5)
-         if (!fromMe) {
+         if (!fromMe && source !== "history") {                        ← ⚠️ el history NO suma
            if (jid === openChatJid) { clearUnread(jid, id); pushReadReceipt(map) }   (CA-11.7)
            else bumpUnread(jid, +1)                                                  (CA-10.1)
          }
        markDirty("inbox", jid === openChatJid ? "convo" : null)
 ```
+
+⚠️ **Los mensajes con `source: "history"` no suman no leídos**, y no es un detalle: el `chats` del
+mismo `messaging-history.set` trae el contador **absoluto** del servidor, así que sumar de a uno lo
+contaba dos veces y en el primer arranque **todo el historial aparecía sin leer**. `notify` y `append`
+sí suman.
 
 La bandeja se reordena sola porque la proyección re-consulta `ORDER BY last_message_at DESC`
 (CA-4.2/4.3); el cursor se mantiene sobre el mismo chat porque `Inbox.tsx` guarda el **jid**
@@ -848,7 +1021,8 @@ enviado desde el teléfono llega con `fromMe: true`, no existe en la base y se i
 Ctrl-G ⇒ mode="search"; se guarda { selectedJid, filter, query } para el Esc      (CA-12.8)
 tipear ⇒ setState local; useEffect con debounce 120 ms                            (RNF-7)
        ⇒ match = buildFtsQuery(text)                                              (CA-12.5)
-       ⇒ repo.searchMessages(match, 200) + repo.searchChats(match, 20)            (CA-12.1)
+       ⇒ repo.searchMessages(match, 200)          ← FTS5; si `match` queda vacío, cero mensajes
+       ⇒ repo.searchChats(TEXTO CRUDO, 20)        ← fold+includes, NO FTS (R1)    (CA-12.1)
        ⇒ markDirty("search")
 render ⇒ grupo "Chats" (si hay) + resultados: chat · fecha · fragmento con hits    (CA-12.2)
        ⇒ 0 resultados ⇒ "sin coincidencias" (NO la lista anterior)                (CA-12.4)
@@ -860,10 +1034,16 @@ render ⇒ grupo "Chats" (si hay) + resultados: chat · fecha · fragmento con h
 Los mensajes nuevos aparecen en búsquedas posteriores sin reiniciar porque los triggers indexan en el
 `INSERT` (CA-12.7).
 
+⚠️ **Los chats se buscan aunque no quede ningún término FTS-able.** `buildFtsQuery` parte por "todo lo
+que no sea letra ni número", así que una query de puros símbolos (un emoji, `+549`) se queda en `''` y
+ahí no hay mensajes que buscar — pero el **chat** sí se puede encontrar. Sin esta salvedad, buscar
+`🌻` encontraba "anto 🌻" en la bandeja y decía "sin coincidencias" en la global: la misma query con
+dos respuestas distintas según dónde se escribiera.
+
 ### 6.5 Reconexión (CA-15.*)
 
 ```
-close(code) donde code ∉ {401,500,515}
+close(code) donde code ∉ {401,500,515,440,403}                       ← ⚠️ 440 y 403 NO reintentan
   └─ attempt++, nextAttemptAt = now + reconnectDelayMs(attempt)      2,4,8,16,32,60… (CA-15.2)
   └─ connState = "reconnecting"; markDirty("conn")
   └─ setTimeout(connect, delay)      ← UN solo timer, y connect() aborta si ya hay socket (CA-15.7)
@@ -876,21 +1056,43 @@ Mientras tanto **la TUI sigue viva**: la bandeja, la conversación y la búsqued
 (CA-13.2/15.3). Lo único deshabilitado es el envío (CA-13.3). Los mensajes del corte los reentrega
 WhatsApp al reconectar como `messages.upsert` normales y entran por el flujo 6.2 (CA-15.4).
 
+⚠️ **Dos códigos frenan en seco (`halt`), sin reintento automático** — enmienda de CA-15.2, decidida
+en la tarea 8b:
+
+- **440 `connectionReplaced`**: no es un corte, es un **desalojo** (otra sesión de WhatsApp Web tomó
+  el slot). Reconectar es jugar ping-pong con el otro cliente, y como cada conexión **exitosa**
+  resetea `attempt`, el backoff ni siquiera protege: el loop queda pegado en 2 s para siempre sin
+  escalar nunca a 60.
+- **403 `forbidden`**: WhatsApp rechazó la cuenta. Reintentar solo no la destraba.
+
+En los dos casos **las credenciales no se tocan** (siguen sirviendo), el motivo se publica en
+`link.reason` → `ui.connBanner` (CA-16.5) y la salida es **manual con `Ctrl-R`**, que el propio
+banner nombra.
+
 ### 6.6 Cierre ordenado (CA-17.*)
 
 `shutdown(code)` — idempotente, con **un solo** tope global de 2 s:
 
 1. Marcar `shuttingDown` (segundo `Ctrl-C` ⇒ `process.exit(1)` inmediato).
-2. Parar el drenador de ingest y el worker de envío (no aceptan trabajo nuevo).
-3. `await Promise.race([sendQueue.inFlight(), sleep(2000)])`; lo que no resolvió ⇒
-   `setMessageStatus(..., "failed", "cierre")` (CA-17.7, CA-17.4).
-4. `ingest.drainNow()` — el resto de la cola se escribe sincrónicamente (son inserts, es rápido).
-5. `sock.end(undefined)` dentro de try/catch. **Nunca `logout()`** (CA-17.1/17.6).
-6. `repo.close()` (checkpoint de WAL).
-7. `renderer.destroy()` → sale de la pantalla alternativa, apaga el tracking de mouse, muestra el
+2. `send.stop()` + `ingest.stop()` (+ `appstate.stop()` e `identity.stop()`, los dos reparadores que
+   el diseño no previó): de acá en adelante nadie acepta trabajo nuevo.
+3. `await Promise.race([sendQueue.inFlight(), sleep(2000)])` (CA-17.4).
+4. Lo que no resolvió ⇒ `setMessageStatus(..., "failed", motivo)` (CA-17.7).
+5. `ingest.drainNow()` — el resto de la cola se escribe sincrónicamente (son inserts, es rápido).
+6. `wa.stop()` ⇒ `sock.end(undefined)` dentro de try/catch. **Nunca `logout()`** (CA-17.1/17.6).
+7. **`store.stop()` — VA ACÁ, después del drenador, del worker y del socket, y no antes.** Cualquiera
+   de los tres hace `markDirty` al terminar, y un `markDirty` posterior a un `stop()` prematuro
+   **vuelve a armar el timer de 33 ms** (medido en la revisión de la tarea 6: 1 timer, 1 notify) —
+   ese timer en vuelo impide que el proceso muera. En lo construido `stop()` es además **terminal**
+   (después de él `markDirty` ya no agenda nada), así que esto es cinturón y tiradores.
+8. `repo.close()` (checkpoint de WAL).
+9. `renderer.destroy()` → sale de la pantalla alternativa, apaga el tracking de mouse, muestra el
    cursor (CA-17.2).
-8. `lock.release()` (CA-18.4).
-9. `process.exit(code ?? 0)` (CA-17.3).
+10. `lock.release()` (CA-18.4) y `process.exit(code ?? 0)` (CA-17.3).
+
+Del paso 4 al 10 **no hay un solo `await`**: es un bloque sincrónico a propósito. Si en el medio se
+colara un turno del event loop, un timer del store podría disparar un flush contra una base ya
+cerrada. Y cada paso está envuelto para que su falla no impida los que siguen.
 
 Se engancha a: `Ctrl-C`/`Ctrl-Q` desde `useKeyboard`, `process.on("SIGINT"|"SIGTERM"|"SIGHUP")`
 (CA-17.5) y `uncaughtException`/`unhandledRejection` (log + `exit(1)`). El renderer se crea con
@@ -906,7 +1108,7 @@ Se engancha a: `Ctrl-C`/`Ctrl-Q` desde `useKeyboard`, `process.on("SIGINT"|"SIGT
 <App>                                    modo: browse | compose | search | help | login | too-small
  ├ <Splash t/>                           mientras booting (CA-19.2, saltea con cualquier tecla)
  ├ <TooSmall w h/>                       si w<60 || h<15 (RNF-2), se recupera solo
- ├ <ErrorScreen/>                        base corrupta (CA-13.6) / instancia tomada (CA-18.2)
+ ├ <ErrorScreen/>                        base corrupta (CA-13.6). NO para "instancia tomada": ver abajo
  ├ <Login>                               si link.phase ∉ {linked}
  │   ├ <QrView payload/>                 matriz half-block (D10)
  │   └ <PairingView/>                    input de teléfono + XXXX-XXXX + timer
@@ -921,20 +1123,41 @@ Se engancha a: `Ctrl-C`/`Ctrl-Q` desde `useKeyboard`, `process.on("SIGINT"|"SIGT
     │       └ <Composer/>       <textarea keyBindings=[invertidos]/>  (oculto si no hay chat abierto)
     ├ <SearchOverlay/>          reemplaza el cuerpo cuando mode==="search"
     ├ <Help/>                   reemplaza el cuerpo cuando mode==="help" (incluye ruta del log, CA-16.3)
+    ├ <LockCode/>               reemplaza el cuerpo con `^P` (fijar el código del candado)
     └ <Footer/>                 hints de teclas o toast efímero ≤3 s (CA-19.5)
 ```
+
+⚠️ **La variante de `<ErrorScreen>` para "instancia tomada" NO se hizo, y es a propósito** (el diseño
+la prometía). CA-18.2 pide **una línea** y un código de salida ≠ 0 "sin abrir socket ni tocar
+credenciales": montar el renderer para eso contradice el criterio —además de dejar la terminal en la
+pantalla alternativa por una línea de aviso—. Lo construido imprime la línea por `console.log`
+(**fd 1**, no `console.error`: el fd 2 ya apunta al archivo de log por D9, así que un `error` ahí
+sería invisible) y sale con **3**. El `<ErrorScreen/>` queda **sólo** para la base corrupta (CA-13.6,
+`exit(2)`), que sí ocurre con la interfaz ya montada.
 
 ### 7.2 Layout por ancho (RNF-1, CA-19.4)
 
 | Modo | Ancho | Disposición |
 |---|---|---|
 | `wide` | ≥ 100 | header 3 · bandeja 40% / conversación 60% · footer 1 |
-| `compact` | 72–99 | header 3 · bandeja 34 cols fijas / conversación resto · footer 1. Los tabs se mudan al `title` del panel de la bandeja para no romper el header a 80 cols. |
+| `compact` | 72–99 | header 3 · bandeja 34 cols fijas / conversación resto · footer 1. **Los tabs siguen en el encabezado** (ver abajo). |
 | `mini` | 60–71 | **un panel por vez**: bandeja, `⏎` entra a la conversación, `Esc` vuelve. Header 3 · cuerpo · footer 1 |
 | — | < 60 cols o < 15 filas | `<TooSmall/>` (RNF-2) |
 
 A 80×24 (el caso de RNF-1) el modo es `compact`: 3 + 20 + 1 = 24 filas, bandeja 34 / conversación 44.
 Verificable a ojo con `grim` + Read.
+
+⚠️ **Corrección: los tabs con contadores NO se mudan al `title` del panel en `compact`.** El diseño
+lo proponía y el código no lo hizo, con motivo: **CA-5.5, CA-10.3 y CA-19.1 piden los contadores en
+el ENCABEZADO** —tres veces, con esas palabras— y a 80 columnas con la conexión abierta entran de
+sobra. Lo que se hizo en cambio es **achicar los tabs antes que romper el header**: el renglón útil a
+80 columnas son 76 y ahí adentro tienen que entrar la marca (11), los tres contadores y el badge de
+conexión, que mide 11 caracteres conectado y **34** reconectando con cuenta regresiva. En vez de
+reservar el peor caso —lo que dejaría los tabs en jeroglíficos todo el tiempo— se mide el badge que
+se va a pintar **ahora** y se elige el nivel de detalle más largo que entre, de tres:
+`Todos N · No leídos N · Grupos N` → `Todos N · Sin leer N · Grupos N` → `≡N ✉N ▣N`. El último es de
+glifos justamente para que los **números** no desaparezcan nunca: un contador escondido es peor que
+uno con un ícono en vez de una palabra.
 
 ### 7.3 Teclado
 
@@ -954,32 +1177,58 @@ las combinaciones con `Shift` se evalúan **antes** que las teclas peladas.
 | `Ctrl-E` | browse | enfocar el campo de redacción | 8.1 |
 | `Ctrl-L` | browse | marcar leído sin abrir | 11.5 |
 | `Ctrl-G` | browse | búsqueda global | 12.1 |
-| `Ctrl-R` | browse | reconectar ya | 15.5 |
+| `Ctrl-R` | **todos** | reconectar ya (se evalúa antes de las ramas que se tragan las teclas) | 15.5 |
 | `Ctrl-Y` | browse | reintentar el último envío fallado | 9.3 |
 | `?` (buscador vacío) | browse | ayuda | 16.3, 19.3 |
+| `Ctrl-N` | **todos** | volver a pedir las colecciones de app-state (los nombres de la agenda) | — (tarea 17) |
+| `Ctrl-P` | browse | fijar el código que revela los chats con candado | — (tarea 17) |
+| `Ctrl-X` | browse | esconder/mostrar a mano el chat seleccionado (**dos veces**: pregunta y confirma) | — (tarea 17) |
+| *(el código, tipeado)* | browse | revelar los chats con candado desde el buscador de la bandeja | — (tarea 17) |
+| `Esc` | browse | volver de panel en `mini` → esconder el candado → limpiar el buscador (en ese orden) | 5.4 |
 | `⏎` | compose | **enviar** (binding invertido, V6) | 8.2 |
 | `Alt-⏎` | compose | salto de línea | 8.4 |
 | `Esc` | compose | volver a la bandeja conservando el borrador | 8.5 |
-| `↑`/`↓`, `⏎`, `Esc` | search | mover / abrir en el mensaje / volver al estado previo | 12.3, 12.8 |
+| `↑`/`↓`, `Ctrl-K`/`Ctrl-J`, `PgUp`/`PgDn`, `Inicio`/`Fin` | search | mover la selección | 12.3 |
+| `⏎` / `Esc` | search | abrir en el mensaje / volver al estado previo | 12.3, 12.8 |
+| `⏎` / `Esc` / dígitos / `Backspace` | candado | seguir / cancelar / tipear el código (se ven `•`) | — |
+| `↑`/`↓`, `PgUp`/`PgDn` | help | desplazar el cuerpo si no entra entero | 19.3 |
 | `Tab` | login | alternar QR ↔ código | 2.6 |
-| `Ctrl-R` | login | pedir código nuevo | 2.5 |
+| `Ctrl-R` | login | pedir código nuevo (con el código a la vista) | 2.5 |
+| `Esc` | login | con el código a la vista, volver al input del teléfono | 2.2 |
 | `Esc` / `?` | help | cerrar | 19.3 |
-| `Ctrl-C` / `Ctrl-Q` | todos | salida ordenada | 17.1 |
+| `Ctrl-C` / `Ctrl-Q` | todos | salida ordenada (incluido el splash) | 17.1 |
 
 **Por qué esas teclas y no otras.** El `<input>`/`<textarea>` de OpenTUI consume para edición
 `Ctrl-A/E/W/K/U/D/F/B`, `Ctrl-←/→`, `Ctrl-Backspace/Delete`, `Ctrl--`, `Ctrl-.`. Los comandos elegidos
-(`Ctrl-E`, `Ctrl-L`, `Ctrl-G`, `Ctrl-R`, `Ctrl-Y`) o no colisionan o colisionan de forma inocua (mover
-el cursor del buscador). **Prohibido** `Ctrl-M` (= `⏎`), `Ctrl-I` (= `Tab`), `Ctrl-[` (= `Esc`) y
-`Ctrl-H` (= backspace): son el mismo byte y romperían la navegación. `Ctrl-K`/`Ctrl-J` funcionan
-gracias al protocolo de teclado kitty (Ghostty lo soporta); las flechas son el camino portable y
-siempre están.
+(`Ctrl-E`, `Ctrl-L`, `Ctrl-G`, `Ctrl-R`, `Ctrl-Y`, `Ctrl-N`, `Ctrl-P`, `Ctrl-X`) o no colisionan o
+colisionan de forma inocua (mover el cursor del buscador); verificado en el fuente de OpenTUI 0.4.2,
+donde además `handleKeyPress` devuelve `false` para cualquier combinación con `ctrl` que no tenga
+binding. **Prohibido** `Ctrl-M` (= `⏎`), `Ctrl-I` (= `Tab`), `Ctrl-[` (= `Esc`) y `Ctrl-H`
+(= backspace): son el mismo byte y romperían la navegación. `Ctrl-S`/`Ctrl-Q` son el control de flujo
+XON/XOFF de la tty y `Ctrl-Z` suspende el proceso — por eso `Ctrl-X` fue la última libre.
+
+**`Ctrl-J` sí se distingue de `⏎`** (corrige lo que decía R6). Sin el protocolo de teclado kitty,
+`Ctrl-J` llega como `{ name: "linefeed" }` y `⏎` como `{ name: "return" }`: son bytes distintos
+(0x0A vs 0x0D) y el handler los ve distintos — por eso `linefeed` está listado junto a `Ctrl-J` en
+las teclas que bajan la selección. Lo que el protocolo kitty agrega es que llegue **como `Ctrl-J`**
+(con el flag `ctrl`) en vez de como `linefeed`; las dos formas están cubiertas. Las flechas siguen
+siendo el camino principal y portable.
 
 ### 7.4 Gotchas de OpenTUI que se heredan (no volver a descubrirlos)
 
-1. **Filas de lista con `wrapMode="none"`** y `height={1}`: un evento de mouse re-mide el `<text>` y
-   el wrap rompe el clip (miscosas/README §Mouse). Aplica a `Inbox.tsx` y a las filas de
-   `SearchOverlay.tsx` (CA-4.6, CA-19.7). **No** aplica a `MessageRow.tsx`, donde el wrap por palabra
-   es lo correcto.
+> **Puesta al día (tarea 18).** Todo lo de acá abajo está medido contra **OpenTUI 0.4.2** con el
+> `testRender` del propio paquete o con la demo (`tools/demo.tsx`) y mouse real. Los que se
+> **refutaron** quedan al final, tachados y con el mecanismo verdadero: son los más caros, porque
+> alguien que los lea como ciertos "arregla" el síntoma por el lado equivocado.
+
+**Heredados de miscosas / del prior art**
+
+1. **Filas de lista con `wrapMode="none"` y `height={1}`.** Las dos, y **por motivos distintos**:
+   `height={1}` es lo que le impide a la fila medir dos renglones y empujar a las de abajo, y
+   `wrapMode="none"` es lo que recupera las columnas que el wrap se comía. Aplica a `Inbox.tsx`, a
+   las filas de `SearchOverlay.tsx` y al pie (CA-4.6, CA-19.7). **No** aplica a `MessageRow.tsx`,
+   donde el wrap por palabra es lo correcto. (El "porque el mouse re-mide" del diseño original es
+   falso: ver **Refutados**, al final de esta sección.)
 2. **Nada de `Ctrl-<letra>` para scrollear**: el `<input>` también recibe la tecla. Por eso el scroll
    de la conversación va con `Shift` (CA-6.6).
 3. **`PRAGMA busy_timeout`** en la SQLite, siempre.
@@ -988,6 +1237,82 @@ siempre están.
 5. **El detalle/conversación es un `<scrollbox>` nativo**, que además responde a la rueda.
 6. **Borradores y `initialValue`**: el `<textarea>` toma `initialValue` una sola vez. Para restaurar el
    borrador al volver a un chat hay que remontarlo con `key={chatJid}` (CA-8.6).
+
+**Descubiertos construyendo esto.** Los dos primeros están verificados dos veces (implementador y
+revisor, sobre el camino real del usuario); el resto salió de un harness con `testRender` o de un
+síntoma reproducido y arreglado.
+
+7. **El reconciliador de React de OpenTUI aplica las props nuevas pero NO resetea las que
+   desaparecen.** Dos ramas del **mismo tipo** de elemento en la misma posición del árbol se
+   contaminan entre sí: con la rama "sin chat" llevando `paddingLeft/Right`, al abrir un chat el
+   `<scrollbox>` heredaba ese padding y aparecía corrido una columna, dos columnas más angosto y con
+   el último `✓` comido. **Sólo se ve por el camino real del usuario** —abriendo el chat *después*
+   del montaje; si se monta directo con el chat abierto, la rama vacía nunca se pintó y no hay nada
+   que heredar—, así que un test que monta el estado final no lo detecta. Defensa: que las dos ramas
+   tengan **tipos distintos**, o que cuelguen de una sola caja raíz con las mismas props (lo que hace
+   `Conversation.tsx`), o repetir la prop con su valor neutro en las dos.
+8. **Una caja de ancho AUTO dentro de un `<scrollbox>` con barra se mide con una columna menos de las
+   que se dibuja** (`dibujo = layout + 1`): la barra se descuenta del layout pero no del dibujo. Un
+   texto que se pasa por **un** carácter se mide en dos filas y se pinta en una ⇒ queda una **fila en
+   blanco fantasma** debajo, y el último carácter montado sobre la barra. El padding **no** lo
+   arregla; fijarle el ancho a la fila sí (`MessageRow` recibe `ancho` explícito y `Conversation`
+   reserva la columna de la barra **siempre**, esté o no, para que el ancho no cambie cuando aparece
+   y el texto no se re-envuelva entero).
+9. **OpenTUI SÍ recorta horizontalmente, y con conciencia de ancho de celda.** Medido: una caja de
+   ancho 20 con un texto de 46 caracteres pinta 20 columnas y nada se derrama sobre la caja de al
+   lado; con caracteres de doble ancho (CJK) tampoco parte un glifo al medio. **Pero redondea para
+   arriba en el último glifo ancho**: caja de 8 → 8 columnas, caja de **9 → 10** columnas, caja de
+   10 → 10, caja de **11 → 12**. O sea, con ancho impar y texto de doble ancho se pasa una columna.
+   Lo que **no** recorta es el **desborde vertical**: seis hijos en una caja de alto 3 se dibujan los
+   seis, encimados sobre lo que haya abajo. Por eso las listas se **presupuestan** (`ventana()` en la
+   bandeja, `lineasQueEntran()` en la ayuda) en vez de confiar en el recorte.
+10. **`clip()` cuenta puntos de código, no columnas** (`lib/fmt.ts`). Corta por code points para no
+    escupir medio par suplente, pero un emoji ocupa dos columnas y cuenta como uno: el recorte visual
+    duro lo tiene que hacer OpenTUI (punto 9) o una caja de ancho fijo. Por eso las columnas de la
+    bandeja son **cajas**, no `padEnd` adentro de un string (además, `clip` aplasta los espacios
+    repetidos porque usa `oneLine`).
+11. **`Bun.stringWidth` miente con algunas marcas combinantes.** Medido en Bun 1.3.14: las latinas
+    dan bien (`U+0301`, `U+0303`, `U+0308` → 0), pero **`U+0591` (hebreo) y `U+064B` (árabe) dan 1
+    cuando deberían dar 0**, y `U+20E3` (keycap) da 2. O sea que no sirve como oráculo de ancho para
+    texto arbitrario; en este proyecto sólo se usa **en tests** y sobre texto latino.
+12. **El `<input>`/`<textarea>` se come los `Ctrl-<letra>` que tiene bindeados**: `Ctrl-K` es
+    `delete-to-line-end`, y están además `Ctrl-A/E/W/U/D/F/B`, `Ctrl-←/→`, `Ctrl-Backspace/Delete`,
+    `Ctrl--` y `Ctrl-.`. Cualquier atajo nuevo hay que elegirlo **fuera** de esa lista (§7.3).
+13. **El `<textarea>` trae `return`/`meta+return` INVERTIDOS** respecto de lo que pide el
+    requirements: por default `return` es `newline` y `meta+return` es `submit`. Se dan vuelta con
+    `keyBindings` (CA-8.2/CA-8.4).
+14. **`<ascii-font>` no se recorta: desborda.** Si es más ancho que la terminal rompe el layout en vez
+    de cortarse, así que el splash mide antes de pintarlo.
+15. **Varias teclas dentro del mismo render leen la MISMA closure.** El `useKeyboard` es uno solo y
+    los eventos pueden llegar de a varios entre dos renders: tipear `8264` en la pantalla del candado
+    dejaba **un solo dígito**, porque los cuatro handlers veían el mismo `useState`. Lo que se lee en
+    el teclado tiene que ser un `useRef` (el valor de *ahora*); el `useState` queda sólo para
+    re-pintar. Lo mismo vale para leer el buscador de la bandeja: se lee **en vivo** del store y no
+    del snapshot, que está cacheado hasta el próximo flush (D3).
+16. **`autoFocus` del renderer se lo roba todo con un click.** Con el default (`true`), cualquier
+    click izquierdo hace que OpenTUI camine hacia arriba buscando el primer ancestro focusable y lo
+    enfoque; el `<scrollbox>` de la conversación **es** focusable, así que clickear la conversación
+    le sacaba el foco al buscador y al campo de redacción, y el modo seguía diciendo `compose` con el
+    campo muerto. Se crea con **`autoFocus: false`**: el foco lo decide la app, nunca el mouse.
+17. **Un agendador que ejecute EN EL ACTO rompe el store.** `flush()` limpia `cancelarFlush` y el
+    `markDirty` que lo llamó se lo **reescribe después**, dejándolo colgado y matando todos los flush
+    siguientes (medido: 1 notify en vez de 5). No es un problema de producción —`setTimeout` nunca es
+    sincrónico— pero sí de los tests: el agendador que se inyecta tiene que ser **manual** (encolar y
+    disparar a mano), no uno que ejecute al vuelo.
+
+**Refutados — no volver a escribirlos**
+
+- ~~**Un evento de mouse re-mide el `<text>`**~~ (§7.4.1 del diseño original). **Falso en OpenTUI
+  0.4.2.** Probadas cuatro variantes con mouse real y un harness con `mockMouse` (`moveTo` y `click`
+  sobre un `<text>` que envuelve, sin `height` ni `wrapMode`): el frame sale **byte por byte
+  idéntico** antes y después. El wrap ocurre en el **layout**, desde el primer frame, sin que nadie
+  toque el mouse. Las dos props del punto 1 siguen siendo necesarias, pero por el motivo de ahí, no
+  por éste.
+- ~~**`justifyContent="center"` se come una fila con cantidad impar de hijos**~~. **Falso.** Se
+  intentó reproducir con tres harnesses: con 3, 5 y 7 hijos de alto automático, con `center` y sin
+  `center`, el frame sale idéntico; y con 7 hijos en un cuerpo de 5 filas se pierden los mismos dos
+  con y sin `center`. El mecanismo real es el **desborde vertical** del punto 9, que no tiene nada
+  que ver con cómo se centra.
 
 ---
 
@@ -1029,9 +1354,18 @@ medido, 300 chars → 71 columnas. El diseño lo cubre chequeando la matriz real
   concatenación condicional. Nunca puede salir `undefined`/`NaN` porque el label se construye en
   `lib/placeholder.ts` (puro, con tests que cubren exactamente ese caso).
 - **Tipo desconocido** (CA-7.5): `kind: "unsupported"`, `body: ""`, se persiste igual.
-- **Revoke** (CA-6.9): llega como `messages.update` con `protocolMessage.type === REVOKE`;
-  `revokeMessage()` pone `kind='revoked'` y `body=''` — el trigger `AFTER UPDATE OF body` lo saca del
-  índice FTS, que es lo correcto (un mensaje borrado no debería seguir apareciendo en búsquedas).
+- **Revoke** (CA-6.9): llega por **dos** caminos y hay que atender los dos (corregido en la tarea 18;
+  el diseño nombraba sólo el segundo):
+  1. **crudo**, por `messages.upsert`: el sobre entero con `message.protocolMessage.type === REVOKE`
+     y el id de la víctima en `protocolMessage.key.id`;
+  2. **aplanado**, por `messages.update`: baileys lo reemite con `messageStubType === REVOKE` y el id
+     de la víctima ya en `key.id`.
+
+  `mapMessage` devuelve **`null`** para los dos (§5.4): un revoke *actualiza*, no inserta, y si
+  insertara el `ON CONFLICT DO NOTHING` se comería el borrado. Quien lo detecta es **`isRevoke()`,
+  llamado en las dos ramas del ingest**, y quien lo aplica es `revokeMessage()`: `kind='revoked'` y
+  `body=''` — el trigger `AFTER UPDATE OF body` lo saca del índice FTS, que es lo correcto (un
+  mensaje borrado no debería seguir apareciendo en búsquedas).
 - **Base corrupta** (CA-13.6): `quick_check` en el arranque ⇒ `<ErrorScreen>` con ruta y motivo,
   `exit(2)`.
 
@@ -1043,6 +1377,28 @@ medido, 300 chars → 71 columnas. El diseño lo cubre chequeando la matriz real
   El chat queda leído localmente pase lo que pase (CA-11.4).
 - Sin conexión no se manda nada y tampoco se encola: el `last_read_id` local ya refleja la verdad.
 - Otro dispositivo marca leído ⇒ `chats.update` con `unreadCount` ⇒ `setUnread(jid, n)` (CA-11.6).
+  ⚠️ **Sólo el `unreadCount === 0`**: los positivos se ignoran a propósito, porque
+  `Utils/process-message.js:196` emite `+1` **por mensaje** — o sea que un positivo es un **delta**,
+  no un absoluto, y tomarlo como absoluto pisa el contador con basura.
+
+**Dos cosas que §5.4/§8.5 no decían y que el código sí hace:**
+
+- **`wa/read.ts` NO marca leído en local.** El diseño lo describía como "markRead local + recibos";
+  hace **sólo** el recibo. El `clearUnread` local vive en `commands.markRead`, que es quien tiene el
+  repo y el store a mano. La alternativa era duplicar el `clearUnread` en los dos lados para que los
+  tests de interfaz siguieran andando sin socket.
+- **Hay un tope de 200 claves por recibo** (`MAX_CLAVES_RECIBO`), el mismo en `markRead` y en
+  `pushReadReceipt`. El motivo **no** es el costo de red: `readMessages` agrupa por
+  `(chat, participante)` y manda una sola stanza por grupo (`aggregateMessageKeysNotFromMe`). Es
+  contra R8: un chat que nunca se leyó puede traer miles de sin leer del sync inicial, y anunciarlos
+  todos de golpe es exactamente el ritmo de bot que hay que evitar. Con las últimas 200 el otro lado
+  ve el tilde azul igual, porque lo que mira es el mensaje más nuevo. En las claves, `fromMe: false`
+  no es adorno (baileys descarta las propias al agrupar) y `participant` va **sólo en grupos**.
+- **La guarda `unreadCount > 0` de `commands.markRead` pospone la ráfaga** y deja sin recibo un caso:
+  "sync de historial mientras el chat está abierto". El arreglo de fondo sería que `aplicarChat`, al
+  forzar 0 en el chat abierto, use `clearUnread(jid, ultimoId)` en vez de
+  `upsertChat({ unreadCount: 0 })`, así `unread_count` y `last_read_id` dejan de contradecirse.
+  Queda anotado, no hecho.
 
 ### 8.6 `getMessage` y los reenvíos
 
@@ -1058,6 +1414,43 @@ puntual no se re-entrega — riesgo aceptado y documentado.
 - Texto a enviar: `trim()` no vacío (CA-8.3); sin tope de largo propio (lo pone WhatsApp).
 - Query de búsqueda: `buildFtsQuery` sanitiza y acota a 200 chars / 8 términos (CA-12.5).
 
+### 8.8 Lo que baileys NO hace (verificado en el fuente de 7.0.0-rc14)
+
+Seis cosas que costaron horas de diagnóstico porque la API **parece** decir otra cosa. Todas están
+chequeadas contra `node_modules/baileys/lib` de la versión pineada; si se sube de versión, revisarlas.
+
+- **`fetchLatestBaileysVersion` NUNCA rechaza.** Su `catch` atrapa todo —incluido el `!response.ok`
+  que ella misma lanza— y devuelve `{ version: <la bundleada>, isLatest: false, error }`. O sea que
+  **un `try/catch` alrededor es código muerto**: hay que mirar **`r.error`**, o un fallo de red pasa
+  por éxito y CA-1.3 no se cumple nunca. Y ojo con el tipo: acepta un `RequestInit`, así que pasarle
+  un `signal` **compila**, pero por dentro sólo reenvía `dispatcher`, `method` y `headers` — el
+  `signal` **se descarta** y el timeout hay que hacerlo afuera (`Promise.race`, como en
+  `resolverVersion`).
+- **`creds.registered` no sirve para saber si hay sesión.** Se setea en **un solo lugar**
+  (`Socket/messages-recv.js`, en el flujo del **código de emparejamiento**); vinculando por QR queda
+  en `false` para siempre. Mirándolo, la app pedía QR con una sesión perfectamente válida en disco.
+  El criterio correcto —el que usa baileys— es **`creds.me?.id`**.
+- **`blocklist.set` está declarado en el mapa de eventos pero no lo emite nadie** (0 apariciones en
+  `lib/`). El evento real es **`blocklist.update`**, y llega **de a un jid**, desde la notificación
+  `account_sync`. Hay que escuchar los dos por las dudas, pero la lista inicial hay que **pedirla**
+  (`sock.fetchBlocklist()`, una stanza `iq blocklist` por conexión).
+- **La blocklist no viaja en `critical_block`.** Es una notificación (`account_sync`), no app-state.
+  El **candado** de los chats sí es app-state: `lockChatAction` → evento `chats.lock`
+  (`Utils/chat-utils.js:818`), y viaja por `regular_low`.
+- **`APP_STATE_SYNC_KEY_REQUEST` existe en el proto y baileys NO lo implementa** (está en
+  `WAProto/`, 0 usos en `lib/`). Consecuencia dura: si falta la **clave** de una colección de
+  app-state, no hay forma de pedirla — la colección queda "estacionada" (baileys reintenta dos veces
+  y la aparca) y **lo único que la recupera es re-vincular**, porque esa clave la comparte el
+  teléfono cuando enlaza el dispositivo. Probado en vivo: después de re-vincular aparecieron 3 claves
+  donde había 2 y llegaron los 11 chats con candado. Antes de rendirse conviene el truco de borrar el
+  marcador de versión local de esa colección, así la consulta pasa de "los cambios desde la v68" —que
+  son los que no se pueden descifrar— a "el estado completo", que viene con otra clave.
+- **Un mensaje `CIPHERTEXT` no descifrable vuelve con el MISMO `key.id`.** Baileys pide el reenvío y
+  el mensaje real llega con esa misma clave (`Socket/messages-recv.js:1299`). Si el stub ya se
+  persistió, el `ON CONFLICT DO NOTHING` se come la versión buena y esa fila queda **envenenada para
+  siempre** como "no soportado". Por eso el ingest **no persiste** los sobres sin contenido
+  renderizable.
+
 ---
 
 ## 9. Riesgos y mitigaciones
@@ -1066,10 +1459,10 @@ puntual no se re-entrega — riesgo aceptado y documentado.
 |---|---|---|---|
 | R1 | `dlopen("libc.so.6")` falla (otra libc, FFI deshabilitado) y los warnings de `ws` aparecen sobre el render | Alto (RNF-4) | El wrapper de `~/.local/bin` redirige `2>>` al mismo log: la pantalla queda limpia igual. `redirectStderrTo` devuelve `false` y se loguea, nunca lanza |
 | R2 | Alternar de código a QR podría dejar de emitir `qr` sobre el mismo socket (no verificado con rc14) | Medio (CA-2.6) | Al volver a QR, si en 10 s no llegó ningún `qr`, se recicla el socket (`end()` + `connect()`), que es el mismo camino ya probado del backoff. Verificarlo es la **primera** prueba manual de la tarea de login |
-| R3 | `bun:sqlite` es síncrono: una escritura grande congela el render y el teclado | Alto (RNF-5/6) | Chunking a 400 filas por transacción + `setTimeout(0)` entre chunks (D4). Test de carga: 5.000 mensajes sintéticos midiendo la latencia máxima de un tick |
+| R3 | `bun:sqlite` es síncrono: una escritura grande congela el render y el teclado | Alto (RNF-5/6) | Chunking a 400 filas **u 8 ms** por transacción + `setTimeout(0)` entre chunks (D4). ⚠️ El tope por tiempo lo agregó la construcción: sólo con el de filas, una vuelta sobre 50.000 mensajes indexados llegó a 38 ms. Test de carga: 5.000 mensajes sintéticos midiendo la latencia máxima de un tick |
 | R4 | Ráfaga de `messages.upsert` en el sync inicial ⇒ tormenta de renders | Alto (RNF-5) | Notificación coalescida a ≤30 fps (D3) + test `store.test.ts`: 500 upserts ⇒ 1 notify |
 | R5 | `Shift-PgUp` lo intercepta tmux (copy-mode) antes que la app | Medio (CA-6.5) | Documentado en el README con el `unbind -n S-PPage`; `Shift-↑/↓` cubre el caso a mano y siempre llega |
-| R6 | `Ctrl-J`/`Ctrl-K` dependen del protocolo de teclado kitty; en una terminal legacy `Ctrl-J` == `⏎` | Bajo | Las flechas son el camino principal y portable; el README lo aclara |
+| R6 | ~~En una terminal legacy `Ctrl-J` es indistinguible de `⏎`~~ **REFUTADO (tarea 18)**: sin protocolo kitty llegan como `{name:"linefeed"}` y `{name:"return"}` — bytes distintos (0x0A / 0x0D), el handler los ve distintos. Lo único que agrega kitty es que llegue *como* `Ctrl-J` con el flag `ctrl` | Nulo | Las tres formas están cubiertas (`ctrl+k/j`, `linefeed`, flechas). Las flechas siguen siendo el camino principal y portable |
 | R7 | Identidades LID (`@lid`) vs PN (`@s.whatsapp.net`): el mismo humano podría aparecer como dos chats | Medio | v1 normaliza con `jidNormalizedUser` y **no** fusiona identidades. Documentado como limitación conocida; si aparece en la práctica, la fusión es una historia nueva (hay `lid-mapping.update` para hacerlo bien) |
 | R8 | Ban / rate limit de WhatsApp por ritmo de envío | Alto (cuenta real de Gon) | Techo conservador de RNF-8 (1/s, 20/min), serializado, sin ráfagas. `markOnlineOnConnect:false` y sin presencia para parecer lo menos "bot" posible |
 | R9 | El eco/re-sync duplica mensajes o reabre no leídos | Medio (CA-14.4) | Índice único + "solo cuenta si `inserted`" (§6.2). Cubierto por `db.test.ts` |
@@ -1089,6 +1482,11 @@ corriendo sobre una base nueva ignora columnas que no conoce. Sin feature flags:
 
 Cosas del requirements que, a mi juicio, **cuestan más de lo que aportan**. No las saco por mi cuenta;
 las dejo señaladas para que el usuario decida antes de que el planner las convierta en tareas.
+
+> **Qué se decidió (tarea 18).** Se tomaron los recortes **1** (`chats_fts`, R1) y **2** (ventana fija
+> de 500 sin paginado, R2), y también el **3** (sin pantalla de ajustes, R3). El 4 y el 5 no se
+> tocaron: el FTS sigue indexando sólo `body` y el filtro `Grupos` está. Los dos recortes tomados
+> están documentados en el README como limitaciones y trazados en §12.
 
 1. **`chats_fts` (parte de CA-12.1: "y sobre los nombres de chat").** Es casi redundante con el filtro
    de la bandeja (CA-5.2), que ya busca por nombre y número sin acentos. Cuesta una tabla virtual y
@@ -1113,21 +1511,35 @@ las dejo señaladas para que el usuario decida antes de que el planner las convi
 
 ## 11. Preguntas abiertas
 
-1. **Recibos de lectura por default.** El diseño asume `readReceipts: true` (comportamiento de un
-   cliente real). Si Gon prefiere leer invisible, se invierte el default en `config.json` — cero
-   cambios de código. (Es la pregunta abierta 2 del requirements; el diseño la deja como un flag,
-   no como una decisión de arquitectura.)
-2. **Ventana inicial de conversación.** 200 mensajes (CA-6.8) vs. la propuesta de recorte 2
-   (500 sin paginado). Afecta directamente cuántas tareas salen de la conversación.
-3. **Chats LID.** Si al probar aparecen contactos duplicados (`@lid` y `@s.whatsapp.net`), hay que
-   decidir si v1 los fusiona. Hoy el diseño dice que no (R7).
-4. **`--no-splash` y CA-13.1.** El "≤1 s hasta la bandeja" se mide con `--no-splash`; con splash, la
-   base se carga **detrás** de la animación (la bandeja ya está lista cuando termina). Si se quiere
-   medir el número con splash, hay que bajar la animación de 1,5 s a ~0,8 s.
+**Cerradas por la construcción (tarea 18):**
+
+1. ~~**Recibos de lectura por default.**~~ Quedó `readReceipts: true` (comportamiento de un cliente
+   real), configurable a mano en `config.json` y sin pantalla de ajustes (recorte 3). Documentado en
+   el README como limitación, porque **la otra persona ve el tilde azul**.
+2. ~~**Ventana inicial de conversación.**~~ Se tomó el recorte 2: **500 mensajes, sin paginado**.
+3. ~~**Chats LID.**~~ Aparecieron de verdad (3 chats `@lid` en la cuenta real): **no se fusionan**
+   (R7), pero **sí se comparte el nombre** entre las dos identidades vía `jid_aliases` — sin eso la
+   bandeja mostraba números en casi todos lados, porque WhatsApp manda los nombres de la agenda
+   pegados al LID. Documentado en el README.
+4. **`--no-splash` y CA-13.1.** Sigue igual: el "≤1 s hasta la bandeja" se mide con `--no-splash`;
+   con splash, la base se carga **detrás** de la animación (la bandeja ya está lista cuando termina).
+
+**Abiertas de verdad:**
+
+5. **Contactos 1:1 que muestran sólo el número.** En la cuenta real quedaron 8 chats así, con fila en
+   `contacts` pero con `name`, `notify` y `verifiedName` **los tres vacíos**; y los mensajes de
+   historial no traen `pushName` (sólo lo traen los que llegan en vivo). La hipótesis —sin confirmar—
+   es que son personas **no agendadas**, que en el teléfono también se ven como número: si es eso,
+   no hay bug, y la mejora posible sería mostrar el `~alias` que la persona se puso. **Falta
+   verificarlo contra el teléfono.**
 
 ---
 
 ## 12. Trazabilidad — criterio → dónde vive
+
+> **Corregida contra lo construido (tarea 18).** Las filas que cambiaron llevan ⚠️ y dicen qué decía
+> antes. Dos criterios quedaron **cubiertos en parte y a propósito** (CA-6.8 y CA-12.1, recortes 2 y
+> 1 de §10) y están documentados como limitación en el README.
 
 ### Área A — Vinculación y sesión
 
@@ -1135,7 +1547,7 @@ las dejo señaladas para que el usuario decida antes de que el planner las convi
 |---|---|
 | 1.1 | `index.tsx` (creds en disco) → `link.phase="need-link"` → `ui/Login.tsx` |
 | 1.2 | `wa/socket.ts` `fetchLatestBaileysVersion()` antes de `makeWASocket` |
-| 1.3 | `wa/socket.ts` try/catch → `log.warn("wa.version.fallback")` + sigue con la bundleada |
+| 1.3 | ⚠️ `wa/socket.ts` `resolverVersion`: mira **`r.error`** (más un `Promise.race` de 8 s) → `log.warn("wa.version.fallback")` + sigue con la bundleada. *Decía "try/catch": sería código muerto, `fetchLatestBaileysVersion` nunca rechaza (§8.8)* |
 | 1.4 | `wa/socket.ts` flag `sawQr` + close 405 ⇒ `link.phase="failed"` con motivo |
 | 1.5 | `wa/qr.ts` (matriz) + `ui/QrView.tsx` + `fitsQr()` (D10) |
 | 1.6 | `<QrView key={qr}>` sobre `link.qr` (re-render, no impresión) |
@@ -1180,14 +1592,14 @@ las dejo señaladas para que el usuario decida antes de que el planner las convi
 
 | CA | Dónde |
 |---|---|
-| 6.1 | `repo.lastMessages(jid,200)` asc + `stickyStart="bottom"` |
+| 6.1 | ⚠️ `repo.lastMessages(jid, 500)` asc + `stickyStart="bottom"` *(200 → 500 por el recorte 2)* |
 | 6.2 | `ui/MessageRow.tsx` (hora, autor, cuerpo; alineación/color por `fromMe`) |
 | 6.3 | `sender_name` mostrado si `chat.isGroup && !fromMe` |
 | 6.4 | `stickyScroll` (se despega solo si el usuario scrolleó) + badge "↓ N nuevos" |
 | 6.5 | `Shift-↑/↓` `scrollBy(±2)`; `Shift-PgUp/PgDn` media página |
 | 6.6 | Regla explícita en §7.3: ningún `Ctrl-<letra>` para scroll |
 | 6.7 | `useEffect` sobre `convo.jid` ⇒ `scrollTop = scrollHeight` |
-| 6.8 | `repo.messagesBefore` disparado al llegar arriba (ver recorte 2) |
+| 6.8 | ⚠️ **Cubierto en parte, a propósito (recorte 2 / R2).** La ventana al abrir un chat es de **500 mensajes** (`repo.lastMessages`) y **no hay carga incremental al scrollear hacia arriba**: `repo.messagesBefore` existe y está testeado, pero **nadie lo llama**. Lo que sí hay es el aviso de que quedó historial arriba (`hayMasArriba`, que en el camino anclado cuenta las filas de la mitad de arriba en vez de mirar `hasMoreAbove`, que ahí miente). Documentado como limitación en el README |
 | 6.9 | `repo.revokeMessage` + label `🚫 mensaje eliminado` |
 | 7.1 | `lib/placeholder.ts` (tabla de labels por `kind`) |
 | 7.2 | `body` (caption) renderizado debajo del label |
@@ -1223,18 +1635,18 @@ las dejo señaladas para que el usuario decida antes de que el planner las convi
 | 10.4 | Filtro `No leídos` sobre `unreadCount > 0` |
 | 10.5 | `unread_count` persistido; `bootstrap()` lo lee antes de conectar |
 | 11.1 | `commands.openChat` ⇒ `clearUnread(jid, maxId)` |
-| 11.2 | `wa/read.ts` `sock.readMessages(keys)` desde `last_read_id` |
+| 11.2 | ⚠️ `wa/read.ts` `sock.readMessages(keys)` desde `last_read_id`, tope de 200 claves. **Sólo el recibo**: el marcado local es `commands.markRead` (§8.5) |
 | 11.3 | `config.readReceipts === false` ⇒ solo local |
 | 11.4 | `catch` que loguea y sigue |
 | 11.5 | `Ctrl-L` ⇒ `commands.markRead(jid)` (mismo camino) |
-| 11.6 | `chats.update.unreadCount` ⇒ `setUnread` |
+| 11.6 | ⚠️ `chats.update.unreadCount` ⇒ `setUnread` **sólo si es 0**: los positivos son un delta (`+1` por mensaje), no un absoluto (§8.5) |
 | 11.7 | El ingest no incrementa si el chat está abierto; marca leído al vuelo |
 
 ### Área F — Búsqueda
 
 | CA | Dónde |
 |---|---|
-| 12.1 | `repo.searchMessages` + `repo.searchChats` (FTS5) |
+| 12.1 | ⚠️ **Cubierto por dos caminos distintos, y sólo uno es FTS (recorte 1 / R1).** Los **mensajes**: `repo.searchMessages` (FTS5 + bm25 + `snippet`, tope 200). Los **nombres de chat**: `repo.searchChats`, que **no** usa `chats_fts` —no existe— sino `fold()` + `includes` sobre `chats.name`, `contacts.name` y el jid; el mismo criterio del filtro de la bandeja (CA-5.2), así que las dos puertas dan el mismo resultado. El overlay de `Ctrl-G` muestra los dos grupos. *Decía "(FTS5)" para los dos* |
 | 12.2 | `snippet()` con `char(1)/char(2)` + `parseSnippet` ⇒ spans resaltados |
 | 12.3 | `openChat(jid,{anchorId})` + `messagesAround` + `scrollChildIntoView` + marca visual |
 | 12.4 | Estado explícito "sin coincidencias"; la lista previa se descarta |
@@ -1267,7 +1679,7 @@ las dejo señaladas para que el usuario decida antes de que el planner las convi
 | CA | Dónde |
 |---|---|
 | 15.1 | `conn.state` con 5 valores (⊃ los 3 pedidos) en `<ConnBadge/>` |
-| 15.2 | `lib/backoff.ts` `reconnectDelayMs` (2 s → 60 s) |
+| 15.2 | ⚠️ `lib/backoff.ts` `reconnectDelayMs` (2 s → 60 s) para todo lo que cae en `decideOnClose` ⇒ `reconnect`, **menos dos excepciones con acción `halt`**: 440 `connectionReplaced` y 403 `forbidden` (ver la enmienda de CA-15.2 en el requirements y CA-16.5) |
 | 15.3 | `attempt` + `nextAttemptAt` en el header; la TUI nunca se bloquea |
 | 15.4 | `open` ⇒ `attempt=0` + envío habilitado; los mensajes del corte entran por 6.2 |
 | 15.5 | `Ctrl-R` ⇒ `commands.reconnectNow()` |
@@ -1275,9 +1687,10 @@ las dejo señaladas para que el usuario decida antes de que el planner las convi
 | 15.7 | `connect()` aborta si ya hay socket o hay uno arrancando |
 | 15.8 | `markOnlineOnConnect: false` |
 | 16.1 | `boot/log.ts` con timestamp por línea |
-| 16.2 | `pino({level:"silent"})` + `dup2(fd2)` + toasts como único canal en pantalla |
+| 16.2 | ⚠️ `createBaileysLogger` (nivel `warn`) **al archivo de log**, `dup2(fd2)` (D9) y toasts como único canal en pantalla. *Decía `pino({level:"silent"})`: callarlo escondía el aviso que explicaba por qué no bajaba la agenda (§5.6)* |
 | 16.3 | `<Help/>` muestra `logger.path` |
 | 16.4 | Rotación a `.log.1` al superar 5 MB |
+| 16.5 | ⚠️ **CA nuevo** (enmienda de la tarea 18): `ui.connBanner`, la línea persistente del encabezado que espeja `link.reason` y se limpia sola al abrir la conexión. Es lo que hace visible un cierre con `halt` (440/403), donde `link.phase` sigue en `linked` y sin banner el usuario vería "sin conexión" para siempre sin enterarse de que la salida es `Ctrl-R` |
 
 ### Área I — Ciclo de vida
 
@@ -1291,7 +1704,7 @@ las dejo señaladas para que el usuario decida antes de que el planner las convi
 | 17.6 | El cierre no toca `credsDir` ni el `.sqlite` |
 | 17.7 | Envío en vuelo pasa a `failed` al vencer los 2 s |
 | 18.1 | `acquireLock(lockPath)` en el arranque |
-| 18.2 | `<ErrorScreen/>` de una línea + `exit(3)` antes de abrir socket |
+| 18.2 | ⚠️ `console.log` de **una línea** (fd 1) + `exit(3)`, antes de abrir la base y el socket. *Decía `<ErrorScreen/>`: montar el renderer contradice el "sin abrir nada" del criterio (§7.1)* |
 | 18.3 | `kill(pid,0)` ESRCH o `/proc/<pid>/cmdline` que no matchea ⇒ marca huérfana |
 | 18.4 | `lock.release()` en el paso 8 del shutdown + `process.on("exit")` |
 
@@ -1304,7 +1717,7 @@ las dejo señaladas para que el usuario decida antes de que el planner las convi
 | 19.3 | `ui/Help.tsx`, cierra con `Esc` |
 | 19.4 | Flex + `useTerminalDimensions`; selección por jid |
 | 19.5 | `store.toast()` + auto-limpieza a los 2,6 s |
-| 19.6 | `install.sh` genera `~/.local/bin/wacosas` (+ alias corto `wc`) |
+| 19.6 | ⚠️ `install.sh` genera `~/.local/bin/wacosas` + alias corto **`wa`**. *El plan decía `wc`: es el `word count` de coreutils y ponerlo antes en el PATH rompe scripts ajenos* |
 | 19.7 | `wrapMode="none"` en todas las filas de lista |
 
 ### Restricciones no funcionales
@@ -1315,7 +1728,7 @@ las dejo señaladas para que el usuario decida antes de que el planner las convi
 | 2 | `<TooSmall/>` bajo 60×15, recuperación automática |
 | 3 | El pairing es una pantalla de primera clase, elegida automáticamente por tamaño (D11) |
 | 4 | `dup2(fd2)` (D9) + `2>>` en el wrapper |
-| 5 | Handlers O(1) + cola + chunking de 400 filas + flush coalescido (D3/D4) |
+| 5 | ⚠️ Handlers O(1) + cola + chunking de **400 filas *o* 8 ms** por tick + flush coalescido (D3/D4). *El corte por tiempo faltaba y es obligatorio: 400 filas solas llegan a 38 ms sobre base poblada (§5.7)* |
 | 6 | Índices `idx_chats_activity` / `idx_messages_chatts`; la selección es estado React puro |
 | 7 | Debounce 120 ms + FTS5 con bm25 y `LIMIT 200` |
 | 8 | `lib/ratelimit.ts` (1/s, 20/min) + cola serializada (D8) |

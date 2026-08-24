@@ -549,7 +549,15 @@
 > duplicadas (R7) **es real** y no era un efecto del flag del historial, como se había
 > hipotetizado. El README ya la documenta; no hace falta cambiar nada.
 
-- [ ] 18. **[PRUEBA MANUAL — cuenta real de WhatsApp]** Recorrido end-to-end y documentación final
+- [x] 18a. Sincronizar diseño, requisitos y README con lo que se construyó
+  - *(mitad de la tarea 18, separada por el orquestador: esta parte no necesita el teléfono)*
+  - files: `.sdd/wa-tui/design.md`, `.sdd/wa-tui/requirements.md`, `README.md`
+  - hecho: §3, §4.1/4.2, §5.4-5.9, §6.2/6.4/6.5/6.6, §7.1-7.4 (reescrita con 17 gotchas verificados
+    y **2 marcados como refutados**), §8.4/8.5, **§8.8 nueva** con los 6 hallazgos de baileys, R6, §10,
+    §11, §12 (13 filas corregidas); CA-15.2 enmendada (440/403 fuera del backoff) y **CA-16.5 nuevo**;
+    README con las teclas completas, los códigos de salida y las limitaciones reales.
+
+- [ ] 18b. **[PRUEBA MANUAL — cuenta real de WhatsApp]** Recorrido end-to-end y documentación final
   - covers: CA-3.1, CA-3.2, CA-3.5, CA-6.9, CA-8.2, CA-8.4, CA-8.7, CA-8.8, CA-9.1, CA-9.2, CA-9.3,
     CA-9.4, CA-9.5, CA-11.2, CA-11.6, CA-14.3, CA-14.4, CA-15.1, CA-15.3, CA-15.4, CA-15.5,
     CA-19.6, RNF-12 (aviso), R7 (LID)

@@ -4,9 +4,13 @@
 // Cinco cosas que gobiernan este archivo:
 //
 //  1. **Cada fila mide EXACTAMENTE una línea** (`height={1}` + `wrapMode="none"`
-//     + `clip()` sobre cada string, §7.4.1). No es cosmético: un evento de mouse
-//     vuelve a MEDIR el `<text>`, y si el wrap está habilitado la fila crece,
-//     empuja a las de abajo y la lista queda corrida (CA-19.7).
+//     + `clip()` sobre cada string, §7.4.1). No es cosmético, y las tres cosas
+//     van por motivos distintos: sin `height={1}` un texto más largo que el panel
+//     se mide en dos renglones desde el PRIMER frame, empuja a las filas de abajo
+//     y la lista queda corrida (CA-19.7); `wrapMode="none"` recupera las columnas
+//     que el wrap se comía. (Lo que NO pasa —refutado en la tarea 18 con
+//     `mockMouse`, §7.4— es que un evento de mouse re-mida el `<text>`: el frame
+//     sale idéntico antes y después de mover y clickear.)
 //  2. **Las filas que se pintan se PRESUPUESTAN, no se recortan.** OpenTUI no
 //     esconde a los hijos que no entran en el alto de una caja: los dibuja
 //     ENCIMADOS. Por eso la ventana visible se calcula a mano (`ventana()`) y se

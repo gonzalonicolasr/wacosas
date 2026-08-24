@@ -11,9 +11,10 @@ servicio aparte. Corre con **Bun**.
 > o que se lleve el disco, puede leer todo**. En la v1 no hay cifrado en reposo. Si eso no te sirve,
 > no lo instales en una máquina compartida.
 
-**Estado: en construcción.** Hoy está el andamio (rutas, permisos, instalador y el entry con sus
-flags). La interfaz, la base y la conexión con WhatsApp se van sumando en las tareas siguientes del
-plan que vive en `.sdd/wa-tui/`.
+**Estado: usable.** Vincula, sincroniza el historial, lista la bandeja, abre conversaciones, envía
+texto, marca leído, busca en todo lo guardado y sale limpio. Lo que **no** hace está en
+[Limitaciones conocidas](#limitaciones-conocidas) — leelas antes de esperar algo que no está. El plan
+completo (requisitos, diseño y tareas) vive en `.sdd/wa-tui/`.
 
 ## Requisitos
 
@@ -46,6 +47,21 @@ wacosas --version     # imprime la versión y sale
 wacosas --help        # ayuda
 ```
 
+### La primera vez: vincular
+
+Al arrancar sin sesión, wacosas te muestra la pantalla de vinculación y **elige el método por el
+tamaño de tu terminal**:
+
+- **QR** si entra (necesita **67 × 34**, o sea una terminal grande);
+- **código de emparejamiento** de 8 caracteres si no: escribís tu número con el código de país y sin
+  `+`, y lo tipeás en el teléfono (*Dispositivos vinculados → Vincular con número de teléfono*).
+
+`Tab` alterna entre los dos cuando quieras. Con el código a la vista, `Ctrl-R` pide otro y `Esc`
+vuelve al campo del número (WhatsApp devuelve un código para **cualquier** número bien formado: no
+valida que sea tuyo, así que un dígito de más te deja esperando un código que tu teléfono nunca te va
+a pedir). Después del escaneo, WhatsApp cierra la conexión a propósito y wacosas la reabre sola: eso
+es lo que deja la sesión completa, no lo interrumpas.
+
 ### `--qr-png[=RUTA]` — escanear el QR cuando no entra en la terminal
 
 El QR de WhatsApp mide **34 filas × 67 columnas**: en una pane de 80×24 no entra, y por eso wacosas
@@ -71,7 +87,8 @@ Se respeta XDG; si no tenés las variables seteadas, los defaults son:
 | Configuración | `~/.local/share/wacosas/config.json` |
 | Código del candado (hash) | `~/.local/share/wacosas/lock-code.json` |
 | QR como PNG (sólo con `--qr-png`) | `~/.local/share/wacosas/qr.png` |
-| Log | `~/.local/state/wacosas/wacosas.log` |
+| Marca de instancia única | `~/.local/share/wacosas/wacosas.lock` |
+| Log | `~/.local/state/wacosas/wacosas.log` (+ `.log.1`) |
 
 Los directorios de datos y de estado se crean solos al arrancar, con permisos `0700`.
 
@@ -93,12 +110,104 @@ valen los defaults. Si el JSON está mal formado se usan los defaults y queda un
 
 ## Teclas
 
-Pendiente: se documentan cuando esté la interfaz (tarea 18 del plan).
+Todas las vigentes. En la app las tenés con **`?`** (se abre sólo con el buscador vacío; con texto
+tipeado el `?` es un carácter más).
+
+### En cualquier lado
+
+| Tecla | Qué hace |
+| --- | --- |
+| `?` | abrir / cerrar la ayuda |
+| `Ctrl-R` | reconectar **ya**, sin esperar el backoff. En la pantalla de vinculación con el código a la vista, pide **otro** código |
+| `Ctrl-N` | volver a pedirle a WhatsApp las colecciones de app-state (los **nombres de la agenda**, los candados). Ver la limitación de más abajo |
+| `Ctrl-C` · `Ctrl-Q` | salir ordenado. Un **segundo** `Ctrl-C` sale en el acto, sin esperar nada |
+
+### En la bandeja
+
+| Tecla | Qué hace |
+| --- | --- |
+| *(escribir)* | filtra la lista por nombre o número — el buscador está **siempre** enfocado, no hay que apretar nada |
+| `Ctrl-G` | búsqueda global en todo el historial |
+| `↑` `↓` · `Ctrl-K` `Ctrl-J` | mover la selección (la rueda del mouse también) |
+| `PgUp` `PgDn` | saltar una pantalla · `Inicio` `Fin` van a las puntas |
+| `⏎` | abrir el chat (o **doble click**; un click solo lo selecciona) |
+| `Ctrl-L` | marcarlo leído **sin** abrirlo |
+| `Tab` | ciclar el filtro: Todos → No leídos → Grupos (los tabs también se clickean) |
+| `Esc` | limpiar el buscador · volver a esconder los chats con candado · en terminal angosta, volver de panel |
+| `Ctrl-P` | fijar el código que revela los chats con candado |
+| `Ctrl-X` | esconder a mano el chat seleccionado — **dos veces**: la primera pregunta en el pie, la segunda esconde |
+| *(tu código)* | escrito en el buscador, revela los chats con candado |
+
+### En la conversación
+
+| Tecla | Qué hace |
+| --- | --- |
+| `Shift-↑` `Shift-↓` | scrollear el chat línea a línea |
+| `Shift-PgUp` `Shift-PgDn` | media página · `Shift-Inicio` `Shift-Fin` a las puntas |
+| `Ctrl-E` | enfocar el campo de redacción |
+| `⏎` | **enviar** |
+| `Alt-⏎` | salto de línea dentro del mensaje |
+| `Esc` | volver a la bandeja **conservando el borrador** |
+| `Ctrl-Y` | reintentar el último envío que falló en ese chat |
+
+> **`Shift-PgUp` te lo puede robar tmux** (entra en copy-mode antes que la app). Si te pasa:
+> `tmux unbind -n S-PPage` (y `S-NPage`). `Shift-↑`/`Shift-↓` no lo intercepta nadie.
+>
+> **`Ctrl-K`/`Ctrl-J`** andan en cualquier terminal: sin el protocolo de teclado kitty, `Ctrl-J` llega
+> como *linefeed* y se distingue igual de `⏎`. Las flechas son el camino de siempre.
+
+### En la búsqueda global (`Ctrl-G`)
+
+Escribís y la lista se arma sola (chats por nombre arriba, mensajes abajo). `↑`/`↓` —o `Ctrl-K`/
+`Ctrl-J`, `PgUp`/`PgDn`, `Inicio`/`Fin`— mueven; **`⏎`** abre el chat **posicionado en ese mensaje**,
+señalado; **`Esc`** vuelve a la bandeja con el mismo chat seleccionado y el mismo filtro que tenías.
+
+### En terminales angostas (menos de 72 columnas)
+
+Se ve **un panel por vez**: `⏎` entra a la conversación, `Esc` vuelve a la bandeja, y ahí las flechas
+y `PgUp`/`PgDn` **sin `Shift`** scrollean el chat.
 
 ## Arquitectura
 
-Pendiente: resumen de los módulos y sus límites (tarea 18 del plan). Por ahora, el diseño completo
-está en `.sdd/wa-tui/design.md`.
+Un solo proceso Bun con los dos mundos adentro y **un límite explícito** entre ellos:
+
+- **`src/wa/`** — WhatsApp (Baileys). El socket (`socket.ts`) tiene un ciclo de vida propio con
+  backoff; todo lo que llega entra por **una cola serializada** (`ingest.ts`) que escribe a SQLite de
+  a chunks (400 filas u 8 ms por vuelta, lo que llegue primero), así una sincronización de miles de
+  mensajes nunca traba el teclado. Los envíos salen por otra cola con rate limit (1/s, 20/min).
+- **`src/db/`** — SQLite (`bun:sqlite`, WAL, FTS5) es la **fuente de verdad**: la interfaz arranca
+  leyendo la base y es navegable **sin conexión**. WhatsApp es un productor de eventos, no un
+  requisito para que la app funcione.
+- **`src/state/`** — un store externo con notificación **coalescida** (como mucho un render cada
+  33 ms). React lo lee con `useSyncExternalStore` por *slice* y es dueño sólo de lo que no toca ni la
+  red ni el disco. La UI habla con la máquina por un único módulo de comandos.
+- **`src/ui/`** — OpenTUI + React. Un solo manejador de teclado que rutea por modo.
+- **`src/boot/`** — rutas XDG, permisos, log con rotación, instancia única y cierre ordenado.
+
+El diseño completo (con los gotchas ya pagados, que son varios) está en `.sdd/wa-tui/design.md`.
+
+### El log
+
+`~/.local/state/wacosas/wacosas.log`, rotado a `.log.1` al pasar los 5 MB. Ahí va **todo**: la
+conexión con su código de cierre, los envíos, los errores de base y hasta los avisos de Baileys. Es
+también el destino del `stderr` del proceso, así que ningún warning suelto te rompe la pantalla.
+
+**Nunca se loguea el cuerpo de un mensaje ni una credencial**: los campos que acepta el logger son
+escalares y la regla es explícita. Si buscás el texto de algo que mandaste, no está.
+
+### Códigos de salida
+
+| Código | Qué pasó |
+| --- | --- |
+| `0` | salida ordenada (`Ctrl-C`, `Ctrl-Q`, `SIGTERM`, `SIGINT`, `SIGHUP`) |
+| `1` | segundo `Ctrl-C` (salida de apuro) o una excepción no atrapada |
+| `2` | la base está corrupta (te lo dice en pantalla, con la ruta) |
+| `3` | **ya hay otra instancia** corriendo sobre el mismo directorio de datos |
+
+El `3` es a propósito distinto del `2`: un script puede diferenciarlos. La segunda instancia imprime
+**una línea** con el PID de la primera y sale **sin** abrir la base, sin tocar `creds/` y sin
+conectarse a WhatsApp. Si la primera murió de golpe, su marca queda huérfana y se detecta sola (se
+verifica que el PID exista **y** que sea realmente wacosas, así un PID reciclado no te bloquea).
 
 ## Limitaciones conocidas
 
@@ -178,10 +287,32 @@ sería martillar sin poder ganar nunca. Cuando frena queda dicho en el log
 (`appstate.tope_alcanzado … salida=Ctrl-N`). **`Ctrl-N`** vuelve a pedir las cinco colecciones a mano,
 que es lo único que destraba una estacionada si la clave llegó.
 
-Y si después de un `Ctrl-N` seguís viendo números —o chats con candado que no se esconden—, la clave
-no llegó: **la salida probada es desvincular y volver a vincular** (borrar
-`~/.local/share/wacosas/creds/` y escanear de nuevo), que es cuando el teléfono comparte las claves de
-app-state. El historial local no se toca.
+#### Receta: la bandeja muestra números en vez de nombres
+
+En orden, de lo barato a lo definitivo:
+
+1. **Esperá 30 segundos** después de conectar. La reparación automática corre sola y en muchos casos
+   alcanza. Mirá el log: `grep appstate ~/.local/state/wacosas/wacosas.log`.
+2. **`Ctrl-N`.** Vuelve a pedir las cinco colecciones a mano. Es lo único que destraba una colección
+   estacionada **si la clave ya llegó**.
+3. **Re-vinculá.** Si después del `Ctrl-N` seguís viendo números —o chats con candado que no se
+   esconden—, es que **falta una clave de app-state**, y no hay forma de pedirla: el mensaje que
+   existe para eso (`APP_STATE_SYNC_KEY_REQUEST`) está en el protocolo de WhatsApp pero **Baileys no
+   lo implementa** (cero usos en la librería). Esa clave la comparte el **teléfono**, y sólo cuando
+   enlaza el dispositivo. O sea:
+
+   ```bash
+   # con wacosas cerrado
+   rm -rf ~/.local/share/wacosas/creds/
+   wacosas          # y escaneás de nuevo
+   ```
+
+   **El historial local no se pierde**: la base es un archivo aparte de `creds/`, y lo que vuelva a
+   entrar se mergea por el índice único en vez de duplicarse.
+
+   Es lo que pasó de verdad en la cuenta con la que se desarrolló esto: después de re-vincular
+   aparecieron **3 claves donde había 2** y llegaron los **11 chats con candado** que nunca habían
+   bajado.
 
 Ojo con una diferencia que el log tardó en decir bien: una colección estacionada **tiene** datos
 locales (viejos), así que no alcanza con mirar si hay archivo para saber si está al día. Hoy el log
@@ -215,8 +346,14 @@ ningún "código incorrecto" en pantalla, a propósito — que exista un código
 puso.
 
 **La primera vez hay que fijarlo, con `Ctrl-P`.** Se escribe dos veces (no se ve: se pintan `•`) y
-queda guardado. Usá **los mismos dígitos que ya usás en WhatsApp**: la idea es no obligarte a
-recordar un código nuevo. Sólo dígitos, entre 4 y 16. `Ctrl-P` de nuevo lo reemplaza.
+queda guardado. Sólo dígitos, entre 4 y 16. `Ctrl-P` de nuevo lo reemplaza.
+
+La pantalla te sugiere usar **los mismos dígitos que ya usás en WhatsApp**, para no obligarte a
+recordar un código nuevo, y para el uso diario está bien. Pero elegí a conciencia: el hash local es
+**crackeable offline** (ver [más abajo](#el-código-del-candado-es-crackeable-offline)), así que
+reusar el del teléfono significa que quien se lleve este archivo se queda **también** con el código
+de tu Chat Lock. Si eso te importa, **poné acá uno distinto** — y sobre todo, no reuses el de
+ninguna otra cosa (banco, PIN del teléfono).
 
 Los **bloqueados no se revelan nunca**: el código es del candado. Alguien bloqueado no es un chat
 escondido detrás de un código, es una persona con la que decidiste no hablar.
@@ -266,7 +403,76 @@ alguien que ya está sentado en tu sesión: esa persona puede volver a fijar el 
 (no se pide el anterior, justamente para que no te quedes afuera si lo olvidás) y, sobre todo, puede
 abrir la base con `sqlite3` y leer todo sin preguntarle nada a nadie.
 
-### El resto
+### Un chat abre con 500 mensajes, y no hay "cargar más"
 
-Pendiente de completar en la tarea 18 (ventana fija de mensajes, alcance de la búsqueda global,
-atajos que chocan con tmux).
+Al abrir un chat se cargan los **últimos 500** mensajes y **eso es todo**: no hay paginado hacia
+arriba. Si scrolleás hasta el principio y quedó historial más viejo, la conversación te lo dice
+(`↑ hay mensajes más viejos…`) pero no hay tecla que los traiga.
+
+**No se perdió nada**: los mensajes siguen en la base y la **búsqueda global (`Ctrl-G`) sí los
+encuentra** — y abrir un resultado te posiciona ahí, con su contexto alrededor. Ése es hoy el camino
+para llegar a algo viejo.
+
+Por qué: anclar el scroll mientras se insertan filas arriba es la parte más frágil de una TUI, y en
+v1 **no hay sincronización de historial viejo contra WhatsApp** —lo que hay es lo que WhatsApp
+entregó—, así que una ventana más grande resuelve el 99% del uso real sin el riesgo. La consulta de
+paginado (`messagesBefore`) está escrita y testeada; lo único que falta es engancharla al scroll.
+
+### La búsqueda global mira **el cuerpo** del mensaje, nada más
+
+`Ctrl-G` busca sobre el **texto** de los mensajes (y los **nombres de chat**, que se listan aparte
+arriba de los resultados). Lo que **no** encuentra:
+
+- **nombres de archivo de adjuntos** — buscar `presupuesto.pdf` no trae el documento: el nombre vive
+  en otra columna que no está indexada;
+- **el contenido de un adjunto** — no se descargan. (El **epígrafe** sí se encuentra: se guarda como
+  cuerpo del mensaje.);
+- **mensajes eliminados** — un borrado sale del índice, que es lo correcto.
+
+Acentos y mayúsculas dan igual (`manana` encuentra `Mañana`) y lo que escribas se sanitiza, así que
+comillas, guiones, asteriscos y paréntesis no rompen nada: son texto.
+
+### Los recibos de lectura están **prendidos** por default
+
+Abrir un chat (o `Ctrl-L`) le manda el recibo a WhatsApp: **la otra persona te ve el doble tilde
+azul**, igual que en el teléfono. Si querés leer invisible, `{"readReceipts": false}` en
+`config.json` y reiniciá: ahí el chat se marca leído **sólo en tu máquina** y no sale ni una llamada.
+
+Dos detalles: el recibo es *best effort* (si falla, el chat queda leído igual y queda una línea en el
+log) y **sin conexión no se manda ni se encola** — un recibo que sale tres horas después le miente al
+otro sobre cuándo lo leíste.
+
+### El código del candado es **crackeable offline**
+
+Ya está dicho arriba, pero conviene el número: el código se guarda derivado con **scrypt**
+(`N=16384, r=8, p=1`) y una derivación cuesta **~26 ms** en esta máquina. O sea que alguien que se
+lleve el archivo puede probarlos todos:
+
+| Largo | Combinaciones | Tiempo en **un** core |
+| --- | --- | --- |
+| 4 dígitos | 10.000 | **~5 minutos** |
+| 6 dígitos | 1.000.000 | **~7-9 horas** |
+| 8 dígitos | 100.000.000 | ~1 mes |
+
+Con varios cores, dividí. (Con hardware dedicado no está medido; lo único que se puede decir con
+certeza es que cada derivación necesita **16 MB de memoria** —`128 · N · r`—, que es justamente lo
+que scrypt pone para que paralelizar salga caro.)
+
+Dos consecuencias prácticas:
+
+- **6 dígitos es una tarde de cómputo.** Si querés que cueste de verdad, usá más dígitos (el máximo
+  es 16).
+- **Acá está el motivo para no reusar el código del teléfono**: quien se lleve `lock-code.json` y lo
+  reviente se queda con **el código de tu Chat Lock**, que sirve en el aparato donde sí hay algo que
+  proteger.
+
+Ahora, el orden de magnitud del riesgo: quien tenga ese archivo tiene **la base sin cifrar al lado**,
+así que reventar el código sólo le ahorra abrir `sqlite3`. Esto sirve contra una mirada de reojo a la
+terminal, **no** contra alguien sentado en tu sesión.
+
+### Lo que directamente no está en v1
+
+Enviar o descargar multimedia (los adjuntos se ven como `📷 imagen`, `🎤 audio 0:12`, `📎 informe.pdf`
+y nada más), reacciones, responder citando, editar, borrar para todos, reenviar, fijar, archivar,
+silenciar, bloquear, llamadas, estados, administrar grupos (leer y escribir texto en grupos **sí**),
+multi-cuenta, notificaciones del sistema, y **cifrado de la base**.

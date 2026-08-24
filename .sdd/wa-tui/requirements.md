@@ -395,9 +395,25 @@ conversación cuando cierro la TUI o se reinicia la máquina.
 
 - **CA-15.1** — MIENTRAS wacosas esté corriendo, EL SISTEMA DEBERÁ mostrar en el encabezado el estado
   de la conexión con al menos tres valores distinguibles: conectado, reconectando y desvinculado.
-- **CA-15.2** — CUANDO la conexión se cierra con un código distinto de `loggedOut`, `badSession` y
-  `restartRequired`, EL SISTEMA DEBERÁ reintentar la conexión con backoff exponencial arrancando en
-  2 s y con un tope de 60 s entre intentos.
+- **CA-15.2** — CUANDO la conexión se cierra con un código distinto de `loggedOut`, `badSession`,
+  `restartRequired`, `connectionReplaced` y `forbidden`, EL SISTEMA DEBERÁ reintentar la conexión con
+  backoff exponencial arrancando en 2 s y con un tope de 60 s entre intentos.
+
+  > ⚠️ **Enmienda (tarea 8b, escrita en la 18).** La redacción original decía "distinto de
+  > `loggedOut`, `badSession` y `restartRequired`", o sea que **todo** el resto iba a backoff.
+  > Construyéndolo aparecieron **dos códigos que NO deben reintentarse**, y por eso están ahora en la
+  > lista de excepciones:
+  >
+  > - **440 `connectionReplaced`** — no es un corte, es un **desalojo**: otra sesión de WhatsApp Web
+  >   tomó el slot. Reconectar es jugar ping-pong con el otro cliente y, como cada conexión
+  >   **exitosa** resetea el contador de intentos, el backoff ni siquiera protege: el loop queda
+  >   pegado en 2 s para siempre sin escalar nunca a 60.
+  > - **403 `forbidden`** — WhatsApp rechazó la conexión de esta cuenta. Reintentar solo no la
+  >   destraba.
+  >
+  > En los dos casos el sistema **frena en seco sin borrar credenciales** (siguen sirviendo) y la
+  > salida es **manual**, con la tecla de reconexión de CA-15.5. Que el usuario se entere de eso es
+  > CA-16.5.
 - **CA-15.3** — MIENTRAS el sistema esté reintentando, EL SISTEMA DEBERÁ mostrar en el encabezado
   cuántos intentos lleva y cuánto falta para el próximo, y DEBERÁ mantener la TUI navegable.
 - **CA-15.4** — CUANDO la conexión se restablece, EL SISTEMA DEBERÁ resetear el contador de intentos,
@@ -426,6 +442,14 @@ la pantalla.
   archivo de log junto con la lista de atajos.
 - **CA-16.4** — CUANDO el archivo de log supera los 5 MB, EL SISTEMA DEBERÁ rotarlo conservando como
   máximo un archivo anterior.
+- **CA-16.5** — CUANDO la conexión se cierra con uno de los códigos que **no** se reintentan
+  (`connectionReplaced`, `forbidden`; ver la enmienda de CA-15.2), EL SISTEMA DEBERÁ mostrar en
+  pantalla, de forma persistente, el motivo por el que dejó de reconectar y la tecla que lo destraba.
+
+  > ⚠️ **CA nuevo (tarea 18)**, hermano de la enmienda de CA-15.2. Sin esto, un cierre que frena en
+  > seco queda **mudo**: la sesión sigue vinculada, la pantalla dice "sin conexión" y no hay nada que
+  > le diga al usuario que la salida es apretar la tecla de reconexión. Lo cumple `ui.connBanner`, la
+  > línea del encabezado que espeja el motivo y se limpia sola cuando la conexión vuelve a abrir.
 
 ---
 
