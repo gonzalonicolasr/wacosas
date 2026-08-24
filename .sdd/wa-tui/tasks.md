@@ -329,7 +329,7 @@
     ninguna fila ocupa más de una línea al pasar el mouse.
   - depends-on: 9, 11
 
-- [ ] 13. Construir el panel de conversación con ventana fija de 500 y scroll
+- [x] 13. Construir el panel de conversación con ventana fija de 500 y scroll
   - covers: CA-6.1, CA-6.2, CA-6.3, CA-6.4, CA-6.5, CA-6.7, CA-6.9, CA-7.1, CA-7.2, CA-7.3, CA-7.4,
     CA-7.5, CA-6.8 (recortado: ventana de 500 sin carga incremental)
   - files: `src/ui/Conversation.tsx`, `src/ui/MessageRow.tsx`, `src/state/commands.ts`
@@ -358,6 +358,11 @@
   - depends-on: 12
 
 - [ ] 14. Implementar el composer y la cola de envío con rate limit y reintentos
+  - ⚠️ **dos gotchas de OpenTUI que el `<textarea>` va a pisar** (verificados en la tarea 13, detalle en la 18):
+    (1) el reconciliador **no resetea las props que desaparecen** entre dos ramas del mismo tipo en la
+    misma posición — se contaminan, y sólo se ve por el camino real del usuario; (2) una caja de ancho
+    **AUTO** dentro de un `<scrollbox>` con barra se mide con **una columna menos** de las que se
+    dibuja ⇒ fila en blanco fantasma. Fijale el ancho.
   - covers: CA-8.1, CA-8.2, CA-8.3, CA-8.4, CA-8.5, CA-8.6, CA-8.7, CA-8.8, CA-9.1, CA-9.2, CA-9.3,
     CA-9.4 (mecanismo), CA-13.3, RNF-8, RNF-9
   - files: `src/ui/Composer.tsx`, `src/wa/send.ts`, `src/state/commands.ts` (`send`, `retrySend`),
@@ -412,6 +417,19 @@
   - depends-on: 14
 
 - [ ] 16. Construir la búsqueda global full-text
+  - ⚠️ **dos gotchas de OpenTUI que el `<SearchOverlay/>` va a pisar** (verificados en la tarea 13, detalle en la 18):
+    (1) el reconciliador **no resetea las props que desaparecen** entre dos ramas del mismo tipo en la
+    misma posición — se contaminan, y sólo se ve por el camino real del usuario; (2) una caja de ancho
+    **AUTO** dentro de un `<scrollbox>` con barra se mide con **una columna menos** de las que se
+    dibuja ⇒ fila en blanco fantasma. Fijale el ancho.
+  - ⚠️ **abierto por la revisión de la tarea 12 — los dos buscadores pueden contradecirse**: el filtro
+    de bandeja compara contra la **etiqueta visible** + jid, así que un chat cuyo `pushName` quedó
+    tapado por el nombre de la agenda **no es buscable por ese pushName** (buscar `🌻` da 0), mientras
+    que `repo.searchChats` **sí** lo encuentra (da 1). Es defendible ("buscás lo que ves"), pero
+    decidilo acá y dejá los dos consistentes, o el usuario va a ver que la misma query da distinto
+    según dónde la escriba. Segundo: `test/fixtures/seed.ts:101-108` **sigue** con el `UPDATE` sin
+    `WHERE` (abierto desde la revisión de la tarea 3) — no mordió porque se siembra sobre bases
+    frescas, pero acá se hacen tests de volumen.
   - covers: CA-12.1, CA-12.2, CA-12.3, CA-12.4, CA-12.5, CA-12.7, CA-12.8, RNF-7
   - files: `src/ui/SearchOverlay.tsx`, `src/state/commands.ts` (`search`), `src/ui/App.tsx` (modo
     `search`), `test/search.bench.test.ts`
@@ -476,6 +494,26 @@
       es ping-pong con el otro cliente, y como cada reconexión exitosa resetea `attempt`, el loop
       queda pegado en 2 s para siempre sin escalar nunca) y **403 `forbidden`**. Sumar el CA nuevo
       del mensaje en pantalla, en la historia 16.
+    · **§7.2 quedó contradicha por el código**: los tabs con contadores viven en el **encabezado**
+      también en `compact` (lo piden CA-5.5, CA-10.3 y CA-19.1 tres veces), no en el `title` del panel.
+    · **R6 del diseño es FALSO**: dice que en una terminal legacy `Ctrl-J` es indistinguible de `⏎`.
+      Medido: sin protocolo kitty `Ctrl-J` llega como `{name:"linefeed"}` y `⏎` como `{name:"return"}`.
+    · **§7.4.1 describe mal el mecanismo**: dice que "un evento de mouse re-mide el `<text>`". En
+      OpenTUI 0.4.2 el mouse **no re-mide nada** (probadas 4 variantes con mouse real, ninguna cambió
+      un carácter). Lo que salva la fila es `height={1}`; `wrapMode="none"` recupera las columnas que
+      el wrap se comía. Las dos siguen siendo necesarias, pero por motivos distintos del documentado.
+    · **`justifyContent="center"` NO come una fila** con cantidad impar de hijos (se intentó
+      reproducir con tres harnesses). El mecanismo real es desborde vertical común.
+    · **DOS gotchas nuevos de OpenTUI 0.4.2, verificados dos veces cada uno (implementador +
+      revisor), que hoy sólo viven en comentarios de `.tsx` y tienen que subir a §7.4**:
+      (1) **el reconciliador de React NO resetea las props que desaparecen** — dos ramas del *mismo
+      tipo* de elemento en la misma posición se contaminan (el `paddingLeft` de una se le pega a la
+      otra). Se ve sólo por el camino real del usuario, no montando directo. Defensa: que las ramas
+      tengan tipos distintos, o una sola caja raíz.
+      (2) **una caja de ancho AUTO dentro de un `<scrollbox>` con barra visible se mide con una
+      columna menos de las que se dibujan** (`dibujo = layout + 1`): un texto que se pasa por un
+      carácter se mide en dos filas y se pinta en una ⇒ **fila en blanco fantasma** + el último
+      carácter encima de la barra. El padding NO lo arregla; fijarle el ancho a la fila sí.
     · **El prior art de `wa-worker` está mal y conviene dejarlo escrito**: `fetchLatestBaileysVersion`
       **nunca rechaza** — atrapa todo y devuelve la versión bundleada con un `error` adentro, y
       descarta el `signal`. Un `try/catch` alrededor es código muerto. Hay que mirar `r.error`.

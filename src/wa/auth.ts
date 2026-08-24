@@ -28,11 +28,24 @@ const ARCHIVO_CREDS = "creds.json";
 /**
  * ¿Hay una sesión VINCULADA en disco?
  *
- * No alcanza con que exista `creds.json`: baileys lo escribe apenas arranca el
- * handshake, mucho antes de que el usuario escanee nada, así que un proceso
- * cortado a mitad de la vinculación deja el archivo igual. Lo que distingue una
- * sesión usable es `registered: true`, que se escribe recién cuando WhatsApp
- * aceptó el dispositivo.
+ * El criterio es `creds.me?.id`, **el mismo que usa baileys** para decidir entre
+ * vincular y retomar (`Socket/socket.js:320`): sin `creds.me` manda un
+ * `generateRegistrationNode` —o sea, pide QR—; con él, un `generateLoginNode`.
+ * Lo escribe `configureSuccessfulPairing` (`Utils/validate-connection.js:190`)
+ * en cuanto WhatsApp acepta el dispositivo, por CUALQUIERA de los dos caminos.
+ *
+ * NO sirve `registered: true`, que es lo que miraba esta función: baileys lo
+ * setea en un solo lugar (`Socket/messages-recv.js:940`, dentro del
+ * `case 'link_code_companion_reg'`), o sea **sólo en el flujo del código de
+ * emparejamiento**. Una sesión vinculada por QR —el camino más común— queda con
+ * `registered: false` para siempre, así que mirarlo hacía que la app pidiera QR
+ * de nuevo con la sesión ya buena, y que CA-3.4 no se pudiera disparar nunca por
+ * ese camino (visto con una cuenta real: `me.id` + `platform: iphone` puestos y
+ * `registered: false`).
+ *
+ * Que exista `creds.json` tampoco alcanza: baileys lo escribe apenas arranca el
+ * handshake, mucho antes de que el usuario escanee nada, y ahí todavía no hay
+ * `me` — un proceso cortado a mitad de la vinculación deja exactamente eso.
  *
  * De esto depende el `flujo` del socket (`link` vs `reconnect`) y con él CA-3.4:
  * un QR durante una RECONEXIÓN significa que las creds no sirven y hay que
@@ -41,7 +54,8 @@ const ARCHIVO_CREDS = "creds.json";
 export function hasCreds(credsDir: string): boolean {
   try {
     const raw = readFileSync(join(credsDir, ARCHIVO_CREDS), "utf8");
-    return JSON.parse(raw)?.registered === true;
+    const id = JSON.parse(raw)?.me?.id;
+    return typeof id === "string" && id !== "";
   } catch {
     // No existe, no se puede leer o es JSON roto: para el caso es lo mismo.
     return false;

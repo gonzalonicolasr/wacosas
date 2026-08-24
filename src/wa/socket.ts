@@ -20,7 +20,8 @@
 //
 // Y una que sale de `auth.ts`: **un `qr` durante una RECONEXIÓN significa que las
 // creds no sirven** (CA-3.4). Por eso el `flujo` se calcula con `hasCreds()` (que
-// mira `registered: true`, no la mera existencia del archivo) en cada conexión.
+// mira `creds.me?.id`, el mismo criterio que baileys, no la mera existencia del
+// archivo) en cada conexión.
 //
 // NINGÚN handler puede lanzar: una excepción adentro de un handler de Baileys se
 // lleva puesta la conexión. Todos cierran contra un `try/catch` que loguea.
@@ -81,8 +82,8 @@ const EVENTOS = [
 /**
  * Con qué intención se abrió el socket:
  *  · `link` — no hay sesión vinculada en disco: se ESPERA un QR.
- *  · `reconnect` — hay creds `registered:true`: un QR acá significa que dejaron
- *    de servir (CA-3.4).
+ *  · `reconnect` — hay una sesión vinculada en disco (`creds.me.id`): un QR acá
+ *    significa que dejó de servir (CA-3.4).
  */
 export type Flow = "link" | "reconnect";
 
@@ -557,7 +558,7 @@ export function createWaController(deps: WaDeps): WaController {
     log.info("wa.qr", { flujo, largo: qr.length, intento });
 
     if (flujo === "reconnect") {
-      // CA-3.4: había creds `registered:true` y WhatsApp igual pide QR ⇒ no
+      // CA-3.4: había una sesión vinculada en disco y WhatsApp igual pide QR ⇒ no
       // sirven. Se borran y se vuelve a vincular UNA vez, nunca en loop: el
       // próximo `conectar()` ya arranca con flujo `link` y el QR es lo esperado.
       log.warn("wa.qr_con_creds", { flujo });

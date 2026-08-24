@@ -90,7 +90,21 @@ export function estadoDe(
     : { texto: "⟳ esperando el QR de WhatsApp…", color: MUT };
 }
 
-export function Login({ width, height }: { width: number; height: number }) {
+export function Login({
+  width,
+  height,
+  /**
+   * Ruta del PNG que escribe el entry con `--qr-png`, o `null` sin el flag. Si
+   * está, la pantalla TIENE que nombrarla: el archivo no sirve de nada si el
+   * usuario no sabe dónde mirar. Y cuando el QR no entra en la terminal, ese
+   * aviso importa más que el panel de "no entra" — es el camino que le queda.
+   */
+  qrPngPath = null,
+}: {
+  width: number;
+  height: number;
+  qrPngPath?: string | null;
+}) {
   const link = useSlice("link");
   // La matriz se arma UNA vez por payload: `QRCode.create` no es gratis y este
   // componente se re-renderiza con cada latido del badge de conexión.
@@ -112,6 +126,18 @@ export function Login({ width, height }: { width: number; height: number }) {
   const conEstado = filasCuerpo >= altoQr + 1;
   const conMotivo = !!link.reason && filasCuerpo >= altoQr + (conEstado ? 2 : 1);
   const espacioso = !aPintar && filasCuerpo >= FILAS_ESPACIOSO;
+  /**
+   * El aviso de `--qr-png` como renglón suelto. Cuando el QR NO entra no va acá:
+   * lo lleva `<QrNoEntra/>`, que es el que está explicando justamente eso (así
+   * la ruta no aparece dos veces ni se gasta un renglón de más).
+   *
+   * Es el último en el orden de caída del presupuesto de filas: sin el aviso la
+   * pantalla se sigue pudiendo usar —el QR está a la vista—, sin el QR no.
+   */
+  const conPng =
+    !!qrPngPath &&
+    entra &&
+    (!aPintar || filasCuerpo >= altoQr + (conEstado ? 1 : 0) + (conMotivo ? 1 : 0) + 1);
 
   // Centrado vertical con un padding entero calculado del MISMO presupuesto de
   // filas de arriba: el centrado y lo que se pinta salen de una sola cuenta.
@@ -129,7 +155,7 @@ export function Login({ width, height }: { width: number; height: number }) {
   // 0 en vez de negativo. El alto estimado no necesita ser exacto: si sobra, el
   // bloque queda un renglón más arriba y lo que sobra queda ABAJO.
   const altoContenido = aPintar
-    ? altoQr + (conEstado ? 1 : 0) + (conMotivo ? 1 : 0)
+    ? altoQr + (conEstado ? 1 : 0) + (conMotivo ? 1 : 0) + (conPng ? 1 : 0)
     : ALTO_CUERPO_CODIGO_MAX;
   const relleno = Math.max(0, Math.floor((filasCuerpo - altoContenido) / 2));
 
@@ -169,7 +195,15 @@ export function Login({ width, height }: { width: number; height: number }) {
             arriba del cuerpo, pegado al título: es la explicación de por qué
             está en esta pantalla y no en la del QR. */}
         {metodo === "code" && !entra ? (
-          <QrNoEntra width={width} height={height} qr={qr} compacto />
+          <QrNoEntra width={width} height={height} qr={qr} compacto pngPath={qrPngPath} />
+        ) : null}
+
+        {/* `--qr-png`: dónde quedó el archivo. Arriba de todo y no al pie, porque
+            es una instrucción ("abrí esto y escaneá"), no una nota al margen. */}
+        {conPng ? (
+          <text fg={ACCENT} wrapMode="none">
+            {clip(`📷 el QR también está en ${qrPngPath}`, Math.max(20, width - 2))}
+          </text>
         ) : null}
 
         {espacioso ? <text> </text> : null}
@@ -179,7 +213,7 @@ export function Login({ width, height }: { width: number; height: number }) {
           // React monta uno nuevo y desmonta el viejo — no hay apilado posible.
           <QrView key={link.qr as string} qr={aPintar} />
         ) : metodo === "qr" && !entra ? (
-          <QrNoEntra width={width} height={height} qr={qr} />
+          <QrNoEntra width={width} height={height} qr={qr} pngPath={qrPngPath} />
         ) : metodo === "qr" ? (
           // Entra, pero WhatsApp todavía no mandó ningún payload (el segundo que
           // hay entre `wa.connect` y el primer `wa.qr`). Decir acá que "no entra"

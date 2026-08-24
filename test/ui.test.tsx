@@ -33,12 +33,19 @@ const ATAJOS_BANDEJA = [
   "Tab             filtrar: todos / no leídos / grupos",
   "Esc             limpiar el buscador",
 ];
+const ATAJOS_CONVO = ["⇧↑↓ ⇧PgUp/PgDn  scrollear el chat · ⇧Inicio ⇧Fin a las puntas"];
 const ATAJOS_MINI = [
   "⏎               entrar a la conversación",
   "Esc             volver a la bandeja",
+  "↑ ↓ PgUp PgDn   con el chat a la vista, scrollean sin ⇧",
 ];
 const NOTAS = [`log: ${LOG}`, "la base local NO se cifra: queda 0600, sólo para tu usuario"];
-const TITULOS = ["teclas", "en la bandeja", "en terminales angostas (un panel por vez)"];
+const TITULOS = [
+  "teclas",
+  "en la bandeja",
+  "en la conversación",
+  "en terminales angostas (un panel por vez)",
+];
 
 /** Las filas de adentro del panel de la ayuda, sin borde ni padding. */
 function filasAyuda(frame: string): string[] {
@@ -142,6 +149,7 @@ for (const [width, height, mini, entera] of [
     const conocidas = [
       ...ATAJOS_GLOBALES,
       ...ATAJOS_BANDEJA,
+      ...ATAJOS_CONVO,
       ...NOTAS,
       ...TITULOS,
       ...(mini ? ATAJOS_MINI : []),
@@ -155,6 +163,7 @@ for (const [width, height, mini, entera] of [
     const obligatorias = [
       ...ATAJOS_GLOBALES,
       ...ATAJOS_BANDEJA,
+      ...ATAJOS_CONVO,
       ...NOTAS,
       ...(mini ? ATAJOS_MINI : []),
     ];
@@ -185,20 +194,29 @@ for (const [width, height, mini, entera] of [
 
 test("cuando el alto no alcanza se cae el adorno antes que un atajo", () => {
   const todas = lineasAyuda({ logPath: LOG, mini: true });
-  // 3 títulos + 3 huecos + 12 atajos (4 globales, 6 de bandeja, 2 de mini) + 2 notas.
-  expect(todas.length).toBe(20);
+  // 4 títulos + 4 huecos + 14 atajos (4 globales, 6 de bandeja, 1 de conversación,
+  // 3 de mini) + 2 notas.
+  expect(todas.length).toBe(24);
   // Entra todo: se pinta todo, adorno incluido.
-  expect(lineasQueEntran(todas, 20)).toEqual(todas);
-  // No entra: se van títulos y renglones en blanco, quedan los 12 atajos + 2 notas.
-  const apretadas = lineasQueEntran(todas, 15);
-  expect(apretadas.length).toBe(14);
+  expect(lineasQueEntran(todas, 24)).toEqual(todas);
+  // No entra: primero se van SÓLO los renglones en blanco. Los títulos son lo
+  // que hace encontrar el atajo de un vistazo y aguantan un escalón más (a 80×24
+  // la ayuda son 19 líneas contra 18 de alto: gastar seis renglones de adorno
+  // para ahorrar uno la dejaba sin un solo título y con cinco filas en blanco).
+  const sinHuecos = lineasQueEntran(todas, 20);
+  expect(sinHuecos.length).toBe(20);
+  expect(sinHuecos.some((l) => l.tipo === "titulo")).toBe(true);
+  expect(sinHuecos.every((l) => l.tipo !== "hueco")).toBe(true);
+  // Recién si tampoco así entra se van los títulos: quedan los 14 atajos + 2 notas.
+  const apretadas = lineasQueEntran(todas, 16);
+  expect(apretadas.length).toBe(16);
   expect(apretadas.every((l) => l.tipo === "atajo" || l.tipo === "nota")).toBe(true);
   // Nunca se recorta a mano por debajo de lo esencial: eso lo cubre el scroll.
   expect(lineasQueEntran(todas, 3)).toEqual(apretadas);
 
   // Con lo esencial entrando justo NO hay nada que scrollear; con menos, sí — y
   // ése es el caso de 60×15 (el mínimo de RNF-2), donde el cuerpo son 9 filas.
-  expect(ayudaScrollea({ logPath: LOG, mini: true, filas: 14 })).toBe(false);
+  expect(ayudaScrollea({ logPath: LOG, mini: true, filas: 16 })).toBe(false);
   expect(ayudaScrollea({ logPath: LOG, mini: true, filas: 9 })).toBe(true);
 });
 
@@ -284,10 +302,19 @@ const LINK_LIMPIO: LinkSnapshot = {
   reason: null,
 };
 
-async function montarLogin(width: number, height: number, link: Partial<LinkSnapshot> = {}) {
+async function montarLogin(
+  width: number,
+  height: number,
+  link: Partial<LinkSnapshot> = {},
+  /** `--qr-png`: la ruta que el entry le pasa a `<App/>` (null = sin el flag). */
+  qrPngPath: string | null = null,
+) {
   store.setLink({ ...LINK_LIMPIO, ...link });
   store.flushNow();
-  const t = await testRender(<App noSplash logPath={LOG} />, { width, height });
+  const t = await testRender(<App noSplash logPath={LOG} qrPngPath={qrPngPath} />, {
+    width,
+    height,
+  });
   await pintar(t);
   return t;
 }
@@ -381,6 +408,74 @@ test("Tab alterna QR ↔ código sin tocar el socket (CA-2.6)", async () => {
   const deVuelta = t.captureCharFrame();
   expect(deVuelta).toContain(qr.rows[1] as string);
   expect(deVuelta).not.toContain("escribí tu número");
+  t.renderer.destroy();
+});
+
+// ── `--qr-png` ──────────────────────────────────────────────────────────────
+//
+// El flag existe para el caso de arriba: el QR mide 34 × 67 y en una pane de
+// 24 × 80 no entra. Con el PNG el usuario lo abre en un visor y escanea sin
+// salir de la app —que es lo que importa, porque el 515 posterior al escaneo lo
+// maneja el controlador (CA-1.8)—. Pero el archivo no sirve de nada si la
+// pantalla no dice CUÁL es, así que eso es lo que se mide acá.
+
+const RUTA_PNG = "/tmp/wacosas-test/qr.png";
+
+test("con --qr-png y el QR que no entra, la pantalla dice la ruta del PNG", async () => {
+  const t = await montarLogin(80, 24, { phase: "qr-shown", qr: PAYLOAD }, RUTA_PNG);
+  const frame = t.captureCharFrame();
+
+  expect(frame).toContain(RUTA_PNG);
+  // El aviso se lleva el renglón del panel de "no entra": ahí las medidas ya no
+  // obligan a nada (no hace falta agrandar la terminal) y la ruta sí.
+  expect(frame).toContain("el QR no entra acá");
+  expect(frame).not.toContain("hace falta 69 × 36");
+  // Y el código de emparejamiento sigue ofrecido: el PNG es otro camino, no un
+  // reemplazo (CA-2.1).
+  expect(frame).toContain("escribí tu número");
+  t.renderer.destroy();
+});
+
+test("sin el flag, la misma pantalla no nombra ningún PNG", async () => {
+  // Control negativo del anterior: si la ruta apareciera igual, el test de
+  // arriba no probaría nada.
+  const t = await montarLogin(80, 24, { phase: "qr-shown", qr: PAYLOAD });
+  const frame = t.captureCharFrame();
+  expect(frame).not.toContain(".png");
+  expect(frame).toContain("hace falta 69 × 36");
+  t.renderer.destroy();
+});
+
+test("con --qr-png y el QR dibujado, se ven las dos cosas: el QR entero y la ruta", async () => {
+  const t = await montarLogin(80, 40, { phase: "qr-shown", qr: PAYLOAD }, RUTA_PNG);
+  const filas = filasDe(t.captureCharFrame());
+  const qr = buildQr(PAYLOAD)!;
+
+  // El aviso NO le puede comer filas al QR: las 34 tienen que seguir enteras
+  // (OpenTUI no recorta a los hijos que no entran, los encima).
+  const arriba = filas.findIndex((f) => f.includes(qr.rows[1] as string));
+  expect(arriba).toBeGreaterThan(0);
+  for (const [i, fila] of qr.rows.entries()) {
+    const enPantalla = filas[arriba - 1 + i] ?? "";
+    expect({ fila: i, entera: enPantalla.includes(fila) }).toEqual({ fila: i, entera: true });
+  }
+  expect(filas.some((f) => f.includes(RUTA_PNG))).toBe(true);
+  t.renderer.destroy();
+});
+
+test("con --qr-png y el QR forzado con Tab en una terminal chica, el panel lleva la ruta", async () => {
+  // CA-2.6: el usuario puede forzar el QR aunque no entre. El panel que le
+  // explica que no entra es, con el flag, el lugar donde tiene que ver la ruta.
+  const t = await montarLogin(
+    80,
+    24,
+    { phase: "qr-shown", qr: PAYLOAD, method: "qr", methodForced: true },
+    RUTA_PNG,
+  );
+  const frame = t.captureCharFrame();
+  expect(frame).toContain("el QR no entra en esta terminal");
+  expect(frame).toContain(RUTA_PNG);
+  expect(frame).toContain("ahora 80 × 24"); // acá las medidas SÍ siguen (hay lugar)
   t.renderer.destroy();
 });
 

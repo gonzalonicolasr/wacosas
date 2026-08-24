@@ -12,17 +12,17 @@
 //     snapshot está cacheado y sólo cambia de identidad en el flush coalescido
 //     (D3), que es lo que le pone techo a los renders (RNF-5).
 //
-// Lo que TODAVÍA no cuelga de acá, con su tarea: `<Conversation/>` +
-// `<Composer/>` (13 y 14) y `<SearchOverlay/>` (16). Los huecos están marcados
-// abajo.
+// Lo que TODAVÍA no cuelga de acá, con su tarea: `<Composer/>` (14) y
+// `<SearchOverlay/>` (16). Los huecos están marcados abajo.
 import type { KeyEvent, ScrollBoxRenderable } from "@opentui/core";
 import { useKeyboard, useTerminalDimensions } from "@opentui/react";
 import { useEffect, useRef, useState } from "react";
 
 import { clip } from "../lib/fmt";
-import { commands, SALTO_EXTREMO } from "../state/commands";
+import { commands, etiquetaChat, SALTO_EXTREMO } from "../state/commands";
 import { useSlice } from "../state/hooks";
 import { store } from "../state/store";
+import { Conversation, HINTS_CONVO } from "./Conversation";
 import { ALTO_FOOTER, Footer } from "./Footer";
 import { ALTO_HEADER, Header } from "./Header";
 import { ayudaScrollea, Help } from "./Help";
@@ -30,7 +30,7 @@ import { HINTS_BANDEJA, Inbox } from "./Inbox";
 import { Login, metodoDe } from "./Login";
 import { Splash } from "./Splash";
 import { MIN_COLS, MIN_ROWS, TooSmall } from "./TooSmall";
-import { BG, BORDER, ELEVATED, MUT, SURFACE, WARN } from "./theme";
+import { BG, BORDER, ELEVATED, SURFACE, WARN } from "./theme";
 
 type Modo = "browse" | "help";
 /** Un panel por vez cuando la terminal es angosta (§7.2). */
@@ -53,11 +53,61 @@ function disposicionDe(ancho: number): Disposicion {
   return "mini";
 }
 
-export function App({ noSplash, logPath }: { noSplash: boolean; logPath: string }) {
+/** Las teclas que scrollean la conversación (CA-6.5). Ninguna es `Ctrl-<letra>` (CA-6.6). */
+const TECLAS_SCROLL = new Set(["up", "down", "pageup", "pagedown", "home", "end"]);
+
+/**
+ * Aplica al panel de conversación una de las teclas de arriba. Devuelve `false`
+ * si no había caja (ningún chat abierto), para que el llamador decida.
+ *
+ * El scroll se le pide al `<scrollbox>`, que es el dueño de su posición (V7): no
+ * hay ningún `scrollTop` calculado a mano en toda la aplicación.
+ */
+function scrollConvo(caja: ScrollBoxRenderable | null, tecla: string, media: number): boolean {
+  if (!caja) return false;
+  switch (tecla) {
+    case "up":
+      caja.scrollBy(-1);
+      return true;
+    case "down":
+      caja.scrollBy(1);
+      return true;
+    case "pageup":
+      caja.scrollBy(-media);
+      return true;
+    case "pagedown":
+      caja.scrollBy(media);
+      return true;
+    case "home":
+      caja.scrollTo(0);
+      return true;
+    case "end":
+      caja.scrollTo(Math.max(0, caja.scrollHeight - caja.viewport.height));
+      return true;
+    default:
+      return false;
+  }
+}
+
+export function App({
+  noSplash,
+  logPath,
+  // `--qr-png`: la ruta donde el entry va escribiendo cada QR como imagen, o
+  // `null` sin el flag. Viaja como prop —igual que `logPath`— y no por el store
+  // porque no es estado de la máquina: es una decisión de arranque que no
+  // cambia en toda la corrida. La pantalla de vinculación la MUESTRA, para que
+  // el usuario sepa qué archivo abrir.
+  qrPngPath = null,
+}: {
+  noSplash: boolean;
+  logPath: string;
+  qrPngPath?: string | null;
+}) {
   const { width, height } = useTerminalDimensions();
   const conn = useSlice("conn");
   const link = useSlice("link");
   const inbox = useSlice("inbox");
+  const convo = useSlice("convo");
   const ui = useSlice("ui");
 
   const [modo, setModo] = useState<Modo>("browse");
@@ -67,6 +117,10 @@ export function App({ noSplash, logPath }: { noSplash: boolean; logPath: string 
   // El cuerpo de la ayuda se scrollea desde acá: el `useKeyboard` es uno solo
   // (§7.4) y el `<scrollbox>` no tiene el foco, así que se lo mueve por la ref.
   const ayudaRef = useRef<ScrollBoxRenderable | null>(null);
+  // Misma historia con la conversación: el `<scrollbox>` no tiene el foco (lo
+  // tiene el buscador de la bandeja, CA-5.1), así que las teclas de scroll salen
+  // de acá y llegan por la ref.
+  const convoRef = useRef<ScrollBoxRenderable | null>(null);
 
   const disposicion = disposicionDe(width);
 
@@ -86,6 +140,12 @@ export function App({ noSplash, logPath }: { noSplash: boolean; logPath: string 
   const verConvo = disposicion !== "mini" || panelMini === "convo";
   /** Ancho INTERIOR del panel de la bandeja (sin los bordes). */
   const anchoInterior = (disposicion === "mini" ? width : anchoBandeja) - 2;
+  /** Ancho INTERIOR del panel de conversación: lo que sobra, sin los bordes. */
+  const anchoConvo = (disposicion === "mini" ? width : width - anchoBandeja) - 2;
+
+  /** El chat abierto, para el título del panel y para el pie. */
+  const chatAbierto =
+    convo.jid === null ? null : (inbox.chats.find((c) => c.jid === convo.jid) ?? null);
 
   /**
    * CA-1.1: sin sesión vinculada la pantalla es `<Login/>`, no la bandeja. Vale
@@ -237,9 +297,19 @@ export function App({ noSplash, logPath }: { noSplash: boolean; logPath: string 
     }
 
     // ── browse ──────────────────────────────────────────────────────────────
-    // ACÁ ARRIBA van las combinaciones con `Shift` (§7.3): `Shift-↑/↓` y
-    // `Shift-PgUp/PgDn` scrollean la conversación (tarea 13). Tienen que quedar
-    // ANTES de las teclas peladas, o el `↑` pelado se las come.
+    // ACÁ ARRIBA van las combinaciones con `Shift` (§7.3): `Shift-↑/↓` línea a
+    // línea, `Shift-PgUp/PgDn` media página y `Shift-Inicio/Fin` a las puntas
+    // (CA-6.5). Tienen que quedar ANTES de las teclas peladas, o el `↑` pelado de
+    // la bandeja se las come.
+    //
+    // La tecla se consume SIEMPRE que venga con `Shift`, haya o no chat abierto:
+    // si se dejara pasar, un `Shift-↑` sin conversación movería la selección de
+    // la bandeja, que es exactamente lo que el usuario NO pidió.
+    const media = Math.max(1, Math.floor(filasVisibles / 2));
+    if (key.shift && TECLAS_SCROLL.has(n)) {
+      scrollConvo(convoRef.current, n, media);
+      return;
+    }
 
     // El buscador se lee EN VIVO y no del snapshot: éste está cacheado hasta el
     // próximo flush (D3), así que un `?` apretado dentro de los 33 ms de haber
@@ -268,8 +338,13 @@ export function App({ noSplash, logPath }: { noSplash: boolean; logPath: string 
     }
 
     // De acá para abajo, las teclas de la bandeja. En `mini` con la conversación
-    // a la vista no hay lista que navegar (las teclas del panel son de la 13).
-    if (!verBandeja) return;
+    // a la vista no hay lista que navegar, así que ahí las flechas PELADAS
+    // scrollean el chat: es el único panel en pantalla y pedirle `Shift` al
+    // usuario cuando no hay ambigüedad sería gratuito.
+    if (!verBandeja) {
+      scrollConvo(convoRef.current, n, media);
+      return;
+    }
 
     if (enter) {
       commands.openSelectedChat();
@@ -304,7 +379,7 @@ export function App({ noSplash, logPath }: { noSplash: boolean; logPath: string 
   if (width < MIN_COLS || height < MIN_ROWS) return <TooSmall width={width} height={height} />;
   // CA-1.1: la vinculación va DESPUÉS de `<TooSmall/>` —abajo de 60×15 no se
   // dibuja ni el panel de "el QR no entra"— y ANTES de todo lo demás.
-  if (enLogin) return <Login width={width} height={height} />;
+  if (enLogin) return <Login width={width} height={height} qrPngPath={qrPngPath} />;
 
   // El `↑↓` sólo se anuncia si la ayuda de verdad no entra entera (terminal muy
   // baja): un hint que promete una tecla que no hace nada es ruido.
@@ -312,12 +387,17 @@ export function App({ noSplash, logPath }: { noSplash: boolean; logPath: string 
     modo === "help" &&
     ayudaScrollea({ logPath, mini: disposicion === "mini", filas: filasVisibles });
 
+  // El pie es UNA línea de 80 columnas y no entra todo: con un chat abierto se
+  // cambia `^R reconectar` por las teclas de scroll, que son las que el usuario
+  // necesita AHÍ. `Ctrl-R` sigue en la ayuda y, cuando de verdad hace falta, lo
+  // nombra el banner de conexión (`MOTIVO_CONEXION_REEMPLAZADA`).
+  const cola = convo.jid ? "? ayuda · ^C salir" : "? ayuda · ^R reconectar · ^C salir";
   const hints =
     modo === "help"
       ? `${scrollAyuda ? "↑↓ desplazar · " : ""}^R reconectar · Esc / ? cerrar la ayuda`
       : !verBandeja
-        ? "Esc bandeja · ? ayuda · ^R reconectar · ^C salir"
-        : `${HINTS_BANDEJA} · ? ayuda · ^R reconectar · ^C salir`;
+        ? `↑↓ scroll · Esc bandeja · ${cola}`
+        : `${HINTS_BANDEJA}${convo.jid ? ` · ${HINTS_CONVO}` : ""} · ${cola}`;
 
   return (
     <box flexDirection="column" width="100%" height="100%" backgroundColor={BG}>
@@ -363,10 +443,13 @@ export function App({ noSplash, logPath }: { noSplash: boolean; logPath: string 
               border
               borderColor={BORDER}
               backgroundColor={SURFACE}
-              title=" conversación "
+              // El título dice QUÉ chat se está leyendo: en `mini` la bandeja no
+              // está a la vista y sin esto no habría forma de saberlo. Se recorta
+              // a mano porque un título más ancho que el panel rompe el marco.
+              title={` ${chatAbierto ? clip(etiquetaChat(chatAbierto), Math.max(8, anchoConvo - 4)) : "conversación"} `}
             >
-              {/* Acá van <Conversation/> (tarea 13) y <Composer/> (tarea 14). */}
-              <text fg={MUT}>{"  (ningún chat abierto)"}</text>
+              <Conversation ancho={anchoConvo} cajaRef={convoRef} />
+              {/* Acá va <Composer/> (tarea 14). */}
             </box>
           ) : null}
         </box>

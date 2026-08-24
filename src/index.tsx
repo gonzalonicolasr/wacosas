@@ -43,6 +43,30 @@ if (!stderrRedirigido) {
 const { version } = (await import("../package.json")).default;
 const argv = process.argv.slice(2);
 
+/**
+ * `--qr-png` / `--qr-png=<ruta>` ⇒ ruta del PNG, o `null` si el flag no está.
+ *
+ * POR QUÉ EXISTE: el QR de WhatsApp mide 34 filas × 67 columnas y la terminal de
+ * todos los días acá es 24 × 80 — no entra (RNF-3). Para eso está el código de
+ * emparejamiento, pero el usuario **quiere el QR** y agrandar la terminal no
+ * siempre es opción. Con el PNG lo abre en cualquier visor y escanea desde ahí,
+ * SIN salirse de la app: eso es lo que importa, porque el 515
+ * (`restartRequired`) que llega justo después del escaneo lo tiene que manejar
+ * el controlador (CA-1.8, respawn en el acto) y no una herramienta aparte que
+ * termina y deja la sesión a medio armar —un `creds/` con un solo archivo, sin
+ * pre-keys ni app-state—.
+ *
+ * Sin valor ⇒ `<dataDir>/qr.png`. Un `--qr-png=` vacío se trata como sin valor:
+ * quedarse con `""` sería escribir en el directorio actual.
+ */
+function rutaQrPng(args: string[], dataDir: string): string | null {
+  const PREFIJO = "--qr-png=";
+  const arg = args.find((a) => a === "--qr-png" || a.startsWith(PREFIJO));
+  if (arg === undefined) return null;
+  const valor = arg.startsWith(PREFIJO) ? arg.slice(PREFIJO.length).trim() : "";
+  return valor === "" ? `${dataDir}/qr.png` : valor;
+}
+
 if (argv.includes("--version") || argv.includes("-v")) {
   console.log(version);
   process.exit(0);
@@ -56,6 +80,10 @@ Uso:
 
 Opciones:
   --no-splash      saltea la animación de arranque y va directo a la interfaz
+  --qr-png[=RUTA]  además de dibujarlo, escribe cada QR de vinculación como PNG
+                   (por defecto ${paths.dataDir}/qr.png, permisos 0600).
+                   Sirve cuando el QR no entra en la terminal: lo abrís con un
+                   visor de imágenes y escaneás desde ahí, sin salir de wacosas
   -v, --version    imprime la versión y sale
   -h, --help       muestra esta ayuda y sale
 
@@ -69,6 +97,7 @@ pero cualquiera que entre con tu usuario puede leer el historial.`);
 }
 
 const noSplash = argv.includes("--no-splash"); // CA-13.7
+const qrPngPath = rutaQrPng(argv, paths.dataDir);
 
 // ── renderer ────────────────────────────────────────────────────────────────
 // `exitOnCtrlC:false` + `exitSignals:[]`: la salida la maneja la app (CA-17.1),
@@ -140,8 +169,49 @@ const shutdown = (code = 0): void => {
 const { configureCommands } = await import("./state/commands");
 const { App } = await import("./ui/App");
 
-createRoot(renderer).render(<App noSplash={noSplash} logPath={paths.logPath} />);
+createRoot(renderer).render(<App noSplash={noSplash} logPath={paths.logPath} qrPngPath={qrPngPath} />);
 log.info("boot.render", { splash: !noSplash, ms: Math.round(performance.now()) });
+
+// ── `--qr-png`: cada QR también como PNG ────────────────────────────────────
+// Se engancha al store y no al socket: el payload ya viaja por el slice `link`
+// (lo publica `wa/socket.ts` en cada `wa.qr`), así que esto es un OYENTE más y
+// el ciclo de vida de la conexión no se entera. La rotación pisa el archivo:
+// hay un solo QR vigente por vez, igual que en pantalla (CA-1.6).
+//
+// Nunca puede voltear la app (ni la vinculación): si el `toFile` falla —disco
+// lleno, permisos, ruta inventada— queda una línea en el log y el QR se sigue
+// escaneando de la pantalla. Por eso el `catch` no re-lanza y no hay `await`.
+if (qrPngPath) {
+  const QRCode = (await import("qrcode")).default;
+  const { chmodSync } = await import("node:fs");
+  /** El último payload escrito: sin esto cada flush del slice reescribiría el PNG. */
+  let ultimo: string | null = null;
+
+  store.subscribe("link", () => {
+    const qr = store.getSnapshot("link").qr;
+    if (qr === null || qr === ultimo) return;
+    ultimo = qr;
+    QRCode.toFile(qrPngPath, qr, { width: 512, margin: 2 })
+      .then(() => {
+        // El `umask(0o077)` ya lo hace nacer 0600; el `chmod` es para el archivo
+        // que quedó de una corrida anterior con permisos laxos (mismo criterio
+        // que `hardenCreds`). Un QR es la llave para vincular un dispositivo.
+        try {
+          chmodSync(qrPngPath, 0o600);
+        } catch {
+          /* el archivo está escrito: no poder endurecerlo no lo invalida */
+        }
+        // El payload NO se loguea (CA-14.7): sólo dónde quedó y cuánto medía.
+        log.info("qr.png", { path: qrPngPath, largo: qr.length });
+      })
+      .catch((e: unknown) => {
+        log.warn("qr.png_fallido", {
+          path: qrPngPath,
+          motivo: e instanceof Error ? e.message : String(e),
+        });
+      });
+  });
+}
 
 // ── máquina (después del render: baileys tarda en cargar) ────────────────────
 const { createIngest } = await import("./wa/ingest");

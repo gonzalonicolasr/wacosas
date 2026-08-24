@@ -9,9 +9,10 @@
 // ayuda quedaba ilegible (a 60×15, el mínimo de RNF-2, se pisaban tres renglones).
 // Van dos mecanismos, en este orden:
 //
-//  1. `lineasQueEntran()` tira el ADORNO (títulos de sección y renglones en
-//     blanco) cuando no entra todo. Es lo que hace que a 60×15 se vean los cuatro
-//     atajos, la ruta del log y el aviso sin tener que scrollear nada.
+//  1. `lineasQueEntran()` tira el ADORNO cuando no entra todo, en dos escalones:
+//     primero los renglones en blanco y sólo si tampoco alcanza los títulos de
+//     sección. Es lo que hace que a 60×15 se vean los cuatro atajos, la ruta del
+//     log y el aviso sin tener que scrollear nada.
 //  2. Lo que aun así no entre queda dentro de un `<scrollbox>` (§7.4.5), que sí
 //     recorta y se desplaza con `↑`/`↓` (y con la rueda) desde el `useKeyboard`
 //     de `App`. Es la red para cuando las próximas tareas sumen más atajos: nunca
@@ -41,9 +42,18 @@ const ATAJOS_BANDEJA: Array<[string, string]> = [
   ["Esc", "limpiar el buscador"],
 ];
 
+// Una sola fila, apretada a propósito: cada atajo nuevo empuja la ayuda un
+// renglón más allá del alto de una terminal chica, y a 80×19 dos filas la
+// habrían mandado al scroll. La columna de teclas mide 16 (`COL`) y
+// `⇧↑↓ ⇧PgUp/PgDn` entra justo.
+const ATAJOS_CONVO: Array<[string, string]> = [
+  ["⇧↑↓ ⇧PgUp/PgDn", "scrollear el chat · ⇧Inicio ⇧Fin a las puntas"],
+];
+
 const ATAJOS_MINI: Array<[string, string]> = [
   ["⏎", "entrar a la conversación"],
   ["Esc", "volver a la bandeja"],
+  ["↑ ↓ PgUp PgDn", "con el chat a la vista, scrollean sin ⇧"],
 ];
 
 const AVISO = "la base local NO se cifra: queda 0600, sólo para tu usuario";
@@ -66,6 +76,9 @@ export function lineasAyuda({ logPath, mini }: { logPath: string; mini: boolean 
   lineas.push({ tipo: "hueco" });
   lineas.push({ tipo: "titulo", texto: "en la bandeja" });
   for (const [tecla, texto] of ATAJOS_BANDEJA) lineas.push({ tipo: "atajo", tecla, texto });
+  lineas.push({ tipo: "hueco" });
+  lineas.push({ tipo: "titulo", texto: "en la conversación" });
+  for (const [tecla, texto] of ATAJOS_CONVO) lineas.push({ tipo: "atajo", tecla, texto });
   if (mini) {
     lineas.push({ tipo: "hueco" });
     lineas.push({ tipo: "titulo", texto: "en terminales angostas (un panel por vez)" });
@@ -77,20 +90,26 @@ export function lineasAyuda({ logPath, mini }: { logPath: string; mini: boolean 
   return lineas;
 }
 
-/** Adorno = las filas que no informan ningún atajo ni ninguna ruta. */
-function esAdorno(linea: LineaAyuda): boolean {
-  return linea.tipo === "titulo" || linea.tipo === "hueco";
-}
-
 /**
- * Las líneas que se pintan en `filas` filas de alto. Si no entran todas, se cae
- * el adorno primero (lo que queda sigue siendo legible y ordenado). Si ni así
- * entran, devuelve igual la lista completa de lo esencial: recortarla a mano
- * escondería un atajo para siempre, y de eso se encarga el scroll.
+ * Las líneas que se pintan en `filas` filas de alto, tirando el adorno en DOS
+ * escalones y no de una: primero los renglones en blanco y **recién después** los
+ * títulos de sección.
+ *
+ * ⚠️ El orden importa: tirar todo junto gastaba seis renglones para ahorrar uno
+ * —al sumar "en la conversación" la ayuda pasó a 19 líneas contra 18 de alto a
+ * 80×24— y la ayuda quedaba sin un solo título y con cinco filas en blanco abajo.
+ * Un hueco no dice nada; un título es lo que hace encontrar el atajo de un
+ * vistazo.
+ *
+ * Si ni sin adorno entra, devuelve igual la lista completa de lo esencial:
+ * recortarla a mano escondería un atajo para siempre, y de eso se encarga el
+ * scroll.
  */
 export function lineasQueEntran(todas: LineaAyuda[], filas: number): LineaAyuda[] {
   if (todas.length <= filas) return todas;
-  return todas.filter((l) => !esAdorno(l));
+  const sinHuecos = todas.filter((l) => l.tipo !== "hueco");
+  if (sinHuecos.length <= filas) return sinHuecos;
+  return sinHuecos.filter((l) => l.tipo !== "titulo");
 }
 
 /**

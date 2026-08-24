@@ -176,6 +176,24 @@ export const SALTO_EXTREMO = Number.MAX_SAFE_INTEGER;
 export type Commands = {
   /** Abre el chat y lo marca leído (CA-6.1, CA-11.1). `anchorId` = salto desde la búsqueda. */
   openChat(jid: string, opts?: { anchorId?: number }): void;
+  /**
+   * Carga la ventana de mensajes del chat (CA-6.1): los últimos `VENTANA_DEFAULT`,
+   * o los que rodean a `anchorId` cuando se llega desde un resultado de búsqueda
+   * (CA-12.3). No marca leído ni mueve el cursor de la bandeja: es sólo la
+   * ventana, que es lo que necesita el salto de la tarea 16.
+   */
+  loadWindow(jid: string, anchorId?: number | null): void;
+  /**
+   * Suelta el ancla: la ventana vuelve a ser "los últimos 500".
+   *
+   * El ancla existe para UN salto (CA-12.3) y `construirConvo` la aplica en
+   * TODOS los flush siguientes, así que si no se suelta el chat queda congelado:
+   * los mensajes que llegan después no entran en `messagesAround` y la
+   * conversación deja de crecer aunque la bandeja se actualice. Quién decide
+   * cuándo soltarla es `ui/Conversation.tsx`, que es el único que sabe si el
+   * usuario todavía está mirando el salto.
+   */
+  releaseAnchor(): void;
   closeChat(): void;
   /** Abre el chat seleccionado en la bandeja (`⏎`, CA-6.1). Sin selección no hace nada. */
   openSelectedChat(): void;
@@ -214,12 +232,27 @@ const FASES_EN_CURSO = new Set(["checking", "need-link", "qr-waiting", "qr-shown
 export const commands: Commands = {
   openChat(jid, opts) {
     if (!deps || !jid) return;
-    deps.store.setOpenChat(jid, { anchorId: opts?.anchorId ?? null });
+    commands.loadWindow(jid, opts?.anchorId ?? null);
     // El chat que se abre queda seleccionado: si se llegó por click sobre una
     // fila que no era la del cursor —o por el salto desde la búsqueda global
     // (CA-12.3)—, el cursor tiene que terminar donde terminó el usuario.
     deps.store.setInboxUi({ selectedJid: jid });
     commands.markRead(jid);
+  },
+
+  // La ventana en sí la arma el store: el slice `convo` es una PROYECCIÓN (D2),
+  // así que decirle cuál es el chat abierto y con qué ancla ya alcanza para que
+  // el próximo flush consulte `lastMessages` o `messagesAround` según el caso.
+  loadWindow(jid, anchorId) {
+    if (!deps || !jid) return;
+    deps.store.setOpenChat(jid, { anchorId: anchorId ?? null });
+  },
+
+  releaseAnchor() {
+    if (!deps) return;
+    const jid = deps.store.openChatJid();
+    if (jid === null) return;
+    deps.store.setOpenChat(jid);
   },
 
   openSelectedChat() {

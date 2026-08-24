@@ -165,7 +165,7 @@ let nBanco = 0;
 
 function banco(
   opts: {
-    /** Sembrar `creds.json` con `registered:true` ⇒ el flujo arranca en `reconnect`. */
+    /** Sembrar `creds.json` con una sesión vinculada ⇒ el flujo arranca en `reconnect`. */
     vinculado?: boolean;
     version?: () => Promise<{ version: WAVersion; isLatest: boolean; error?: unknown }>;
     /** Envuelve la cola real (para romperla a propósito). */
@@ -177,7 +177,17 @@ function banco(
   const archivoCreds = join(credsDir, "creds.json");
   if (opts.vinculado) {
     mkdirSync(credsDir, { recursive: true, mode: 0o700 });
-    writeFileSync(archivoCreds, JSON.stringify({ registered: true }), { mode: 0o600 });
+    // La forma REAL de una sesión vinculada por QR: `me.id` puesto y
+    // `registered` en **false** — baileys sólo pone `registered:true` en el
+    // flujo del código de emparejamiento (`Socket/messages-recv.js:940`), y lo
+    // que mira para retomar la sesión es `creds.me` (`Socket/socket.js:320`).
+    // Sembrarlo así es lo que hace que estos tests corran por el camino que de
+    // verdad usa el usuario (ver `test/auth.test.ts`).
+    writeFileSync(
+      archivoCreds,
+      JSON.stringify({ me: { id: SELF_JID, name: "Yo" }, platform: "iphone", registered: false }),
+      { mode: 0o600 },
+    );
   }
 
   const logPath = join(dir, "wa.log");

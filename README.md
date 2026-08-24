@@ -41,9 +41,24 @@ cualquier lado sin `cd` al repo.
 ```bash
 wacosas               # abre la TUI
 wacosas --no-splash   # sin animación de arranque, directo a la bandeja
+wacosas --qr-png      # además de dibujarlo, escribe cada QR como PNG
 wacosas --version     # imprime la versión y sale
 wacosas --help        # ayuda
 ```
+
+### `--qr-png[=RUTA]` — escanear el QR cuando no entra en la terminal
+
+El QR de WhatsApp mide **34 filas × 67 columnas**: en una pane de 80×24 no entra, y por eso wacosas
+ofrece el código de emparejamiento. Si igual querés el QR y agrandar la terminal no es opción,
+arrancá con `--qr-png`: cada QR que emite WhatsApp se escribe **además** como imagen
+(`~/.local/share/wacosas/qr.png` por defecto, o la ruta que le pases con `--qr-png=/tmp/qr.png`), con
+permisos `0600`. Lo abrís con cualquier visor, escaneás desde ahí y **la vinculación la sigue
+manejando la app**: el cierre `restartRequired` (515) que llega justo después del escaneo lo reconecta
+el controlador solo, que es lo que deja la sesión completa.
+
+El archivo se pisa en cada rotación del QR (cada 20-60 s): siempre tiene el vigente. Si el visor no
+recarga solo, volvé a abrirlo. Si el PNG no se puede escribir (disco lleno, permisos), queda una línea
+en el log y la vinculación sigue andando por pantalla.
 
 ## Dónde quedan las cosas
 
@@ -54,6 +69,7 @@ Se respeta XDG; si no tenés las variables seteadas, los defaults son:
 | Base SQLite | `~/.local/share/wacosas/wacosas.sqlite` |
 | Credenciales de sesión | `~/.local/share/wacosas/creds/` |
 | Configuración | `~/.local/share/wacosas/config.json` |
+| QR como PNG (sólo con `--qr-png`) | `~/.local/share/wacosas/qr.png` |
 | Log | `~/.local/state/wacosas/wacosas.log` |
 
 Los directorios de datos y de estado se crean solos al arrancar, con permisos `0700`.
