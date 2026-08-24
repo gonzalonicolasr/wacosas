@@ -56,10 +56,11 @@ export type CommandDeps = {
    */
   lockCode?: LockCode;
   /**
-   * Cierre del proceso. Hoy es el mínimo que deja la terminal usable; la tarea 17
-   * lo reemplaza por el apagado ordenado de §6.6 sin tocar a los llamadores.
+   * Cierre ordenado del proceso (`boot/shutdown.ts`, §6.6). El `motivo` no cambia
+   * nada de lo que hace: va al log para que una salida quede explicada —después
+   * de una que nadie pidió, la primera pregunta es "¿quién la disparó?"—.
    */
-  shutdown(code?: number): void;
+  shutdown(code?: number, motivo?: string): void;
 };
 
 let deps: CommandDeps | null = null;
@@ -438,7 +439,12 @@ export type Commands = {
    * al lado del input sin dar una vuelta por el store (CA-2.2).
    */
   requestPairing(phoneDigits?: string): Resultado;
-  quit(code?: number): void;
+  /**
+   * Cierre ordenado (CA-17.1). `motivo` describe QUIÉN lo pidió (`"tecla ^C"`,
+   * `"SIGTERM"`, …) y termina en el log: es lo único que permite distinguir una
+   * salida que pidió el usuario de una que no pidió nadie.
+   */
+  quit(code?: number, motivo?: string): void;
 };
 
 /** Último teléfono VÁLIDO usado: lo reusa el `Ctrl-R` de "código nuevo" (CA-2.5). */
@@ -698,6 +704,16 @@ export const commands: Commands = {
     // fue acusado —o lo marcó leído otro dispositivo (CA-11.6), que deja el
     // contador en 0 sin tocar `last_read_id`—, y mandar el recibo igual sería
     // una ráfaga de stanzas por mensajes que el otro ya vio en azul (R8).
+    //
+    // ⚠️ Lo que esta guarda POSPONE: el sync de historial con el chat abierto.
+    // `ingest.aplicarChat` fuerza el contador a 0 en el chat que se está mirando
+    // (CA-11.7) con un `upsertChat({unreadCount: 0})` que NO mueve
+    // `last_read_id`, así que este `markRead` ve 0, no manda recibo, y esos
+    // mensajes se quedan sin acusar hasta que entre uno nuevo en vivo (ese sí
+    // sale por `pushReadReceipt`). Es el mal menor: la alternativa —mandarlo
+    // igual— es la ráfaga de arriba. El arreglo de fondo es que `aplicarChat`
+    // use `clearUnread(jid, ultimoId)` en vez de `upsertChat`, así `unread_count`
+    // y `last_read_id` dejan de contradecirse; queda anotado para la tarea 18.
     if (chat.unreadCount > 0) deps.read?.markRead(jid, chat.lastReadId);
   },
 
@@ -843,12 +859,12 @@ export const commands: Commands = {
     return { ok: true };
   },
 
-  quit(code = 0) {
+  quit(code = 0, motivo = "?") {
     if (!deps) {
       process.exit(code);
       return;
     }
-    deps.log.info("app.quit", { code });
-    deps.shutdown(code);
+    deps.log.info("app.quit", { code, motivo, pid: process.pid });
+    deps.shutdown(code, motivo);
   },
 };

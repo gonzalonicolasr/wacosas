@@ -475,7 +475,7 @@
     bandeja con el mismo chat seleccionado y el mismo filtro.
   - depends-on: 13
 
-- [ ] 17. Implementar instancia única y cierre ordenado
+- [x] 17. Implementar instancia única y cierre ordenado
   - ⚠️ **tres cabos sueltos de la revisión de la 15** (chicos, ninguno bloquea): (a) el comentario
     de `read.ts:36-40` explica mal el cap — 200 claves en un 1:1 son **una sola stanza**
     (`aggregateMessageKeysNotFromMe` agrupa por `remoteJid:participant`), el cap sirve para grupos y

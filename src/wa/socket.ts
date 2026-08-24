@@ -900,6 +900,12 @@ export function createWaController(deps: WaDeps): WaController {
       // El estado de conexión ya quedó en `unlinked` arriba, con el reset.
       esperar(COOLDOWN_WIPE_MS)
         .then(() => {
+          // El `detenido` va ANTES del borrado: este cooldown es el único timer
+          // del archivo que `stop()` no puede cancelar, así que si el usuario
+          // apretó `Ctrl-C` en el medio esto despierta con el cierre en curso —y
+          // cerrar la app NUNCA borra credenciales (CA-17.6)—. La sesión sigue
+          // sin servir: el próximo arranque vuelve a caer acá y las borra.
+          if (detenido) return;
           // Si no se pudieron borrar, `borrarCreds` ya frenó todo: reconectar acá
           // sería volver a caer en este mismo camino cada 1,5 s.
           if (!borrarCreds(MOTIVO_QR_EN_RECONEXION)) return;
@@ -1024,6 +1030,10 @@ export function createWaController(deps: WaDeps): WaController {
         cancelarEspera();
         esperar(COOLDOWN_WIPE_MS)
           .then(() => {
+            // Cierre en curso ⇒ no se toca `creds/` (CA-17.6). Ver el mismo
+            // chequeo en la rama `wa.qr_con_creds`: este cooldown es un timer que
+            // `stop()` no puede cancelar y puede despertar en pleno apagado.
+            if (detenido) return;
             // Un wipe fallido NO se puede seguir de largo: con `intento` en 0 esto
             // sería un loop de reconexión cada 1,5 s sin backoff (ver `borrarCreds`).
             if (!borrarCreds(accion.reason)) return;

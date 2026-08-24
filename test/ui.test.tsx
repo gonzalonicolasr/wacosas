@@ -25,6 +25,14 @@ import { buildQr } from "../src/wa/qr";
 
 const LOG = "/tmp/wacosas-test.log";
 
+/**
+ * Presupuesto de los tests que esperan a que se apague un aviso efímero
+ * (`sinToast`): pueden dormir hasta `TOAST_MS` REALES, y cuánto duermen depende
+ * del toast que dejó el test anterior en el store —que es un singleton—. Con el
+ * default de 5 s de `bun test` quedaban a 800 ms del tope. Ver `sinToast`.
+ */
+const TIMEOUT_TOAST = 15_000;
+
 const ATAJOS_GLOBALES = [
   "?               abrir / cerrar esta ayuda",
   "Esc             cerrar la ayuda",
@@ -675,6 +683,17 @@ async function apretarEsc(t: Awaited<ReturnType<typeof montarLogin>>) {
  * `TOAST_MS` reales; el store no tiene con qué apagarlo antes de tiempo. Los
  * tests que miran el pie esperan lo que le quede de vida — nada, si no hay
  * ninguno, que es el caso salvo justo después de un `Ctrl-R` que reconectó.
+ *
+ * ⚠️ **Los tres tests que llaman acá llevan `timeout` propio, y no es de más.**
+ * Lo que se duerme es `TOAST_MS` MENOS la edad del toast, y el toast lo dejó una
+ * acción anterior sobre el `store`, que es el SINGLETON del proceso: o sea que
+ * cuánto se duerme depende de cuánto tardó lo de antes. Medido con
+ * `--reporter=junit`, el peor de los tres tarda 2,2 s de los 5 s que da `bun
+ * test` por default; el peor caso teórico es una máquina más rápida (toast más
+ * nuevo ⇒ espera más larga): 3,02 s de sueño + ~1,2 s del test = 4,2 s, a 800 ms
+ * del tope. Es el único test de la suite que se acerca a su presupuesto por una
+ * espera de reloj de pared, así que se le da margen explícito como a los de
+ * volumen.
  */
 async function sinToast(t: Awaited<ReturnType<typeof montarLogin>>) {
   act(() => {
@@ -719,7 +738,7 @@ test("en la vista del código, Ctrl-R pide uno NUEVO para el mismo número (CA-2
   expect(visto.eventos).toContain("link.pairing_pedido");
   expect(visto.reconexiones).toBe(0);
   t.renderer.destroy();
-});
+}, TIMEOUT_TOAST);
 
 test("con el código en pantalla, Esc vuelve al input y deja pedir para otro número", async () => {
   // El tropiezo real: WhatsApp NO valida que el número sea tuyo, así que un
@@ -750,7 +769,7 @@ test("con el código en pantalla, Esc vuelve al input y deja pedir para otro nú
   expect(visto.telefonos).toEqual(["5491133445566", "5491199887766"]);
   expect(t.captureCharFrame()).toContain("pidiéndole el código");
   t.renderer.destroy();
-});
+}, TIMEOUT_TOAST);
 
 test("en la vista del QR, Ctrl-R RECONECTA aunque ya se haya pedido un código", async () => {
   const visto = cablearComandos();
@@ -795,7 +814,7 @@ test("en la vista del QR, Ctrl-R RECONECTA aunque ya se haya pedido un código",
   // y sin sacar al usuario de la pantalla que estaba usando.
   expect(t.captureCharFrame()).toContain(qr.rows[1] as string);
   t.renderer.destroy();
-});
+}, TIMEOUT_TOAST);
 
 // ── la pantalla del candado (`^P`) ──────────────────────────────────────────
 //

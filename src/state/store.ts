@@ -219,7 +219,12 @@ export type Store = {
   setSearchQuery(query: string): void;
   /** Publica ya lo que esté sucio, sin esperar el frame (cierre ordenado y tests). */
   flushNow(): void;
-  /** Cancela los timers pendientes. Lo llama el cierre ordenado (CA-17.*). */
+  /**
+   * Cancela los timers pendientes. Lo llama el cierre ordenado (CA-17.*), y es
+   * **terminal**: después de `stop()` un `markDirty`, un `toast` o un `flushNow`
+   * no agendan ni publican nada. Sin eso, cualquier marca posterior al cierre
+   * rearma el timer de 33 ms (y ese flush leería una base ya cerrada).
+   */
   stop(): void;
 };
 
@@ -277,6 +282,8 @@ export function createStore(opts: StoreOpts = {}): Store {
 
   let cancelarFlush: Cancelar | null = null;
   let cancelarToast: Cancelar | null = null;
+  /** `stop()`: el cierre ya empezó. Es TERMINAL, no se vuelve atrás. */
+  let detenido = false;
   /** `-Infinity` ⇒ el primer `markDirty` agenda el flush con 0 ms de espera. */
   let ultimoFlush = -Infinity;
 
@@ -377,6 +384,12 @@ export function createStore(opts: StoreOpts = {}): Store {
   }
 
   function markDirty(...slices: Array<Slice | null | undefined>): void {
+    // Después de `stop()` no se agenda NADA más. Sin esta guarda, cualquier
+    // `markDirty` posterior al cierre —el `setConn` del `wa.stop()`, un efecto
+    // de desmontaje— vuelve a armar el timer de 33 ms que `stop()` acababa de
+    // cancelar, y encima ese flush leería una base ya cerrada (medido en la
+    // revisión de la tarea 6: 1 timer, 1 notify).
+    if (detenido) return;
     let hay = false;
     for (const s of slices) {
       if (!s) continue; // el flujo §6.2 pasa `null` cuando el chat no está abierto
@@ -419,6 +432,10 @@ export function createStore(opts: StoreOpts = {}): Store {
     },
 
     toast(text) {
+      // Igual que `markDirty`: después del `stop()` no se agenda nada. Un toast
+      // durante el cierre —"no se pudo enviar", del envío que quedó a medias—
+      // dejaría vivo un timer de 3 s que nadie va a ver.
+      if (detenido) return;
       const t = { text, at: ahora() };
       ui.toast = t;
       markDirty("ui");
@@ -502,12 +519,14 @@ export function createStore(opts: StoreOpts = {}): Store {
     },
 
     flushNow() {
+      if (detenido) return; // la base ya se está cerrando: no hay qué proyectar
       cancelarFlush?.();
       cancelarFlush = null;
       flush();
     },
 
     stop() {
+      detenido = true;
       cancelarFlush?.();
       cancelarFlush = null;
       cancelarToast?.();

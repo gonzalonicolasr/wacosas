@@ -128,6 +128,14 @@ export type Ingest = {
   push(job: IngestJob): void;
   /** Vacía la cola de una, sin timers. Lo usa el cierre ordenado (CA-17.1). */
   drainNow(): void;
+  /**
+   * Corta el drenador por timers y deja de aceptar trabajo nuevo (paso 2 de
+   * §6.6). Lo llama el cierre ordenado ANTES de esperar el envío en vuelo: los
+   * eventos que WhatsApp mande mientras el proceso se apaga se descartan —los
+   * vuelve a traer la próxima sesión— y así el `drainNow()` del paso 5 tiene una
+   * cola que termina. `drainNow()` sigue funcionando después de esto.
+   */
+  stop(): void;
   /** Filas todavía sin aplicar: el `⟳ sincronizando… N` del encabezado (§6.2). */
   pendingRows(): number;
 };
@@ -380,6 +388,8 @@ export function createIngest(deps: IngestDeps): Ingest {
   let trabada = 0;
 
   let cancelarTick: Cancelar | null = null;
+  /** `stop()`: el cierre ya empezó. No entra trabajo nuevo ni se agenda un tick. */
+  let detenido = false;
   /** Contexto de mapeo de la vuelta en curso (se rearma en cada `vuelta`). */
   let ctx: MapCtx = { selfJid: "", nowSec: 0 };
 
@@ -1074,7 +1084,7 @@ export function createIngest(deps: IngestDeps): Ingest {
    * llegue en el medio NO lo adelanta, se cuelga del que ya está agendado.
    */
   function agendarTick(ms = 0): void {
-    if (cancelarTick) return;
+    if (cancelarTick || detenido) return;
     cancelarTick = agendar(tick, ms);
   }
 
@@ -1104,6 +1114,10 @@ export function createIngest(deps: IngestDeps): Ingest {
   /** El `push` del contrato. Con nombre porque el fallback de subject lo reusa. */
   function encolar(job: IngestJob): void {
     try {
+      // Cierre en marcha: lo que llegue ahora no se escribe. Lo que ya estaba
+      // encolado sí (`drainNow`), y lo que se descarta acá lo vuelve a mandar
+      // WhatsApp en la próxima sesión.
+      if (detenido) return;
       const largo = itemsDe(job).length;
       if (largo === 0) return;
       if (cola.length - cabeza >= MAX_QUEUE_JOBS) descartarViejo();
@@ -1122,6 +1136,12 @@ export function createIngest(deps: IngestDeps): Ingest {
 
   return {
     push: encolar,
+
+    stop() {
+      detenido = true;
+      cancelarTick?.();
+      cancelarTick = null;
+    },
 
     drainNow() {
       cancelarTick?.();

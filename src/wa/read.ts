@@ -154,7 +154,13 @@ export function createReadReceipts(deps: ReadDeps): ReadReceipts {
       if (!enabled || !chatJid) return;
       const grupo = !!isJidGroup(chatJid);
       const keys: WAMessageKey[] = [];
-      for (const m of msgs ?? []) {
+      // El MISMO tope que `markRead`, y por el mismo motivo (R8): un chunk del
+      // ingest puede traer cientos de mensajes de una —el sync de historial que
+      // cae sobre el chat abierto— y anunciarlos todos junta un nodo enorme sin
+      // que el otro lado vea nada distinto: lo que mira es el más nuevo. Se
+      // conservan los ÚLTIMOS, que son justamente esos.
+      const ventana = (msgs ?? []).slice(-MAX_CLAVES_RECIBO);
+      for (const m of ventana) {
         if (!m?.waId) continue;
         keys.push(clave(chatJid, m.waId, grupo ? m.senderJid : ""));
       }

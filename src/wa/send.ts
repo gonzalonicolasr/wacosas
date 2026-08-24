@@ -63,6 +63,7 @@ export const MAX_SENT_CACHE = 200;
 export const UMBRAL_AVISO_MS = 2_000;
 
 export const MOTIVO_SIN_CONEXION = "sin conexión: el mensaje no se mandó, el texto queda acá";
+export const MOTIVO_CERRANDO = "wacosas se está cerrando: el mensaje no se mandó";
 export const MOTIVO_SIN_CHAT = "no hay ningún chat abierto";
 export const MOTIVO_VACIO = "no hay nada para enviar";
 export const MOTIVO_NO_GUARDADO = "no se pudo guardar el mensaje en la base";
@@ -91,6 +92,16 @@ export type SendQueue = {
   retry(chatJid: string, waId: string): ResultadoEnvio;
   /** El trabajo en vuelo, para el tope de 2 s del cierre ordenado (CA-17.7). */
   inFlight(): Promise<void> | null;
+  /**
+   * Corta el ingreso de trabajo nuevo (paso 2 de §6.6). Lo llama el cierre
+   * ordenado ANTES de esperar el envío en vuelo: sin esto, el worker seguiría
+   * tomando los que quedaban en la cola —uno por segundo, RNF-8— y el tope de
+   * 2 s no alcanzaría nunca. El que ya está en la red se termina (`inFlight`);
+   * los que no salieron los deja `failed` el cierre (`boot/shutdown.ts`).
+   *
+   * §5.8 no lo definía: lo pidió la revisión de la tarea 14 y lo necesita la 17.
+   */
+  stop(): void;
   /** Mensajes esperando turno, incluido el que se está mandando. */
   size(): number;
   /**
@@ -144,6 +155,8 @@ export function createSendQueue(deps: SendDeps): SendQueue {
   const cola: SendJob[] = [];
   /** El worker en vuelo, o `null`. Es lo que devuelve `inFlight()`. */
   let corriendo: Promise<void> | null = null;
+  /** `stop()`: el cierre ya empezó y no entra ni sale trabajo nuevo. */
+  let detenido = false;
   /** `wa_id` → proto del mensaje, para `getMessage` (§8.6). */
   const sentCache = new Map<string, proto.IMessage>();
 
@@ -242,7 +255,10 @@ export function createSendQueue(deps: SendDeps): SendQueue {
    */
   async function fallar(job: SendJob, razon: string): Promise<void> {
     const proximo = job.attempt + 1;
-    if (proximo <= SEND_MAX_ATTEMPTS) {
+    // Con el cierre en marcha no se reintenta: el primer reintento es a 1 s y el
+    // tercero a 9 s, o sea que la cadena sola se come el tope de 2 s del apagado
+    // y el mensaje terminaría igual en `failed`, pero cuatro segundos después.
+    if (proximo <= SEND_MAX_ATTEMPTS && !detenido) {
       const delay = sendRetryDelayMs(proximo);
       // El cuerpo del mensaje NO se loguea (CA-14.7): sólo el intento y el motivo.
       log.warn("send.reintento", { intento: proximo, en_ms: delay, motivo: razon });
@@ -270,7 +286,10 @@ export function createSendQueue(deps: SendDeps): SendQueue {
 
   async function trabajar(): Promise<void> {
     try {
-      while (cola.length > 0) await procesar(cola.shift() as SendJob);
+      // `!detenido` en la condición y no adentro: el job que ya se sacó de la
+      // cola se termina (eso es lo que espera `inFlight`), pero no se toma
+      // ninguno más una vez que empezó el cierre.
+      while (!detenido && cola.length > 0) await procesar(cola.shift() as SendJob);
     } catch (e) {
       // `procesar` ya atrapa todo; esto es el último seguro para que una
       // excepción inesperada no deje la cola trabada con `corriendo` colgado.
@@ -302,6 +321,7 @@ export function createSendQueue(deps: SendDeps): SendQueue {
       // CA-8.3: sólo espacios no es un mensaje. Se recorta en las PUNTAS: los
       // saltos de línea del medio son del usuario y viajan tal cual (CA-8.4).
       const cuerpo = texto(text).trim();
+      if (detenido) return { ok: false, reason: MOTIVO_CERRANDO };
       if (!jid) return { ok: false, reason: MOTIVO_SIN_CHAT };
       if (!cuerpo) return { ok: false, reason: MOTIVO_VACIO };
       // CA-8.7: sin conexión no se encola NI se inserta. El aviso lo da el
@@ -357,6 +377,7 @@ export function createSendQueue(deps: SendDeps): SendQueue {
     retry(chatJid, waId) {
       const jid = texto(chatJid);
       const id = texto(waId);
+      if (detenido) return { ok: false, reason: MOTIVO_CERRANDO };
       if (!jid || !id) return { ok: false, reason: MOTIVO_NO_ESTA };
       const fila = repo.getMessageByWaId(jid, id);
       if (!fila) return { ok: false, reason: MOTIVO_NO_ESTA };
@@ -375,6 +396,15 @@ export function createSendQueue(deps: SendDeps): SendQueue {
 
     inFlight() {
       return corriendo;
+    },
+
+    stop() {
+      detenido = true;
+      // La cola se vacía acá y no en el cierre: las filas de esos mensajes ya
+      // están en la base con `pending`, y el que las pasa a `failed` con motivo
+      // es `cerrarEnviosAbiertos` (`boot/shutdown.ts`, CA-17.7). Vaciarla evita
+      // que un `bombear()` tardío arranque otro worker.
+      cola.length = 0;
     },
 
     size() {

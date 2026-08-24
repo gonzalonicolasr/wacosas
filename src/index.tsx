@@ -12,7 +12,9 @@
 //     frame ya sale con los chats de la base y no vacío (CA-13.1);
 //   · `wa.start()` va ÚLTIMO: la interfaz tiene que estar pintada y navegable
 //     aunque la red no conteste nunca (CA-13.2, RNF-5).
-// El `lock` (instancia única) lo inserta la tarea 17 entre los args y la base.
+//   · el `lock` (instancia única, CA-18.*) va entre los args y la base: una
+//     segunda instancia tiene que morir SIN haber abierto la base ni tocado
+//     `creds/`, y sin haberle robado la pantalla a la que ya está corriendo.
 //
 // Los imports son DINÁMICOS a propósito: los `import` estáticos se hoistean y se
 // evaluarían antes del `umask` y del dup2. Además, cargar `wa/socket` (o sea,
@@ -99,6 +101,33 @@ pero cualquiera que entre con tu usuario puede leer el historial.`);
 const noSplash = argv.includes("--no-splash"); // CA-13.7
 const qrPngPath = rutaQrPng(argv, paths.dataDir);
 
+// ── instancia única (CA-18.*) ───────────────────────────────────────────────
+// Va acá y no más abajo a propósito: la segunda instancia tiene que salir SIN
+// abrir la base, sin tocar `creds/` y sin conectarse a WhatsApp (CA-18.2). Y va
+// después de `--version`/`--help`, que son preguntas y no una sesión.
+//
+// El aviso sale por `console.log` (fd 1) y no por `console.error`: el fd 2 ya
+// está apuntando al archivo de log (D9), así que un `error` acá sería invisible.
+const { acquireLock } = await import("./boot/lock");
+const tomado = acquireLock(paths.lockPath);
+if (!tomado.ok) {
+  console.log(
+    `wacosas ya está corriendo en este directorio (pid ${tomado.ajena.pid}). ` +
+      `Cerrá esa instancia, o usá otro XDG_DATA_HOME.`,
+  );
+  log.warn("boot.instancia_tomada", { pid: tomado.ajena.pid, lock: paths.lockPath });
+  // 3 = "hay otra instancia". Distinto de 0 (CA-18.2) y distinto del 2 de la
+  // base corrupta, para que un script pueda diferenciarlos.
+  process.exit(3);
+}
+const lock = tomado.lock;
+if (tomado.aviso) {
+  // No se pudo escribir el pidfile (directorio de sólo lectura, por ejemplo). Se
+  // arranca igual —quedarse sin app es peor que el riesgo de dos instancias—,
+  // pero queda dicho en el log.
+  log.warn("boot.lock_sin_marca", { lock: paths.lockPath, motivo: tomado.aviso });
+}
+
 // ── renderer ────────────────────────────────────────────────────────────────
 // `exitOnCtrlC:false` + `exitSignals:[]`: la salida la maneja la app (CA-17.1),
 // no el renderer. Sin esto, `Ctrl-C` mataría el proceso salteándose el cierre
@@ -145,6 +174,10 @@ try {
         } catch {
           /* si el renderer ya se cayó, salir igual */
         }
+        // La marca de instancia única se suelta también por este camino (CA-18.4):
+        // si no, una base corrupta dejaría el pidfile puesto hasta el próximo
+        // arranque —que lo vería huérfano y lo pisaría, pero recién ahí—.
+        lock.release();
         process.exit(2);
       }}
     />,
@@ -175,19 +208,51 @@ store.bootstrap(repo);
 // ── interfaz ────────────────────────────────────────────────────────────────
 const renderer = await montarRenderer();
 
-/**
- * Cierre mínimo: deja la terminal usable (fuera de la pantalla alternativa, sin
- * mouse tracking, con el cursor visible) y sale. La tarea 17 lo reemplaza por el
- * apagado ordenado de §6.6 sin tocar a los llamadores.
- */
-const shutdown = (code = 0): void => {
-  try {
-    renderer.destroy();
-  } catch {
-    /* si el renderer ya se cayó, la salida sigue siendo la prioridad */
-  }
-  process.exit(code);
-};
+// ── cierre ordenado (§6.6, CA-17.*) ─────────────────────────────────────────
+// Se arma ACÁ, antes de la máquina, porque desde este punto ya hay una terminal
+// en la pantalla alternativa: si algo explota mientras carga baileys, el camino
+// de salida tiene que existir para devolverle el prompt al usuario.
+//
+// La máquina (ingest, cola de envío, socket, app-state, identidades) viaja en una
+// caja que se llena MÁS ABAJO, cuando esas cinco piezas existen: un `Ctrl-C` en
+// el medio de la carga de baileys tiene que poder cerrar igual, y cada paso del
+// cierre se saltea solo si su pieza todavía no está.
+const { createShutdown, cerrarEnviosAbiertos, MOTIVO_CAIDA } = await import("./boot/shutdown");
+const maquina: import("./boot/shutdown").Maquina = {};
+
+const shutdown = createShutdown({
+  log,
+  store,
+  repo,
+  renderer,
+  lock,
+  maquina: () => maquina,
+});
+
+// Envíos que dejó a medias un proceso que murió de golpe (`kill -9`, un corte de
+// luz): la cola es de memoria (D8), así que nadie los va a volver a tomar y sin
+// esto se quedarían en `⏳ enviando` para siempre. Pasan a `⚠ falló` con motivo y
+// el usuario decide con `Ctrl-Y` (CA-9.3). Corre antes de que se pueda abrir un
+// chat, que es la única pantalla donde se ve el estado de un mensaje propio.
+cerrarEnviosAbiertos(repo, MOTIVO_CAIDA, log);
+
+// CA-17.5. El renderer se crea con `exitSignals: []`, así que estos son los
+// ÚNICOS handlers de señal del proceso: sin ellos, cerrar la pane de tmux mata a
+// wacosas sin drenar la cola ni cerrar la base.
+for (const senal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+  process.on(senal, () => shutdown(0, senal));
+}
+
+// Un error que nadie atrapó no puede dejar la terminal en la pantalla alternativa
+// y sin cursor: se loguea y se cierra por el mismo camino, con código 1.
+process.on("uncaughtException", (e: unknown) => {
+  log.error("app.excepcion", { motivo: e instanceof Error ? e.message : String(e) });
+  shutdown(1, "uncaughtException");
+});
+process.on("unhandledRejection", (e: unknown) => {
+  log.error("app.rechazo", { motivo: e instanceof Error ? e.message : String(e) });
+  shutdown(1, "unhandledRejection");
+});
 
 const { configureCommands } = await import("./state/commands");
 const { App } = await import("./ui/App");
@@ -379,6 +444,11 @@ store.subscribe("conn", () => {
     appstate.onOpen();
   }
 });
+
+// Recién ahora el cierre ordenado tiene a quién pararle la mano (§6.6, paso 2).
+// Hasta esta línea `Ctrl-C` cerraba igual, pero sin drenar ni parar nada: no
+// había nada corriendo.
+Object.assign(maquina, { ingest, send, wa, appstate, identity });
 
 configureCommands({ repo, wa, store, log, send, read, appstate, lockCode, shutdown });
 

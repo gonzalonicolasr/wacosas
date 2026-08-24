@@ -782,6 +782,17 @@ export function createRepo(db: Database): Repo {
     },
 
     close() {
+      // Checkpoint explícito ANTES de cerrar (§6.6, paso 6). No es de adorno:
+      // `sqlite3_close_v2` sólo checkpointea y borra el `-wal` si no le quedan
+      // sentencias sin finalizar, y acá hay decenas cacheadas en la conexión, así
+      // que sin esto el `-wal` sobrevive entero a cada salida. Los datos están
+      // igual (por eso el WAL existe), pero el arranque siguiente los tiene que
+      // reproducir y el `quick_check` de §4.2 paga la diferencia.
+      try {
+        db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+      } catch {
+        /* la base puede estar en sólo lectura o ya rota: cerrar igual */
+      }
       db.close();
     },
   };

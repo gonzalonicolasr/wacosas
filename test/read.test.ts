@@ -480,6 +480,24 @@ describe("chat abierto (CA-11.7)", () => {
     expect(a.llamadas.length).toBe(0);
   });
 
+  test("una ráfaga al chat abierto también se acota a MAX_CLAVES_RECIBO", () => {
+    // La asimetría que faltaba cerrar (⚠️ de la tarea 17): `markRead` tenía tope
+    // y este camino no, así que 400 mensajes de una vuelta del ingest salían
+    // enteros en un solo nodo. El otro lado ve lo mismo —mira el más nuevo—.
+    const a = armar();
+    commands.openChat(ANTO);
+    // Más que `MAX_ROWS_PER_TICK`: así al menos UNA vuelta del ingest le pasa a
+    // `pushReadReceipt` un lote más grande que el tope (el resto se reparte en
+    // las vueltas siguientes, que es el "un recibo por vuelta" de §6.2).
+    const total = 600;
+    llegan(a, ANTO, total);
+
+    const largos = a.llamadas.map((ll) => ll.length);
+    expect(Math.max(...largos)).toBe(MAX_CLAVES_RECIBO);
+    // Y el más nuevo de todos salió igual: es el que dispara el tilde azul.
+    expect(String(a.llamadas.at(-1)?.at(-1)?.id)).toBe(`IN${total}`);
+  });
+
   test("el mismo sync sobre un chat CERRADO sí trae su contador absoluto", () => {
     const a = armar();
     commands.openChat(ANTO);
@@ -519,3 +537,4 @@ test("reiniciar el proceso deja los contadores como estaban (CA-14.3)", () => {
   expect(b.llamadas.length).toBe(0);
   b.repo.close();
 });
+

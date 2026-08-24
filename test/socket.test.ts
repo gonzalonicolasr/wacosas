@@ -259,6 +259,7 @@ function banco(
       ingestReal.push(j);
     },
     drainNow: () => ingestReal.drainNow(),
+    stop: () => ingestReal.stop(),
     pendingRows: () => ingestReal.pendingRows(),
   };
   const ingest = opts.ingest ? opts.ingest(espia) : espia;

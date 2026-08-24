@@ -73,6 +73,48 @@ function disposicionDe(ancho: number): Disposicion {
 const TECLAS_SCROLL = new Set(["up", "down", "pageup", "pagedown", "home", "end"]);
 
 /**
+ * ¿Esta tecla es la salida (CA-17.1)? Devuelve la etiqueta para el log, o `null`.
+ *
+ * Es la ÚNICA puerta por la que el proceso termina por decisión del usuario, así
+ * que es deliberadamente angosta. La condición vieja era
+ * `key.ctrl && (name|sequence === "c" || name|sequence === "q")`. Lo que quedó
+ * afuera —y por qué—:
+ *
+ *  · **cualquier otro modificador**. Antes alcanzaba con que el nombre fuera `c`
+ *    y `ctrl` estuviera prendido, así que `Ctrl-Shift-C` —el copiar de media
+ *    terminal, y lo que manda un `Ctrl-C` con Bloq Mayús en algunos esquemas—,
+ *    `Ctrl-Alt-C` y `Ctrl-Super-C` **cerraban la aplicación**. `Ctrl-C` es
+ *    `Ctrl-C`: con otra cosa encima es otra tecla, y ninguna otra tecla puede
+ *    tener permiso para matar el proceso.
+ *  · **el `sequence`**. Con el nombre alcanza (`Ctrl-C` legacy es el byte 0x03,
+ *    que el parser nombra `c`; en kitty es `CSI 99;5u`, que también nombra `c`),
+ *    y mirar el `sequence` es abrir la puerta a eventos cuyo nombre no es `c` en
+ *    absoluto: con el protocolo kitty ahí va el *texto asociado* de la tecla, no
+ *    los bytes que llegaron.
+ *  · **los eventos que no son `press`**. Hoy no llegan —`useKeyboard` sin
+ *    `{release:true}` sólo escucha `keypress`—, pero el `eventType` viene en el
+ *    evento y esto es una línea: soltar una tecla no puede cerrar nada.
+ */
+/**
+ * Los bytes de una secuencia de teclado en hexa, para el log. Acotado: lo que
+ * manda una tecla son dos o tres bytes, y si alguna vez llegara algo largo (una
+ * pegada de texto mal ruteada) no puede terminar entero en el archivo (CA-14.7).
+ */
+function bytesDe(seq: string): string {
+  const bytes = [...seq.slice(0, 8)].map((c) => (c.codePointAt(0) ?? 0).toString(16).padStart(2, "0"));
+  return `[${bytes.join(" ")}${seq.length > 8 ? " …" : ""}]`;
+}
+
+export function teclaDeSalida(key: KeyEvent | null | undefined): "^C" | "^Q" | null {
+  if (!key?.ctrl) return null;
+  if (key.eventType && key.eventType !== "press") return null;
+  if (key.shift || key.meta || key.option || key.super || key.hyper) return null;
+  if (key.name === "c") return "^C";
+  if (key.name === "q") return "^Q";
+  return null;
+}
+
+/**
  * Aplica al panel de conversación una de las teclas de arriba. Devuelve `false`
  * si no había caja (ningún chat abierto), para que el llamador decida.
  *
@@ -283,8 +325,14 @@ export function App({
     // splash: que salir dependa de que la animación haya terminado convierte al
     // primer `Ctrl-C` en un "saltear splash". El renderer va con
     // `exitOnCtrlC:false`, así que sin esta rama no habría cómo salir.
-    if (key.ctrl && (es("c") || es("q"))) {
-      commands.quit();
+    //
+    // El motivo que viaja al log lleva los BYTES de la tecla: si alguna vez el
+    // proceso vuelve a cerrarse sin que nadie apriete nada, la línea `app.quit`
+    // dice exactamente qué llegó por el teclado (y si no dice nada de esto, el
+    // cierre no vino de acá).
+    const salida = teclaDeSalida(key);
+    if (salida) {
+      commands.quit(0, `tecla ${salida} ${bytesDe(seq)}`);
       return;
     }
 
