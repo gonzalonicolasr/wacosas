@@ -103,11 +103,22 @@ const qrPngPath = rutaQrPng(argv, paths.dataDir);
 // `exitOnCtrlC:false` + `exitSignals:[]`: la salida la maneja la app (CA-17.1),
 // no el renderer. Sin esto, `Ctrl-C` mataría el proceso salteándose el cierre
 // ordenado (drenar el ingest, cerrar la base) que arma la tarea 17.
+//
+// `autoFocus:false`: el foco lo decide la app (la prop `focused` del buscador y
+// del campo de redacción), NUNCA el mouse. Con el default `true`, cualquier
+// click izquierdo hace que OpenTUI camine hacia arriba buscando el primer
+// ancestro focusable y lo enfoque (`dispatchMouseEvent`); el `<scrollbox>` de la
+// conversación **es** focusable, así que clickear un mensaje le sacaba el foco al
+// buscador de la bandeja y al campo de redacción —el pie seguía diciendo
+// `⏎ enviar` con el campo muerto, y recuperarlo era `Esc` y después `Ctrl-E`,
+// porque en modo `compose` el handler global no maneja nada más que la salida—.
+// Apagarlo no saca nada: `focused` sigue funcionando igual, y el click en la
+// bandeja (seleccionar / abrir con doble click, CA-5.6) es un handler propio.
 const { createCliRenderer } = await import("@opentui/core");
 const { createRoot } = await import("@opentui/react");
 
 async function montarRenderer() {
-  return createCliRenderer({ exitOnCtrlC: false, exitSignals: [] });
+  return createCliRenderer({ exitOnCtrlC: false, exitSignals: [], autoFocus: false });
 }
 
 // ── base ────────────────────────────────────────────────────────────────────

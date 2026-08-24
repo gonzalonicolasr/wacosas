@@ -44,7 +44,26 @@ export type Counts = { all: number; unread: number; groups: number };
  * `failed` y `pending` comparten escalón a propósito: son los dos extremos del
  * mismo intento y el reintento de `Ctrl-Y` (CA-9.3) tiene que poder volver de
  * `failed` a `pending`. Lo que NO se permite es que un ack viejo mande a
- * `failed` —ni a `pending`— un mensaje que ya salió.
+ * `pending` un mensaje que ya salió.
+ *
+ * ⚠️ `failed` es la EXCEPCIÓN de la escalera y por eso no se resuelve con el
+ * número (ver `puedeAvanzar`): también se puede caer ahí desde `sent`. El
+ * `messages.update` con `status: ERROR` sale de un solo lugar de Baileys
+ * (`Socket/messages-recv.js`, el ack con `attrs.error`: 403, 479 `smax-invalid`,
+ * "user is temporarily restricted") y es la ÚNICA señal de que WhatsApp rechazó
+ * el mensaje o nos está limitando —justo lo que RNF-8 trata de evitar—. Como
+ * `sock.sendMessage` NO espera el ack (`relayMessage` vuelve apenas manda la
+ * stanza), nuestro `sent` se escribe SIEMPRE antes de que llegue ese ERROR: con
+ * la escalera a secas, la señal se perdía siempre y el mensaje rechazado
+ * quedaba en `✓ enviado` para siempre, sin motivo y sin `Ctrl-Y`.
+ *
+ * `delivered` y `read` sí lo bloquean: son prueba de que el mensaje llegó.
+ *
+ * Lo que esta función NO puede expresar —porque el repo no sabe quién la
+ * llama— es el caso inverso: que `wa/send.ts` baje a `failed` un mensaje que
+ * SÍ salió porque su promesa lanzó después de que el server acusó la stanza
+ * (ahí el `Ctrl-Y` del usuario lo duplicaría). Esa guarda vive en `fallar()`,
+ * que lee la fila antes de escribir.
  */
 export const ORDEN_ESTADO: Record<MessageStatus, number> = {
   received: 0,
@@ -61,6 +80,9 @@ export function puedeAvanzar(actual: MessageStatus, nuevo: MessageStatus): boole
   const b = ORDEN_ESTADO[nuevo];
   // Un estado desconocido (base tocada a mano, versión futura) no bloquea nada.
   if (a === undefined || b === undefined) return true;
+  // El rechazo del servidor llega después del `sent` (ver arriba): se acepta
+  // hasta ese escalón, nunca sobre un mensaje ya entregado o leído.
+  if (nuevo === "failed") return a <= ORDEN_ESTADO.sent;
   return b >= a;
 }
 

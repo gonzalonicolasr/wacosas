@@ -494,6 +494,33 @@
     timer de 33 ms en vuelo que impide que el proceso muera.
   - depends-on: 9, 14
 
+> ### ❓ Abierto: contactos 1:1 sin nombre (medido en la cuenta real de Gon, 2026-08-24)
+>
+> Tras destrabar el historial, la bandeja quedó con **21 chats, 19.097 mensajes, 13 con nombre**
+> (todos los grupos resueltos). Pero **8 chats 1:1 muestran sólo el número**.
+>
+> Lo medido, para no re-derivarlo:
+> - `creds/` tiene **2293 archivos** y `myAppStateKeyId` + 3 `app-state-sync-key`: **el sync de la
+>   agenda FUNCIONA**. Por eso 11 de 33 contactos sí traen nombre.
+> - **7 de los 8** chats sin nombre **sí tienen fila en `contacts`** — pero esa fila vino con
+>   `name`, `notify` y `verifiedName` los tres vacíos. `aplicarContacto` ya toma los tres
+>   (`ingest.ts:430`), así que el mapeo no es el problema.
+> - **Sólo 29 de 19.097 mensajes tienen `sender_name`**, y **ninguno** de esos pertenece a un chat
+>   sin nombre ⇒ **los mensajes del historial no traen `pushName`**; sólo lo traen los que llegan
+>   en vivo. Un chat que vino puro de historial no tiene de dónde sacar nombre salvo la agenda.
+>
+> **Hipótesis principal**: son personas que Gon **no tiene agendadas**, y WhatsApp en el teléfono
+> también se las muestra como número. Si es así **no hay bug**, y la mejora posible sería mostrar
+> el `~alias` que la persona se puso.
+>
+> **Pendiente de que Gon confirme**: agarrar uno de esos números y ver si en su teléfono aparece
+> con nombre o con número. Si aparece con nombre, **sí hay bug** y hay que ver por qué la fila de
+> `contacts` llega vacía.
+>
+> **Dato aparte, ya cerrado**: quedan **3 chats `@lid`**. O sea que la limitación de identidades
+> duplicadas (R7) **es real** y no era un efecto del flag del historial, como se había
+> hipotetizado. El README ya la documenta; no hace falta cambiar nada.
+
 - [ ] 18. **[PRUEBA MANUAL — cuenta real de WhatsApp]** Recorrido end-to-end y documentación final
   - covers: CA-3.1, CA-3.2, CA-3.5, CA-6.9, CA-8.2, CA-8.4, CA-8.7, CA-8.8, CA-9.1, CA-9.2, CA-9.3,
     CA-9.4, CA-9.5, CA-11.2, CA-11.6, CA-14.3, CA-14.4, CA-15.1, CA-15.3, CA-15.4, CA-15.5,

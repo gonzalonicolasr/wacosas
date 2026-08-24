@@ -443,11 +443,11 @@ describe("envíos", () => {
     repo.upsertChat({ jid: CHAT, name: "Ana" });
     repo.insertMessage(mensaje({ waId: "W1", status: "received" }));
     repo.insertMessage(mensaje({ waId: "W2", status: "pending", fromMe: true }));
-    // W3 nace `pending` y NO `sent`: desde la tarea 14 el estado de entrega sólo
-    // avanza (`ORDEN_ESTADO`), así que un mensaje que WhatsApp ya acusó recibo no
-    // puede pasar a `failed` — y el camino real de un envío fallado es
-    // justamente `pending → failed`, que es lo que se arma acá.
-    repo.insertMessage(mensaje({ waId: "W3", status: "pending", fromMe: true }));
+    // W3 arranca en `sent` porque ése es el camino real del rechazo: el ERROR
+    // ack de WhatsApp llega SIEMPRE después de nuestro `sent` (`sendMessage` no
+    // espera el ack), y `ORDEN_ESTADO` lo deja bajar de ahí a `failed` justamente
+    // para no perder esa señal. Desde `delivered` o `read` no bajaría.
+    repo.insertMessage(mensaje({ waId: "W3", status: "sent", fromMe: true }));
     repo.setMessageStatus(CHAT, "W3", "failed", "sin conexión");
 
     const abiertos = repo.openSends();

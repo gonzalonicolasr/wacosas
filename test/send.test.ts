@@ -29,6 +29,7 @@ import { MAX_PER_WINDOW, MIN_GAP_MS } from "../src/lib/ratelimit";
 import { createStore, type Store } from "../src/state/store";
 import { createIngest } from "../src/wa/ingest";
 import {
+  AVISO_EN_COLA,
   createSendQueue,
   MOTIVO_NO_FALLADO,
   MOTIVO_SIN_CONEXION,
@@ -129,6 +130,8 @@ type Arnes = {
   falso: ReturnType<typeof socketFalso>;
   /** La conexión que ve la cola (`wa.isOpen()`). */
   abierta: { valor: boolean };
+  /** Todo lo que la cola pasó por `store.toast`, en orden (CA-19.5). */
+  toasts: string[];
 };
 
 function armar(): Arnes {
@@ -141,6 +144,15 @@ function armar(): Arnes {
   const falso = socketFalso(reloj);
   const abierta = { valor: true };
   let n = 0;
+
+  // Los toasts se espían sin dejar de pasarlos al store de verdad: lo que se
+  // afirma es lo que el usuario ve en el pie (CA-19.5), no una llamada.
+  const toasts: string[] = [];
+  const toastReal = store.toast;
+  store.toast = (t: string) => {
+    toasts.push(t);
+    toastReal(t);
+  };
 
   const cola = createSendQueue({
     repo,
@@ -159,7 +171,7 @@ function armar(): Arnes {
     newId: () => `LOCAL${++n}`,
   });
 
-  return { repo, store, cola, reloj, falso, abierta };
+  return { repo, store, cola, reloj, falso, abierta, toasts };
 }
 
 /** Corre la cola hasta que no queden esperas pendientes (o se agote el tope). */
@@ -229,6 +241,54 @@ describe("ritmo de envío", () => {
   });
 });
 
+// ── el aviso de que se están espaciando los envíos (D8, CA-19.5) ────────────
+//
+// Sin esto una ráfaga son cinco segundos de `⏳` sin ninguna explicación: el
+// usuario no tiene forma de saber que el silencio es el rate limit de RNF-8 y no
+// un cuelgue. Ojo con el detalle que lo hacía inútil: el limitador da 1 s casi
+// siempre, porque el worker es serial y pide turno recién cuando toma el job.
+
+describe("aviso de cola", () => {
+  test("una ráfaga avisa que se están espaciando los envíos", async () => {
+    const a = armar();
+    for (let i = 1; i <= 6; i++) expect(a.cola.enqueue(ANTO, `m${i}`).ok).toBe(true);
+
+    // El aviso sale al ENCOLAR, no cuando el mensaje llega a su turno: para
+    // entonces ya pasaron los cinco segundos que había que explicar.
+    expect(a.toasts).toContain(AVISO_EN_COLA);
+    // Y sale en el pie, que es donde el usuario lo lee (CA-19.5).
+    expect(a.store.getSnapshot("ui").toast?.text).toBe(AVISO_EN_COLA);
+
+    await drenar(a);
+    expect(a.falso.enviados.length).toBe(6);
+  });
+
+  test("un mensaje solo, con la cola vacía, no avisa nada", async () => {
+    const a = armar();
+    expect(a.cola.enqueue(ANTO, "único").ok).toBe(true);
+    await drenar(a);
+    // Sale en el acto: avisar acá sería ruido.
+    expect(a.toasts).toEqual([]);
+    expect(a.falso.enviados.length).toBe(1);
+  });
+
+  test(`el ${MAX_PER_WINDOW + 1}.º del minuto avisa aunque la cola esté vacía`, async () => {
+    const a = armar();
+    // De a uno y esperando cada envío: la cola nunca tiene a nadie adelante, así
+    // que el único que puede avisar es el limitador cuando se cierra la ventana.
+    for (let i = 1; i <= MAX_PER_WINDOW; i++) {
+      a.cola.enqueue(ANTO, `m${i}`);
+      await drenar(a);
+    }
+    expect(a.toasts).toEqual([]);
+
+    a.cola.enqueue(ANTO, "el que espera el minuto");
+    await drenar(a, 2_000);
+    expect(a.toasts).toEqual([AVISO_EN_COLA]);
+    expect(a.falso.enviados.length).toBe(MAX_PER_WINDOW + 1);
+  });
+});
+
 // ── reintentos (RNF-9, CA-9.3) ──────────────────────────────────────────────
 
 describe("reintentos", () => {
@@ -283,6 +343,35 @@ describe("reintentos", () => {
     const fallo = a.cola.retry(ANTO, r.waId as string);
     expect(fallo).toEqual({ ok: false, reason: MOTIVO_NO_FALLADO });
     expect(a.falso.enviados.length).toBe(1);
+  });
+});
+
+// ── el mensaje YA SALIÓ: nada de lo de después vuelve a la red ──────────────
+
+describe("un error después del envío no lo reenvía", () => {
+  test("si `repo.tx` lanza DESPUÉS de que el mensaje salió, sale UNA sola vez", async () => {
+    const a = armar();
+    const r = a.cola.enqueue(ANTO, "hola de verdad");
+    expect(r.ok).toBe(true);
+
+    // La base se rompe justo cuando el worker va a persistir el `sent`:
+    // SQLITE_BUSY, disco lleno, o la base cerrada por el apagado (tarea 17). El
+    // `enqueue` de arriba ya guardó su fila, así que esto sólo pega en el `tx`
+    // del worker — el que corre con el mensaje YA entregado a WhatsApp.
+    a.repo.tx = ((): never => {
+      throw new Error("database is locked");
+    }) as Repo["tx"];
+
+    await drenar(a);
+
+    // Lo único que importa: la persona del otro lado recibió UN mensaje, no
+    // cuatro. Un error de la BASE no puede reintentar la RED.
+    expect(a.falso.enviados.length).toBe(1);
+    expect(a.falso.enviados.map((e) => e.texto)).toEqual(["hola de verdad"]);
+    // La fila queda `pending` (⏳): no se pudo escribir el `sent`, y eso lo
+    // corrige el eco/ack de WhatsApp. Lo que NO puede quedar es `failed`, que
+    // le ofrecería al usuario un `Ctrl-Y` que duplicaría el mensaje.
+    expect(a.repo.lastMessages(ANTO).map((m) => m.status)).toEqual(["pending"]);
   });
 });
 
@@ -431,11 +520,20 @@ describe("el estado de entrega no retrocede", () => {
     expect(puedeAvanzar("read", "sent")).toBe(false);
     expect(puedeAvanzar("delivered", "sent")).toBe(false);
     expect(puedeAvanzar("sent", "pending")).toBe(false);
-    expect(puedeAvanzar("read", "failed")).toBe(false);
     // `failed` y `pending` comparten escalón: el reintento manual vuelve.
     expect(puedeAvanzar("pending", "failed")).toBe(true);
     expect(puedeAvanzar("failed", "pending")).toBe(true);
     expect(ORDEN_ESTADO.read).toBeGreaterThan(ORDEN_ESTADO.delivered as number);
+
+    // `failed` es la EXCEPCIÓN de la escalera: se puede caer ahí DESDE `sent`,
+    // porque el ERROR ack de WhatsApp (403, 479 `smax-invalid`, "temporarily
+    // restricted") llega siempre después de que escribimos `sent` —
+    // `sock.sendMessage` no espera el ack—. Bloquearlo era perder la única
+    // señal de que nos están limitando.
+    expect(puedeAvanzar("sent", "failed")).toBe(true);
+    // Pero `delivered` y `read` son prueba de que el mensaje LLEGÓ: de ahí no baja.
+    expect(puedeAvanzar("delivered", "failed")).toBe(false);
+    expect(puedeAvanzar("read", "failed")).toBe(false);
   });
 
   test("un SERVER_ACK atrasado no degrada un mensaje ya leído", () => {
@@ -496,6 +594,90 @@ describe("el estado de entrega no retrocede", () => {
     ingest.push({ kind: "msg-updates", updates: [ack(proto.WebMessageInfo.Status.DELIVERY_ACK)] });
     ingest.drainNow();
     expect(estado()).toBe("delivered");
+  });
+
+  // ── el ERROR ack: la única señal de que WhatsApp rechazó el mensaje ────────
+  //
+  // `sock.sendMessage` NO espera el ack (`relayMessage` vuelve apenas manda la
+  // stanza), así que nuestro `sent` se escribe SIEMPRE antes de que llegue el
+  // `messages.update` con `status: ERROR` —el ack con `attrs.error`: 403, 479
+  // `smax-invalid`, "user is temporarily restricted"—. Con la escalera a secas
+  // esa señal se perdía siempre y el mensaje rechazado quedaba en `✓ enviado`.
+
+  /** Un ingest de verdad sobre el mismo repo: los acks entran por donde entran en vivo. */
+  function ingestReal() {
+    const reloj = relojVirtual();
+    const store = createStore({ now: reloj.now, schedule: reloj.schedule });
+    return createIngest({
+      repo,
+      store,
+      log: LOG,
+      selfJid: () => SELF,
+      openChatJid: () => ANTO,
+      now: reloj.now,
+      schedule: reloj.schedule,
+    });
+  }
+
+  const ackDe = (status: number): WAMessageUpdate => ({
+    key: { remoteJid: ANTO, id: WA, fromMe: true },
+    update: { status },
+  });
+
+  test("el ERROR ack baja un `sent` a `failed` y lo deja al alcance de Ctrl-Y", () => {
+    const ingest = ingestReal();
+    // Así queda SIEMPRE la fila cuando el ERROR llega: el worker ya escribió `sent`.
+    repo.setMessageStatus(ANTO, WA, "sent", null);
+    expect(estado()).toBe("sent");
+
+    ingest.push({ kind: "msg-updates", updates: [ackDe(proto.WebMessageInfo.Status.ERROR)] });
+    ingest.drainNow();
+
+    expect(estado()).toBe("failed");
+    // Y aparece en `openSends`, que es de donde `Ctrl-Y` saca el último fallado
+    // del chat (`commands.retrySend`). Antes devolvía "no hay ningún envío
+    // fallado en este chat" sobre un mensaje que WhatsApp había rechazado.
+    expect(repo.openSends().map((m) => m.waId)).toEqual([WA]);
+    // ⚠️ El MOTIVO todavía llega vacío: el update trae el código en
+    // `messageStubParameters` (`[attrs.error]`) y la rama `msg-updates` de
+    // `wa/ingest.ts` no lo pasa a `setMessageStatus`. Es una línea en ingest.ts,
+    // que es de la tarea 15: queda anotado como pendiente, no se toca acá.
+    expect(repo.getMessageByWaId(ANTO, WA)?.error).toBe(null);
+  });
+
+  test("el ERROR ack NO baja un mensaje que ya llegó (delivered / read)", () => {
+    const ingest = ingestReal();
+    repo.setMessageStatus(ANTO, WA, "delivered", null);
+    ingest.push({ kind: "msg-updates", updates: [ackDe(proto.WebMessageInfo.Status.ERROR)] });
+    ingest.drainNow();
+    // El doble tilde es prueba de que el mensaje llegó: no hay `✗` que valga.
+    expect(estado()).toBe("delivered");
+
+    repo.setMessageStatus(ANTO, WA, "read", null);
+    ingest.push({ kind: "msg-updates", updates: [ackDe(proto.WebMessageInfo.Status.ERROR)] });
+    ingest.drainNow();
+    expect(estado()).toBe("read");
+    // Ninguno de los dos queda ofreciendo un reintento que duplicaría el mensaje.
+    expect(repo.openSends()).toEqual([]);
+  });
+
+  test("un envío que YA salió no se baja a `failed` aunque su promesa lance", async () => {
+    // El otro lado del escalón `sent → failed`: ahora que el repo lo permite, el
+    // que tiene que frenarse es `wa/send.ts`. `sendMessage` lanza (timeout del
+    // socket) DESPUÉS de que la stanza salió y el server la acusó: el mensaje SÍ
+    // se mandó, y ponerle `✗` sería invitar al usuario a duplicarlo con Ctrl-Y.
+    const a = armar();
+    a.falso.fallarSiempre("socket timeout");
+    const r = a.cola.enqueue(ANTO, "salió igual");
+    // El ack entra por el ingest mientras la promesa está lanzando.
+    a.repo.setMessageStatus(ANTO, r.waId as string, "sent", null);
+
+    await drenar(a);
+
+    expect(a.repo.lastMessages(ANTO)[0]?.status).toBe("sent");
+    expect(a.repo.lastMessages(ANTO)[0]?.error).toBe(null);
+    // Nada que reintentar: `Ctrl-Y` no lo encuentra.
+    expect(a.repo.openSends()).toEqual([]);
   });
 
   test("un DELIVERY_ACK que se adelanta al `sent` del propio envío gana", async () => {

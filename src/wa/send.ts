@@ -32,7 +32,7 @@ import type { Logger } from "../boot/log";
 import type { Repo } from "../db/repo";
 import type { MappedMessage } from "../db/types";
 import { SEND_MAX_ATTEMPTS, sendRetryDelayMs } from "../lib/backoff";
-import { createLimiter, type Limiter } from "../lib/ratelimit";
+import { createLimiter, MIN_GAP_MS, type Limiter } from "../lib/ratelimit";
 import type { Cancelar, Store } from "../state/store";
 import { previewFor } from "./map";
 
@@ -40,9 +40,25 @@ import { previewFor } from "./map";
 export const MAX_SENT_CACHE = 200;
 
 /**
- * A partir de esta espera del limitador el usuario merece una explicación: su
- * mensaje quedó en la fila y no se está por mandar (D8, CA-19.5). Abajo de esto
- * el `⏳` de la fila alcanza y un aviso sería ruido.
+ * A partir de esta espera estimada el usuario merece una explicación: su mensaje
+ * quedó en la fila y no se está por mandar (D8, CA-19.5). Abajo de esto el `⏳`
+ * de la fila alcanza y un aviso sería ruido.
+ *
+ * Se mide en DOS momentos, porque uno solo no alcanza:
+ *
+ *  · **Al encolar**, contra los mensajes que ya tiene adelante (uno por segundo
+ *    cada uno). Es el caso común: una ráfaga de seis mensajes.
+ *  · **Al pedir turno**, con lo que devuelve el limitador. Es el caso del tope de
+ *    20 por minuto, que no se ve en el largo de la cola.
+ *
+ * ⚠️ Medirlo SÓLO en el turno —como estaba— no avisa nunca en una ráfaga: el
+ * worker es serial y pide turno recién cuando toma el job, y para entonces el
+ * anterior ya salió, así que la espera da 1 s siempre.
+ *
+ * DESVÍO de D8: el glifo `⏳ en cola (Ns)` de la fila NO está: pide una cuenta
+ * regresiva por mensaje en la conversación (`ui/MessageRow.tsx`, tarea 13) y un
+ * re-render por segundo, que es justo lo que RNF-5 evita. Queda el toast, que es
+ * lo que explica el silencio. Anotado en `tasks.md` (tarea 14).
  */
 export const UMBRAL_AVISO_MS = 2_000;
 
@@ -164,6 +180,7 @@ export function createSendQueue(deps: SendDeps): SendQueue {
     // que devuelve es el instante en que le toca (el que duerme es el caller).
     const turno = limiter.reserve(ahora());
     const espera = turno - ahora();
+    // Acá el aviso cubre el tope de 20/minuto (el de la ráfaga sale al encolar).
     if (espera >= UMBRAL_AVISO_MS) store.toast(AVISO_EN_COLA); // D8 / CA-19.5
     if (espera > 0) await esperar(espera);
 
@@ -176,22 +193,40 @@ export function createSendQueue(deps: SendDeps): SendQueue {
       return;
     }
 
+    // ⚠️ Este `try` envuelve SÓLO la llamada a la red, y no es un detalle de
+    // estilo: `fallar` REINTENTA. Si acá adentro cayera también lo de abajo, un
+    // error de la BASE (SQLITE_BUSY, disco lleno, la base cerrada por el apagado)
+    // volvería a la red y el destinatario recibiría el mismo mensaje hasta 4
+    // veces —el peor bug posible en un cliente de mensajería—.
+    let sent: Awaited<ReturnType<typeof sock.sendMessage>>;
     try {
-      const sent = await sock.sendMessage(job.chatJid, { text: job.text }, { messageId: job.waId });
+      sent = await sock.sendMessage(job.chatJid, { text: job.text }, { messageId: job.waId });
+    } catch (e) {
+      await fallar(job, motivo(e));
+      return;
+    }
+
+    // De acá para abajo el mensaje YA SALIÓ. Nada de esto puede volver a la red:
+    // si algo lanza se loguea y se sigue, la fila se queda en `pending` (⏳) y la
+    // corrige el eco de `messages.upsert` o el ack de `messages.update`.
+    try {
       // No debería pasar (le pasamos el id nosotros), pero si WhatsApp devuelve
       // otro hay que quedarse con el suyo: es el que va a traer el eco (CA-9.2).
       const idFinal = texto(sent?.key?.id) || job.waId;
+      // El cache va PRIMERO por ser memoria: así una base que no acepta escrituras
+      // no se lleva puesto el `getMessage` de §8.6 (el retry receipt del peer
+      // llega segundos después y no espera a que la base se recupere).
+      recordar(idFinal, sent?.message, job.text);
       repo.tx(() => {
         if (idFinal !== job.waId) repo.setMessageWaId(job.chatJid, job.waId, idFinal);
         // `setMessageStatus` sólo avanza: si el `DELIVERY_ACK` llegó antes de que
         // esta promesa volviera, este `sent` no lo pisa (ver `ORDEN_ESTADO`).
         repo.setMessageStatus(job.chatJid, idFinal, "sent", null);
       });
-      recordar(idFinal, sent?.message, job.text);
       marcar(job.chatJid);
       log.info("send.ok", { chat_grupo: !!isJidGroup(job.chatJid), reintentos: job.attempt });
     } catch (e) {
-      await fallar(job, motivo(e));
+      log.error("send.post_envio", { motivo: motivo(e) });
     }
   }
 
@@ -213,6 +248,18 @@ export function createSendQueue(deps: SendDeps): SendQueue {
       log.warn("send.reintento", { intento: proximo, en_ms: delay, motivo: razon });
       await esperar(delay);
       await procesar({ ...job, attempt: proximo });
+      return;
+    }
+    // ⚠️ Antes de escribir `failed` hay que mirar la fila. El repo acepta
+    // `sent → failed` (esa es la vía del ERROR ack de WhatsApp, ver
+    // `ORDEN_ESTADO`), así que la escalera sola ya NO frena este caso: la stanza
+    // pudo haber salido y el server haberla acusado mientras nuestra promesa
+    // lanzaba —un timeout del socket, por ejemplo—. Marcar `failed` un mensaje
+    // que SÍ salió es peor que no marcar nada: le pone el `✗` y el `Ctrl-Y`
+    // adelante al usuario, que lo manda de nuevo y lo duplica.
+    const fila = repo.getMessageByWaId(job.chatJid, job.waId);
+    if (fila && fila.status !== "pending") {
+      log.warn("send.fallo_ignorado", { estado: fila.status, motivo: razon });
       return;
     }
     repo.setMessageStatus(job.chatJid, job.waId, "failed", razon);
@@ -294,6 +341,14 @@ export function createSendQueue(deps: SendDeps): SendQueue {
 
       // CA-9.1: la fila aparece al toque en `⏳ enviando`, sin esperar la red.
       marcar(jid);
+      // D8 / CA-19.5: cuánto va a esperar ESTE mensaje ≈ uno por segundo por cada
+      // uno que tiene adelante. `corriendo` ya está seteado con el job todavía en
+      // la cola (el worker arranca un microtask después), así que en una ráfaga
+      // esto cuenta uno de más y el aviso sale desde el SEGUNDO mensaje: es
+      // exactamente lo que se quiere avisar —"hay más de uno encolado, por eso el
+      // ⏳"— y no una medición fina.
+      const adelante = cola.length + (corriendo ? 1 : 0);
+      if (adelante * MIN_GAP_MS >= UMBRAL_AVISO_MS) store.toast(AVISO_EN_COLA);
       cola.push({ chatJid: jid, waId, text: cuerpo, attempt: 0 });
       bombear();
       return { ok: true, waId };
