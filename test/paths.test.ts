@@ -31,6 +31,20 @@ test("respeta XDG_DATA_HOME y XDG_STATE_HOME", () => {
   expect(p.configPath).toBe(join(data, "wacosas", "config.json"));
   expect(p.lockPath).toBe(join(data, "wacosas", "wacosas.lock"));
   expect(p.logPath).toBe(join(state, "wacosas", "wacosas.log"));
+  // Los dos directorios de la tarea de imágenes: lo que el usuario pidió ver
+  // (`media`) y las fotos de perfil de la bandeja (`avatars`), separados a
+  // propósito para poder borrar uno sin el otro.
+  expect(p.mediaDir).toBe(join(data, "wacosas", "media"));
+  expect(p.avatarsDir).toBe(join(data, "wacosas", "avatars"));
+});
+
+test("⚠️ los directorios de imágenes nacen 0700, aunque nunca se baje nada", () => {
+  const data = join(tmp, "xdg-media");
+  const p = resolvePaths(env({ XDG_DATA_HOME: data, XDG_STATE_HOME: join(tmp, "xdg-media-state") }));
+  // Se crean SIEMPRE (no a demanda) para que el permiso sea una propiedad del
+  // arranque y no dependa de que alguien haya apretado `^O` alguna vez.
+  expect(mode(p.mediaDir)).toBe("700");
+  expect(mode(p.avatarsDir)).toBe("700");
 });
 
 test("sin XDG usa ~/.local/share y ~/.local/state", () => {

@@ -10,6 +10,12 @@ servicio aparte. Corre con **Bun**.
 > —directorios `0700`, archivos `0600`, sólo tu usuario— pero **cualquiera que entre con tu usuario,
 > o que se lleve el disco, puede leer todo**. En la v1 no hay cifrado en reposo. Si eso no te sirve,
 > no lo instales en una máquina compartida.
+>
+> Desde que se pueden **ver las imágenes** (`Ctrl-O`), en esa base también va, por cada imagen
+> recibida, la **clave con la que se descifra** el archivo en el servidor de WhatsApp. O sea que quien
+> pueda leer el `.sqlite` puede además **bajarse las fotos** mientras WhatsApp las siga sirviendo. Es
+> una ampliación real de lo que ya quedaba expuesto, y está acá para que la sepas: el archivo en sí
+> **no** se guarda hasta que lo pedís.
 
 **Estado: usable.** Vincula, sincroniza el historial, lista la bandeja, abre conversaciones, envía
 texto, marca leído, busca en todo lo guardado y sale limpio. Lo que **no** hace está en
@@ -23,6 +29,9 @@ completo (requisitos, diseño y tareas) vive en `.sdd/wa-tui/`.
 - Linux con una terminal de al menos **80 × 24** (abajo de 60 × 15 te va a pedir que la agrandes).
 - *(opcional)* **`wl-clipboard`** —o `xclip` en X11— para pegar imágenes con `Ctrl-V`. Sin ninguno de
   los dos, todo lo demás anda igual y `Ctrl-V` te avisa que le falta el comando.
+- *(opcional)* **`chafa`** para **ver** las imágenes que te mandan (`Ctrl-O`) y para el color de cada
+  chat en la bandeja. Sin él, `Ctrl-O` te lo dice y te queda `o`, que abre la imagen en el visor del
+  sistema (`xdg-open`).
 
 ## Instalación
 
@@ -90,9 +99,16 @@ Se respeta XDG; si no tenés las variables seteadas, los defaults son:
 | Código del candado (hash) | `~/.local/share/wacosas/lock-code.json` |
 | QR como PNG (sólo con `--qr-png`) | `~/.local/share/wacosas/qr.png` |
 | Marca de instancia única | `~/.local/share/wacosas/wacosas.lock` |
+| Imágenes que pediste ver (`Ctrl-O`) | `~/.local/share/wacosas/media/` |
+| Fotos de perfil de la bandeja | `~/.local/share/wacosas/avatars/` |
 | Log | `~/.local/state/wacosas/wacosas.log` (+ `.log.1`) |
 
-Los directorios de datos y de estado se crean solos al arrancar, con permisos `0700`.
+Los directorios se crean solos al arrancar, con permisos `0700`, y los archivos con `0600`.
+
+**`media/` y `avatars/` son caché descartable**: borralos cuando quieras y no perdés nada —lo único
+que pasa es que la próxima vez se vuelven a bajar—. `media/` sólo tiene las imágenes que **pediste**
+ver con `Ctrl-O`; `avatars/` tiene las miniaturas de perfil de los chats que se te aparecieron en la
+bandeja, y de ahí sale el color de cada fila.
 
 Para desvincular la sesión y empezar de cero: cerrá wacosas y borrá `~/.local/share/wacosas/creds/`.
 
@@ -150,8 +166,18 @@ tipeado el `?` es un carácter más).
 | `⏎` | **enviar** |
 | `Alt-⏎` | salto de línea dentro del mensaje |
 | `Ctrl-V` | **pegar**: si hay una imagen copiada, **la manda**; si hay texto, lo escribe en el campo |
+| `Ctrl-O` | **ver las imágenes del chat** (pantalla aparte) |
 | `Esc` | volver a la bandeja **conservando el borrador** |
 | `Ctrl-Y` | reintentar el último envío que falló en ese chat |
+
+### Mirando una imagen (`Ctrl-O`)
+
+| Tecla | Qué hace |
+| --- | --- |
+| `←` `→` | la imagen anterior / la siguiente (`↑` `↓` hacen lo mismo) |
+| `Inicio` `Fin` | la más nueva / la más vieja |
+| `o` | abrirla en el **visor del sistema** (`xdg-open`) |
+| `Esc` · `Ctrl-O` | cerrar y volver a la conversación |
 
 > **`Shift-PgUp` te lo puede robar tmux** (entra en copy-mode antes que la app). Si te pasa:
 > `tmux unbind -n S-PPage` (y `S-NPage`). `Shift-↑`/`Shift-↓` no lo intercepta nadie.
@@ -215,9 +241,16 @@ Un solo proceso Bun con los dos mundos adentro y **un límite explícito** entre
   33 ms). React lo lee con `useSyncExternalStore` por *slice* y es dueño sólo de lo que no toca ni la
   red ni el disco. La UI habla con la máquina por un único módulo de comandos.
 - **`src/ui/`** — OpenTUI + React. Un solo manejador de teclado que rutea por modo.
-- **`src/boot/`** — rutas XDG, permisos, log con rotación, instancia única, cierre ordenado y la
-  lectura del portapapeles (`clipboard.ts`: spawnea `wl-paste` y compañía con timeout y tope de
-  tamaño, porque un proceso externo puede no existir, colgarse o devolver basura).
+- **`src/boot/`** — rutas XDG, permisos, log con rotación, instancia única, cierre ordenado y los dos
+  procesos externos: la lectura del portapapeles (`clipboard.ts`, `wl-paste` y compañía) y la
+  conversión de imágenes a celdas de color (`chafa.ts`). Los dos con timeout y tope de tamaño, porque
+  un proceso externo puede no existir, colgarse o devolver basura.
+
+**Las imágenes se dibujan con `chafa`, no con el protocolo gráfico de la terminal**, aunque Ghostty
+lo soporte y se vea mejor: **OpenTUI es el dueño de la pantalla** y una imagen escrita por fuera de
+su buffer la pisa el frame siguiente. `chafa` devuelve celdas de texto con color —medio bloque `▄`,
+dos píxeles por celda—, que entran en el layout como cualquier otro texto. Es el mismo camino que ya
+usaba el QR de vinculación.
 
 El diseño completo (con los gotchas ya pagados, que son varios) está en `.sdd/wa-tui/design.md`.
 
@@ -438,25 +471,55 @@ alguien que ya está sentado en tu sesión: esa persona puede volver a fijar el 
 (no se pide el anterior, justamente para que no te quedes afuera si lo olvidás) y, sobre todo, puede
 abrir la base con `sqlite3` y leer todo sin preguntarle nada a nadie.
 
-### Imágenes: se **mandan**, pero no se **descargan** (la asimetría es a propósito)
+### Imágenes: se ven con `Ctrl-O`, y **sólo las que pedís**
 
-wacosas manda imágenes con `Ctrl-V` (ver arriba), pero **no baja ni un byte de las que te llegan**:
-una imagen recibida se sigue viendo como `📷 imagen` con su epígrafe debajo, y no hay tecla que la
-abra. Lo mismo con audio, video, documentos y stickers, que **tampoco se pueden mandar**.
+Una imagen que te llega se sigue viendo `📷 imagen` en la conversación. **No se baja sola**: con el
+chat abierto, `Ctrl-O` abre una pantalla con las fotos de ese chat, dibujadas con bloques de color, y
+`←`/`→` te mueve entre ellas. La que estás mirando es la única que se baja; con `o` la abrís en el
+visor del sistema cuando la terminal no alcanza.
 
-No es un olvido, es la regla original del proyecto (**CA-7.4**) sostenida a medias a propósito:
+Lo que eso cambió respecto de la regla original (**CA-7.4**, "no descargar ni escribir archivos"), y
+lo que **no**:
 
-- **Recibir** un adjunto significa descargarlo y **escribir un archivo en disco** por cada cosa que
-  te manden. Eso es un directorio que crece solo, permisos que cuidar y contenido de terceros en tu
-  máquina sin que hayas pedido nada. Esa mitad **no se hizo y no está planeada**.
-- **Mandar** una imagen son bytes **que ya elegiste vos** y que van y vuelven **en memoria**: no
-  tocan el disco ni antes ni después. La fila que queda en la base es la misma que la de una imagen
-  recibida —el `📷 imagen` y el mime, cero binario—, así que el `.sqlite` sigue sin tener un solo
-  byte de archivo adentro.
+- **se baja sólo lo que pedís, de a una.** Nada de prefetch, nada en el sync de historial, nada al
+  arrancar. Sin apretar `Ctrl-O` no se baja ni un byte;
+- **queda en `~/.local/share/wacosas/media/`**, `0700` el directorio y `0600` cada archivo. Es caché:
+  borralo cuando quieras. Mirar dos veces la misma foto no la baja dos veces;
+- **el `.sqlite` sigue sin un solo byte de archivo adentro.** Lo que se guarda por imagen son ~90
+  bytes de texto: la **referencia** para poder volver a bajarla (⚠️ ahí adentro va la clave con la
+  que se descifra, y **la base no se cifra** — ver más abajo);
+- **audio, video, documentos y stickers no se bajan ni se pueden mandar.** Sólo imágenes;
+- **las imágenes anteriores a esta versión no se pueden ver.** No guardábamos la referencia y WhatsApp
+  no reenvía un mensaje viejo: `Ctrl-O` te las lista igual y te dice por qué esa no se puede abrir.
+  Las que lleguen de acá en adelante, sí;
+- **WhatsApp borra los archivos viejos de su servidor.** Si pasó mucho tiempo, la pantalla te lo dice
+  con todas las letras en vez de quedarse pensando.
 
-**Consecuencia práctica**: si una imagen que mandaste falla, **`Ctrl-Y` no la puede reintentar** —los
-bytes no están guardados en ningún lado—. Los reintentos automáticos (1/3/9 s) sí funcionan; para uno
-manual hay que volver a copiarla y `Ctrl-V` de nuevo. La app te lo dice cuando pasa.
+Para **dibujarlas** hace falta **`chafa`** instalado (`pacman -S chafa`, `apt install chafa`). Sin él,
+`Ctrl-O` te lo dice y te queda `o` para abrirla en el visor.
+
+**Mandar** una imagen (`Ctrl-V`) es otra cosa y sigue igual: son bytes que ya elegiste vos y que van y
+vuelven **en memoria**, sin tocar el disco. **Consecuencia práctica**: si una imagen que mandaste
+falla, **`Ctrl-Y` no la puede reintentar** —esos bytes no están guardados en ningún lado—. Los
+reintentos automáticos (1/3/9 s) sí funcionan; para uno manual hay que volver a copiarla y `Ctrl-V`
+de nuevo. La app te lo dice cuando pasa.
+
+### El color de cada chat sale de su foto de perfil
+
+El `▪`/`▣` de cada fila de la bandeja está teñido con el color más vivo de la foto de perfil de esa
+persona. Es para recorrer la lista con el ojo; **la foto no se dibuja** —en una o dos celdas una cara
+es una mancha, y probado al lado del glifo teñido se ve peor—.
+
+Lo que cuesta, porque acá hay ~890 chats y cada foto es una consulta a WhatsApp:
+
+- **sólo se piden las filas que se VEN** (a 80×24 son 18), y recién cuando aparecen;
+- **una vez por chat y para siempre**: la miniatura queda en `~/.local/share/wacosas/avatars/` y el
+  arranque siguiente no consulta nada. Lo que **no** tiene foto también se anota, y se vuelve a
+  preguntar recién a los 7 días;
+- **de a una y espaciadas** (una por segundo, el mismo ritmo que los envíos). Si scrolleás los 890
+  chats de un saque, terminar de pintarse le lleva unos 15 minutos — y está bien que así sea;
+- si el contacto no tiene foto, no te la comparte, no hay conexión o falta `chafa`, el glifo queda del
+  color de siempre y no pasa nada más.
 
 ### Un chat abre con 500 mensajes, y no hay "cargar más"
 
@@ -480,8 +543,8 @@ arriba de los resultados). Lo que **no** encuentra:
 
 - **nombres de archivo de adjuntos** — buscar `presupuesto.pdf` no trae el documento: el nombre vive
   en otra columna que no está indexada;
-- **el contenido de un adjunto** — no se descargan. (El **epígrafe** sí se encuentra: se guarda como
-  cuerpo del mensaje.);
+- **el contenido de un adjunto** — lo que hay indexado es texto, no imágenes. (El **epígrafe** sí se
+  encuentra: se guarda como cuerpo del mensaje.);
 - **mensajes eliminados** — un borrado sale del índice, que es lo correcto.
 
 Acentos y mayúsculas dan igual (`manana` encuentra `Mañana`) y lo que escribas se sanitiza, así que
@@ -527,9 +590,8 @@ terminal, **no** contra alguien sentado en tu sesión.
 
 ### Lo que directamente no está en v1
 
-Descargar multimedia y enviar cualquier cosa que no sea una imagen o texto (los adjuntos que llegan
-se ven como `📷 imagen`, `🎤 audio 0:12`, `📎 informe.pdf` y nada más; **mandar** una imagen sí se
-puede, con `Ctrl-V` — ver la asimetría más arriba), reacciones, responder citando, editar, borrar
-para todos, reenviar, fijar, archivar,
-silenciar, bloquear, llamadas, estados, administrar grupos (leer y escribir texto en grupos **sí**),
-multi-cuenta, notificaciones del sistema, y **cifrado de la base**.
+Bajar audio, video, documentos y stickers (se ven como `🎤 audio 0:12`, `🎬 video 1:07`,
+`📎 informe.pdf` y nada más — las **imágenes** sí se ven, con `Ctrl-O`), enviar cualquier cosa que no
+sea texto o una imagen (`Ctrl-V`), reacciones, responder citando, editar, borrar para todos,
+reenviar, fijar, archivar, silenciar, bloquear, llamadas, estados, administrar grupos (leer y
+escribir texto en grupos **sí**), multi-cuenta, notificaciones del sistema, y **cifrado de la base**.

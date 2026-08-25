@@ -18,6 +18,27 @@ export type Paths = {
   configPath: string;
   /** Hash del código que revela los chats con candado (`boot/lockcode.ts`). */
   lockCodePath: string;
+  /**
+   * Las imágenes que el usuario pidió ver con `^O` (`wa/media.ts`).
+   *
+   * ⚠️ Es el ÚNICO lugar donde wacosas escribe contenido que le mandaron —lo que
+   * CA-7.4 prohibía—, y por eso vive acá, adentro del `dataDir` que ya nace
+   * `0700`, y no en `/tmp`: los archivos quedan `0600` y nadie más los ve.
+   *
+   * Se puede **borrar entero cuando se quiera**: es un caché, y lo que se borre
+   * se vuelve a bajar la próxima vez que se apriete `^O`.
+   */
+  mediaDir: string;
+  /**
+   * Las fotos de perfil (miniaturas) de los chats de la bandeja
+   * (`wa/avatars.ts`), de donde sale el color de cada glifo.
+   *
+   * Aparte de `mediaDir` porque son otra cosa: éstas se piden **solas** (para las
+   * filas que se ven) y son de terceros que no te mandaron nada, así que tienen
+   * que poder borrarse sin llevarse las imágenes que sí pediste. Mismos permisos:
+   * el directorio `0700`, los archivos `0600`.
+   */
+  avatarsDir: string;
 };
 
 /** La spec XDG manda ignorar los valores relativos y usar el default. */
@@ -45,13 +66,22 @@ export function resolvePaths(env: Record<string, string | undefined> = process.e
   const home = env.HOME || homedir();
   const dataDir = join(xdgBase(env.XDG_DATA_HOME, join(home, ".local", "share")), "wacosas");
   const stateDir = join(xdgBase(env.XDG_STATE_HOME, join(home, ".local", "state")), "wacosas");
+  const mediaDir = join(dataDir, "media");
+  const avatarsDir = join(dataDir, "avatars");
 
   ensurePrivateDir(dataDir);
   ensurePrivateDir(stateDir);
+  // Se crean SIEMPRE, aunque nunca se baje una imagen: así el permiso `0700` es
+  // una propiedad del arranque —verificable con un `stat`— y no algo que dependa
+  // de que alguien haya apretado `^O` alguna vez.
+  ensurePrivateDir(mediaDir);
+  ensurePrivateDir(avatarsDir);
 
   return {
     dataDir,
     stateDir,
+    mediaDir,
+    avatarsDir,
     dbPath: join(dataDir, "wacosas.sqlite"),
     credsDir: join(dataDir, "creds"),
     logPath: join(stateDir, "wacosas.log"),

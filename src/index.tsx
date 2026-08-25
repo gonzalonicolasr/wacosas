@@ -304,7 +304,9 @@ if (qrPngPath) {
 // ── máquina (después del render: baileys tarda en cargar) ────────────────────
 const { createAppStateSync, META_SYNC_REPARADO } = await import("./wa/appstate");
 const { createIdentityResolver } = await import("./wa/identity");
+const { createAvatars } = await import("./wa/avatars");
 const { createIngest } = await import("./wa/ingest");
+const { createMediaStore } = await import("./wa/media");
 const { createReadReceipts } = await import("./wa/read");
 const { createSendQueue } = await import("./wa/send");
 const { createWaController } = await import("./wa/socket");
@@ -445,12 +447,37 @@ store.subscribe("conn", () => {
   }
 });
 
+// Las imágenes recibidas (`^O`). NO cuelga del socket: bajar del CDN de WhatsApp
+// es un `fetch` con la clave del mensaje, sin sesión, así que una foto se puede
+// mirar aunque la conexión esté caída (ver `wa/media.ts`).
+const media = createMediaStore({ dir: paths.mediaDir, log });
+
+// El color de cada chat en la bandeja (el promedio de su foto de perfil). ⚠️ Es
+// lo ÚNICO de la aplicación que consulta a WhatsApp sin que el usuario apriete
+// nada, así que el cuidado está adentro: sólo las filas que se ven, una consulta
+// por chat en toda la vida (queda en `avatars/`) y espaciadas de a una por
+// segundo. Ver el encabezado de `wa/avatars.ts`.
+const avatars = createAvatars({
+  dir: paths.avatarsDir,
+  log,
+  urlDe: async (jid) => {
+    try {
+      // `preview` es la miniatura: unos KB, no la foto entera.
+      return (await wa?.socket()?.profilePictureUrl(jid, "preview", 10_000)) ?? null;
+    } catch {
+      // Sin foto, sin permiso para verla o sin conexión: no hay nada que avisar.
+      return null;
+    }
+  },
+  publicar: (jid, color) => store.setAvatar(jid, color),
+});
+
 // Recién ahora el cierre ordenado tiene a quién pararle la mano (§6.6, paso 2).
 // Hasta esta línea `Ctrl-C` cerraba igual, pero sin drenar ni parar nada: no
 // había nada corriendo.
-Object.assign(maquina, { ingest, send, wa, appstate, identity });
+Object.assign(maquina, { ingest, send, wa, appstate, identity, avatars });
 
-configureCommands({ repo, wa, store, log, send, read, appstate, lockCode, shutdown });
+configureCommands({ repo, wa, store, log, send, read, appstate, lockCode, media, avatars, shutdown });
 
 log.info("boot.listo", {
   version,

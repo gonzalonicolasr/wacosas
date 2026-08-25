@@ -9,7 +9,7 @@
 //     comparan contra `fold()` o contra pedazos del mismo texto de entrada.
 import { expect, test } from "bun:test";
 
-import { clip, fmtRelDate, fmtTime, fold, highlightParts, oneLine } from "../src/lib/fmt";
+import { anchoTexto, clip, fmtRelDate, fmtTime, fold, grafemas, highlightParts, oneLine } from "../src/lib/fmt";
 
 /** Epoch en SEGUNDOS (la unidad de `messages.ts`, design §4.1) en hora local. */
 const seg = (y: number, mes: number, d: number, h = 0, min = 0) =>
@@ -54,9 +54,72 @@ test("clip recorta con … y respeta el ancho exacto (CA-4.6)", () => {
 
 test("clip no parte un emoji al medio", () => {
   // Cortando por unidades UTF-16 saldría media pareja suplente en la bandeja.
-  expect(clip("😀😀😀", 2)).toBe("😀…");
-  expect(clip("📷 imagen", 4)).toBe("📷 i…");
   expect(clip("😀😀😀", 2)).not.toContain("�");
+  // ⚠️ Este caso cambió con el arreglo de anchos: `😀` mide DOS columnas y el `…`
+  // una, así que en un presupuesto de 2 no entran los dos. Antes devolvía
+  // `"😀…"` —tres columnas para una caja de dos—, que es justo lo que hacía que
+  // OpenTUI se comiera el final de la fila.
+  expect(clip("😀😀😀", 2)).toBe("…");
+  expect(clip("😀😀😀", 3)).toBe("😀…");
+  expect(clip("📷 imagen", 4)).toBe("📷 …");
+});
+
+// ── ancho en columnas (el bug de emojis) ─────────────────────────────────────
+
+test("anchoTexto cuenta COLUMNAS, no caracteres", () => {
+  expect(anchoTexto("hola")).toBe(4);
+  expect(anchoTexto("")).toBe(0);
+  // Un emoji ocupa dos columnas aunque sea un solo punto de código.
+  expect(anchoTexto("📷")).toBe(2);
+  expect(anchoTexto("📷 imagen")).toBe(9);
+  // Y un cluster entero sigue midiendo dos, tenga los puntos de código que tenga.
+  expect(anchoTexto("👨‍👩‍👧")).toBe(2); // ZWJ
+  expect(anchoTexto("🇦🇷")).toBe(2); // bandera
+  expect(anchoTexto("1️⃣")).toBe(2); // keycap
+  expect(anchoTexto("👍🏽")).toBe(2); // tono de piel
+  expect(anchoTexto("日本語")).toBe(6); // CJK
+  // Las marcas combinantes no ocupan columna (acá `Bun.stringWidth` sí miente).
+  expect(anchoTexto("mañana")).toBe(6);
+  expect(anchoTexto("a֑b")).toBe(2); // hebreo
+  expect(anchoTexto("aًb")).toBe(2); // árabe
+});
+
+test("clip nunca se pasa del ancho pedido, con emoji o sin él", () => {
+  const casos: Array<[string, number]> = [
+    ["anto 🌻 la de la feria", 10],
+    ["🎉🎉🎉🎉🎉 fiesta", 6],
+    ["📷 imagen · mirá lo que encontré", 12],
+    ["日本語のメッセージです", 7],
+    ["👨‍👩‍👧 la familia", 5],
+    ["🇦🇷 argentina", 2],
+    ["sin nada raro acá", 9],
+  ];
+  for (const [s, w] of casos) {
+    expect({ s, w, ancho: anchoTexto(clip(s, w)) }).toEqual({ s, w, ancho: expect.any(Number) });
+    expect(anchoTexto(clip(s, w))).toBeLessThanOrEqual(w);
+  }
+});
+
+test("clip no parte un grafema en dos (banderas, ZWJ, keycaps)", () => {
+  // Antes cortaba por PUNTO DE CÓDIGO: `clip("🇦🇷 argentina", 2)` devolvía
+  // `"🇦…"`, o sea la bandera partida en un indicador regional suelto (que se
+  // dibuja como una "A" adentro de un cuadrito). Ahora la bandera entra entera o
+  // no entra: en los dos casos, lo que sale son grafemas COMPLETOS.
+  const entero = (s: string, w: number) => grafemas(clip(s, w)).every((g) => g === "…" || s.includes(g));
+  for (const [s, w] of [
+    ["🇦🇷 argentina", 2],
+    ["🇦🇷 argentina", 3],
+    ["👨‍👩‍👧 familia", 3],
+    ["👨‍👩‍👧 familia", 5],
+    ["1️⃣2️⃣3️⃣ numeritos", 4],
+    ["👍🏽 buenísimo", 3],
+  ] as Array<[string, number]>) {
+    expect({ s, w, entero: entero(s, w) }).toEqual({ s, w, entero: true });
+    // Ningún `…` con un ZWJ colgado adelante: eso sería un cluster partido.
+    expect(clip(s, w)).not.toContain("‍…");
+  }
+  // Y el keycap, que son tres puntos de código y un solo grafema, entra entero.
+  expect(grafemas(clip("1️⃣2️⃣3️⃣ numeritos", 4))).toEqual(["1️⃣", "…"]);
 });
 
 // ── fmtTime / fmtRelDate (CA-6.2, CA-4.1) ────────────────────────────────────

@@ -36,7 +36,7 @@ import { commands, etiquetaChat, filtrarChats, seleccionVigente } from "../state
 import { useSlice } from "../state/hooks";
 import type { ChatRow } from "../db/types";
 import { clip, fmtRelDate } from "../lib/fmt";
-import { ACCENT, ACCENT2, ELEVATED, FAINT, GOLD, INPUT_FG, MUT, SELBG, TEXT, TEXT_DIM } from "./theme";
+import { ACCENT, ACCENT2, ELEVATED, FAINT, GOLD, INPUT_FG, legibleSobrePanel, MUT, SELBG, TEXT, TEXT_DIM } from "./theme";
 
 /** El buscador se lleva una fila del panel; el resto es lista. */
 export const ALTO_BUSCADOR = 1;
@@ -88,6 +88,19 @@ export function ventana(total: number, sel: number, filas: number, previo: numbe
   return Math.max(0, Math.min(desde, tope));
 }
 
+/**
+ * El color con el que se pinta el glifo de un chat, a partir del promedio de su
+ * foto de perfil: aclarado hasta que se despegue del fondo del panel, o
+ * `undefined` cuando no hay foto (y entonces vale el color de siempre).
+ *
+ * El aclarado no es opcional: el color viene de una foto que no elegimos
+ * nosotros, y el promedio de una foto nocturna es un negro que sobre el panel
+ * `#111f1a` sería un chat invisible.
+ */
+function colorDe(color: string | null | undefined): string | undefined {
+  return color ? legibleSobrePanel(color) : undefined;
+}
+
 /** El contador de la fila (CA-10.2). Vacío cuando está todo leído. */
 function badgeDe(n: number): string {
   if (!Number.isFinite(n) || n <= 0) return "";
@@ -111,13 +124,24 @@ type PropsFila = {
   ahoraSeg: number;
   /** Anchos ya repartidos: son iguales para todas las filas de la lista. */
   cols: { nombre: number; preview: number; fecha: number; badge: number };
+  /**
+   * Color de la foto de perfil de este chat (`wa/avatars.ts`), o `undefined` si
+   * no tiene / todavía no llegó. Ver `GLIFO` más abajo.
+   */
+  color?: string;
   onClick: (jid: string) => void;
 };
 
-function Fila({ chat, seleccionada, ahoraSeg, cols, onClick }: PropsFila) {
+function Fila({ chat, seleccionada, ahoraSeg, cols, color, onClick }: PropsFila) {
   const sinLeer = chat.unreadCount > 0;
   const badge = badgeDe(chat.unreadCount);
   const fecha = fmtRelDate(chat.lastMessageAt, ahoraSeg);
+  // ⚠️ El color de la foto tiñe el glifo que YA estaba, no agrega columnas: a una
+  // o dos celdas una miniatura es una mancha, y el ancho de la bandeja es lo más
+  // escaso que hay (34 columnas fijas en `compact`). Lo que distingue grupo de
+  // 1:1 sigue siendo la FORMA (`▣` vs `▪`), así que CA-4.8 se cumple igual aunque
+  // el color pase a ser el de la persona.
+  const colorGlifo = color ?? (chat.isGroup ? ACCENT2 : FAINT);
 
   return (
     <box
@@ -132,7 +156,7 @@ function Fila({ chat, seleccionada, ahoraSeg, cols, onClick }: PropsFila) {
       <box width={ANCHO_GLIFO + cols.nombre} flexShrink={0}>
         <text wrapMode="none">
           {/* CA-4.8: el grupo se distingue por glifo Y por color. */}
-          <span fg={chat.isGroup ? ACCENT2 : FAINT}>{chat.isGroup ? "▣ " : "▪ "}</span>
+          <span fg={colorGlifo}>{chat.isGroup ? "▣ " : "▪ "}</span>
           <span fg={sinLeer ? TEXT : TEXT_DIM}>{clip(etiquetaChat(chat), cols.nombre)}</span>
         </text>
       </box>
@@ -234,6 +258,16 @@ export function Inbox({
     badge: anchoBadge > 0 ? anchoBadge + 1 : 0,
   };
 
+  // ⚠️ El color de la foto se pide SÓLO para las filas que están EN PANTALLA, y
+  // recién cuando aparecen: con ~890 chats, pedir la lista entera sería una
+  // ráfaga de 890 consultas a WhatsApp (ver el encabezado de `wa/avatars.ts`).
+  // El comando es idempotente y no vuelve a preguntar lo que ya sabe, así que
+  // llamarlo en cada cambio de la ventana visible no cuesta nada.
+  const jidsVisibles = enPantalla.map((c) => c.jid).join("|");
+  useEffect(() => {
+    commands.requestAvatars(jidsVisibles === "" ? [] : jidsVisibles.split("|"));
+  }, [jidsVisibles]);
+
   const clickEnFila = (jid: string): void => {
     const at = Date.now();
     const previo = ultimoClick.current;
@@ -309,6 +343,7 @@ export function Inbox({
               seleccionada={c.jid === jidSel}
               ahoraSeg={ahoraSeg}
               cols={cols}
+              color={colorDe(ui.avatars[c.jid])}
               onClick={clickEnFila}
             />
           ))

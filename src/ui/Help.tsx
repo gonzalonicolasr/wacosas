@@ -87,6 +87,11 @@ const ATAJOS_CONVO: Array<[string, string]> = [
   // Va TERCERO en la línea, no último: a 72 columnas la descripción se recorta a
   // 52 y ahí `^V pegar imagen` sigue entrando entero.
   ["^E ⏎ Alt-⏎ ^Y", "escribir · enviar · salto · ^V pegar imagen · reintentar"],
+  // `^O` sí se ganó una fila propia: es una PANTALLA, no una acción sobre el
+  // campo, y con ella vienen tres teclas más que no se adivinan (`← →` para
+  // moverse entre las fotos y `o` para abrirla en el visor del sistema). Cabe
+  // porque el encabezado pasó de tres filas a una y el cuerpo ganó dos.
+  ["^O", "ver las imágenes del chat (← → cambiar · o abre el visor)"],
 ];
 
 const ATAJOS_MINI: Array<[string, string]> = [

@@ -105,6 +105,39 @@ if (process.env.WACOSAS_DEMO_SEED !== "0") {
       ANTO,
     ]);
 
+    // ── imágenes con referencia (`^O`) ──────────────────────────────────────
+    // Tres fotos: dos con `attachment.media` —o sea bajables, como las que
+    // llegan de WhatsApp desde esta versión— y la de arriba (`X0`) SIN
+    // referencia, que es como quedó todo el historial anterior. Así la pantalla
+    // de imágenes muestra los dos casos, el que anda y el que explica por qué no.
+    const fotos: Array<[string, string, string]> = [
+      ["IMG1", "mirá el atardecer de ayer", "foto1"],
+      ["IMG2", "", "foto2"],
+    ];
+    fotos.forEach(([waId, caption, archivo], n) => {
+      ins.run(
+        ANTO,
+        waId,
+        0,
+        ANTO,
+        "anto 🌻",
+        // Las más NUEVAS del chat: así `^O` abre directo en una que se puede
+        // ver, y la que quedó sin referencia (`X0`) está una a la derecha.
+        ahora - 20 * (2 - n),
+        "image",
+        caption,
+        JSON.stringify({
+          label: "📷 imagen",
+          mimetype: "image/png",
+          // La referencia REAL tiene la clave en base64; acá el `directPath` es
+          // el nombre del archivo de juguete que va a leer el `descargar`
+          // inyectado más abajo (nunca sale a internet).
+          media: { key: "ZGVtbw==", directPath: `/${archivo}`, bytes: 1024 },
+        }),
+        "received",
+      );
+    });
+
     // Un grupo con tres voces distintas (CA-6.3).
     const voces = ["Meli", "Jorge", "Sofi"];
     for (let i = 0; i < 12; i++) {
@@ -193,6 +226,60 @@ const read = createReadReceipts({
   enabled: process.env.WACOSAS_DEMO_RECIBOS !== "0",
 });
 
+// ── imágenes recibidas (`^O`) ───────────────────────────────────────────────
+// El `MediaStore` REAL —con su caché en disco, sus permisos 0600, su tope de
+// tamaño y su timeout— contra un "CDN" falso: ⚠️ acá no puede haber una descarga
+// de verdad, porque las claves de la base de juguete no son de nadie. `descargar`
+// devuelve el stream de un PNG local, así que el camino completo (bajar →
+// guardar → chafa → pintar) se ve en pantalla sin tocar la red.
+const { createMediaStore } = await import(`${RAIZ}/src/wa/media.ts`);
+const { createReadStream } = await import("node:fs");
+const DIR_MEDIA = process.env.WACOSAS_DEMO_MEDIA ?? "/tmp/wacosas-demo-media";
+const FOTOS = process.env.WACOSAS_DEMO_FOTOS ?? "/tmp/wacosas-demo-fotos";
+
+const media = createMediaStore({
+  dir: DIR_MEDIA,
+  log: log as never,
+  descargar: async (ref: { directPath?: string; url?: string }) => {
+    const nombre = (ref.directPath ?? ref.url ?? "").replace(/^\//, "");
+    return createReadStream(`${FOTOS}/${nombre}.png`) as never;
+  },
+});
+
+// ── fotos de perfil de la bandeja ───────────────────────────────────────────
+// La cola REAL —con su caché en disco, su espaciado y su tope— contra un
+// WhatsApp falso: ⚠️ acá no se le puede preguntar nada a WhatsApp, así que
+// `urlDe` devuelve un `file://` de una foto de juguete (una por chat, rotando).
+// Con `WACOSAS_DEMO_AVATARES=0` no hay fotos y la bandeja se ve como antes.
+const { createAvatars } = await import(`${RAIZ}/src/wa/avatars.ts`);
+const DIR_AVATARES = process.env.WACOSAS_DEMO_AVATARES_CACHE ?? "/tmp/wacosas-demo-avatares-cache";
+const FOTOS_PERFIL = process.env.WACOSAS_DEMO_AVATARES_SRC ?? "/tmp/wacosas-demo-avatares";
+const conAvatares = process.env.WACOSAS_DEMO_AVATARES !== "0";
+
+const avatares = createAvatars({
+  dir: DIR_AVATARES,
+  log: log as never,
+  // Sin espera entre pedidos: acá no hay a quién cuidarle el ritmo y una demo
+  // que tarda 19 segundos en pintarse no se puede capturar.
+  schedule: (fn: () => void) => {
+    const t = setTimeout(fn, 0);
+    return () => clearTimeout(t);
+  },
+  urlDe: async (jid: string) => {
+    if (!conAvatares) return null;
+    // Un jid de cada seis se queda SIN foto, para ver los dos casos en la misma
+    // captura (el glifo teñido y el de siempre).
+    const n = [...jid].reduce((a, c) => a + c.charCodeAt(0), 0);
+    if (n % 6 === 0) return null;
+    return `${FOTOS_PERFIL}/av${(n % 12) + 1}.jpg`;
+  },
+  bajar: async (ruta: string) => {
+    const { readFileSync, existsSync } = await import("node:fs");
+    return existsSync(ruta) ? new Uint8Array(readFileSync(ruta)) : null;
+  },
+  publicar: (jid: string, color: string | null) => store.setAvatar(jid, color),
+});
+
 configureCommands({
   repo,
   wa: { reconnectNow() {}, async requestPairingCode() {} } as never,
@@ -200,6 +287,8 @@ configureCommands({
   log: log as never,
   send,
   read,
+  media,
+  avatars: avatares,
   shutdown(code = 0) {
     try {
       renderer.destroy();

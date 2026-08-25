@@ -21,9 +21,25 @@ import { commands, FILTROS } from "../state/commands";
 import { useSlice } from "../state/hooks";
 import type { ConnSnapshot, InboxFilter } from "../state/store";
 import { Brand } from "./Brand";
-import { ACCENT, BORDER_ACCENT, DANGER, MUT, SEL_FG, SURFACE, TEXT_DIM, WARN } from "./theme";
+import { ACCENT, DANGER, ELEVATED, MUT, SEL_FG, TEXT_DIM, WARN } from "./theme";
 
-export const ALTO_HEADER = 3;
+/**
+ * El encabezado es UNA fila.
+ *
+ * ⚠️ Antes eran **tres**: una de contenido y dos de marco. En una terminal de 24
+ * filas eso son dos rayas horizontales quedándose con el 8 % de la pantalla, y a
+ * 60×15 (el mínimo de RNF-2) con el **13 %** — justo donde cada fila es una
+ * conversación que se ve o no se ve. El marco tampoco separaba nada: los paneles
+ * de abajo ya empiezan con su propio borde, así que la raya de abajo del
+ * encabezado estaba pegada a la de arriba de la bandeja.
+ *
+ * Lo que reemplaza al marco es el FONDO: una barra `ELEVATED` de una fila se lee
+ * como encabezado sin gastar ni una línea. Las dos filas que se liberan van a la
+ * bandeja y a la conversación (a 80×24, el cuerpo pasa de 20 a 22 filas; a 60×15,
+ * de 11 a 13) y también a la ayuda, que a 60×15 tenía que tirar los títulos de
+ * sección para entrar (`lineasQueEntran`).
+ */
+export const ALTO_HEADER = 1;
 
 /** `"✦ wacosas"` + los dos espacios que deja `Brand`. */
 const ANCHO_MARCA = 11;
@@ -157,17 +173,16 @@ function Tabs({ disponible }: { disponible: number }) {
 export function Header({ conTabs = false }: { conTabs?: boolean } = {}) {
   const conn = useSlice("conn");
   const { width } = useTerminalDimensions();
-  // −2 del borde, −2 del padding del propio encabezado.
+  // −2 del padding del propio encabezado (ya no hay borde que descontar).
   const disponible =
-    width - 4 - ANCHO_MARCA - pintar(conn, Date.now()).texto.length - SLACK_BADGE;
+    width - 2 - ANCHO_MARCA - pintar(conn, Date.now()).texto.length - SLACK_BADGE;
 
   return (
     <box
       flexDirection="row"
       height={ALTO_HEADER}
-      border
-      borderColor={BORDER_ACCENT}
-      backgroundColor={SURFACE}
+      flexShrink={0}
+      backgroundColor={ELEVATED}
       paddingLeft={1}
       paddingRight={1}
     >

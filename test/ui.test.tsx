@@ -52,6 +52,7 @@ const ATAJOS_CONVO = [
   // `^V` (pegar del portapapeles) vive en la columna de TEXTO y no en la de
   // teclas: `^E ⏎ Alt-⏎ ^V ^Y` mide justo `COL` y `padEnd` no dejaría espacio.
   "^E ⏎ Alt-⏎ ^Y   escribir · enviar · salto · ^V pegar imagen · reintentar",
+  "^O              ver las imágenes del chat (← → cambiar · o abre el visor)",
 ];
 const ATAJOS_MINI = [
   "⏎               entrar a la conversación",
@@ -168,12 +169,14 @@ function cablearComandos() {
 // bandeja (tarea 12): a 60×15, el mínimo de RNF-2, el cuerpo son 9 filas y los
 // atajos vigentes ya son 15. Lo que NO puede pasar nunca es que se encimen.
 //
-// 80×19 se sumó a los que scrollean con el atajo de redacción de la tarea 14: a
-// esa altura el cuerpo son 13 filas y lo esencial son 14. El renglón que queda
-// abajo del corte se alcanza con `↑↓`, y el pie lo anuncia (punto 4).
+// ⚠️ 80×19 volvió a entrar ENTERA cuando el encabezado pasó de tres filas a una
+// (`ui/Header.tsx`): el cuerpo pasó de 13 a 15 filas y lo esencial —15 renglones,
+// ya con el `^O` de las imágenes— entra justo. El que sigue scrolleando es 60×15,
+// el mínimo de RNF-2, y ahí el renglón que queda abajo del corte se alcanza con
+// `↑↓`, que el pie anuncia (punto 4).
 for (const [width, height, mini, entera] of [
   [60, 15, true, false],
-  [80, 19, false, false],
+  [80, 19, false, true],
   [80, 20, false, true],
   [80, 24, false, true],
 ] as Array<[number, number, boolean, boolean]>) {
@@ -230,29 +233,29 @@ for (const [width, height, mini, entera] of [
 
 test("cuando el alto no alcanza se cae el adorno antes que un atajo", () => {
   const todas = lineasAyuda({ logPath: LOG, mini: true });
-  // 4 títulos + 4 huecos + 15 atajos (4 globales, 6 de bandeja, 2 de conversación,
+  // 4 títulos + 4 huecos + 16 atajos (4 globales, 6 de bandeja, 3 de conversación,
   // 3 de mini) + 2 notas.
-  expect(todas.length).toBe(25);
+  expect(todas.length).toBe(26);
   // Entra todo: se pinta todo, adorno incluido.
-  expect(lineasQueEntran(todas, 25)).toEqual(todas);
+  expect(lineasQueEntran(todas, 26)).toEqual(todas);
   // No entra: primero se van SÓLO los renglones en blanco. Los títulos son lo
   // que hace encontrar el atajo de un vistazo y aguantan un escalón más (a 80×24
   // la ayuda son 19 líneas contra 18 de alto: gastar seis renglones de adorno
   // para ahorrar uno la dejaba sin un solo título y con cinco filas en blanco).
-  const sinHuecos = lineasQueEntran(todas, 21);
-  expect(sinHuecos.length).toBe(21);
+  const sinHuecos = lineasQueEntran(todas, 22);
+  expect(sinHuecos.length).toBe(22);
   expect(sinHuecos.some((l) => l.tipo === "titulo")).toBe(true);
   expect(sinHuecos.every((l) => l.tipo !== "hueco")).toBe(true);
-  // Recién si tampoco así entra se van los títulos: quedan los 15 atajos + 2 notas.
-  const apretadas = lineasQueEntran(todas, 17);
-  expect(apretadas.length).toBe(17);
+  // Recién si tampoco así entra se van los títulos: quedan los 16 atajos + 2 notas.
+  const apretadas = lineasQueEntran(todas, 18);
+  expect(apretadas.length).toBe(18);
   expect(apretadas.every((l) => l.tipo === "atajo" || l.tipo === "nota")).toBe(true);
   // Nunca se recorta a mano por debajo de lo esencial: eso lo cubre el scroll.
   expect(lineasQueEntran(todas, 3)).toEqual(apretadas);
 
   // Con lo esencial entrando justo NO hay nada que scrollear; con menos, sí — y
   // ése es el caso de 60×15 (el mínimo de RNF-2), donde el cuerpo son 9 filas.
-  expect(ayudaScrollea({ logPath: LOG, mini: true, filas: 17 })).toBe(false);
+  expect(ayudaScrollea({ logPath: LOG, mini: true, filas: 18 })).toBe(false);
   expect(ayudaScrollea({ logPath: LOG, mini: true, filas: 9 })).toBe(true);
 });
 
@@ -1044,8 +1047,10 @@ describe("esconder un chat con ^X", () => {
     expect(frame).not.toContain("▪ Ana");
     expect(frame).toContain("«Ana» oculto");
     expect(frame).toContain("▪ Beto");
-    // El contador del panel también lo descuenta (es la misma consulta).
-    expect(frame).toContain("chats 1");
+    // Y el contador del ENCABEZADO lo descuenta: pasa de `Todos 2` a `Todos 1`.
+    // (El título del panel ya no repite ese número — estaba dos veces en la
+    // misma pantalla, ver `App.tsx`.)
+    expect(frame).toContain("Todos 1");
     expect(repo.isManuallyHidden("5491150000001@s.whatsapp.net")).toBe(true);
     // Y la tecla NO se le fue al buscador, que está enfocado y recibe todo:
     // `^X` no está entre los bindings del `<input>` de OpenTUI.

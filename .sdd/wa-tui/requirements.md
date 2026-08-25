@@ -223,6 +223,29 @@ que llegó algo sin que la TUI intente descargarlo.
   SISTEMA DEBERÁ mostrar el placeholder sin ese dato, y NUNCA `undefined`, `null` ni `NaN`.
 - **CA-7.4** — MIENTRAS wacosas esté corriendo, EL SISTEMA NO DEBERÁ descargar el contenido binario de
   ningún adjunto, ni escribir archivos multimedia en disco.
+
+  > ⚠️ **ENMENDADO DOS VECES.** El criterio nació de tres preocupaciones concretas —un directorio que
+  > crece solo, permisos que cuidar y contenido de terceros en la máquina sin haberlo pedido—, y las
+  > tres siguen valiendo. Lo que cambió es a qué se aplica:
+  >
+  > 1. **(tarea 19, `^V`)** dejó de aplicar al camino de **ENVÍO**: se puede mandar una imagen del
+  >    portapapeles. Son bytes que el usuario ya eligió, van y vuelven **en memoria** y no tocan el
+  >    disco ni antes ni después.
+  > 2. **(tarea de imágenes, `^O`)** el camino de **RECEPCIÓN** pasa a admitir la descarga de **una
+  >    imagen por vez, a pedido explícito del usuario**. El criterio queda reescrito así:
+  >
+  >    > EL SISTEMA NO DEBERÁ descargar ningún adjunto por su cuenta. SÓLO CUANDO el usuario lo pida
+  >    > sobre una imagen concreta (`Ctrl-O`), DEBERÁ bajar ESA imagen y guardarla en
+  >    > `<dataDir>/media/` (directorio `0700`, archivo `0600`), con tope de tamaño y de tiempo, y
+  >    > SIN volver a bajarla si ya está. Audio, video, documentos y stickers **siguen sin bajarse**.
+  >
+  >    Lo que se agrega a la base por cada imagen recibida son ~90 bytes de texto (la referencia para
+  >    poder bajarla, clave de descifrado incluida) y **ningún byte del archivo**. ⚠️ Que esa clave
+  >    quede en una base **sin cifrar** es una ampliación real de lo ya expuesto, y está dicha en el
+  >    aviso del README y en `db/types.ts`.
+  >
+  > Lo que **no** se enmendó y sigue prohibido: bajar algo sin que el usuario lo pida (nada de
+  > prefetch, nada en el sync de historial, nada al arrancar).
 - **CA-7.5** — SI llega un tipo de mensaje que el sistema no sabe representar, ENTONCES EL SISTEMA
   DEBERÁ mostrarlo como `❔ mensaje no soportado` y persistirlo igual como parte del historial del
   chat.

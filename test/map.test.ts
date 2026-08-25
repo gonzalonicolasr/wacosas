@@ -92,7 +92,19 @@ test("imagen con caption: placeholder + caption en el body (CA-7.1, CA-7.2)", ()
   const fila = mapear(imagenConCaption);
   expect(fila.kind).toBe("image");
   expect(fila.body).toBe("el asado de ayer");
-  expect(fila.attachment).toEqual({ label: "📷 imagen", mimetype: "image/jpeg" });
+  // ⚠️ Además del placeholder, una IMAGEN guarda la referencia para poder bajarla
+  // después (`^O`): clave, ruta del CDN y tamaño. No hay un solo byte del
+  // archivo — lo que se guarda son ~90 bytes de texto en la celda `attachment`.
+  expect(fila.attachment).toEqual({
+    label: "📷 imagen",
+    mimetype: "image/jpeg",
+    media: {
+      key: Buffer.from(imagenConCaption.message.imageMessage.mediaKey).toString("base64"),
+      directPath: "/v/t62.7118-24/12345_678_910_n.enc",
+      url: "https://mmg.whatsapp.net/d/f/AbCdEf.enc",
+      bytes: 184320,
+    },
+  });
   // El caption va DEBAJO del placeholder en la conversación (CA-7.2); en la
   // fila de la bandeja entran los dos en una línea (CA-4.5).
   expect(previewFor(fila)).toBe("📷 imagen · el asado de ayer");

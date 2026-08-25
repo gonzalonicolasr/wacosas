@@ -7,7 +7,10 @@
 //   · los timestamps entran en EPOCH SEGUNDOS —la unidad de `messages.ts` y de
 //     `chats.last_message_at` (design §4.1)—, nunca en milisegundos;
 //   · el "ahora" se inyecta siempre, así los tests no dependen del reloj;
-//   · nada de I/O, nada de estado, cero deps (D12).
+//   · nada de I/O, nada de estado, cero deps (D12). Lo único que se usa del
+//     runtime es `Bun.stringWidth` —una función pura— para medir columnas de
+//     terminal; ver la sección "ancho en COLUMNAS" para por qué no alcanza con
+//     contar caracteres.
 
 /** Un tramo de texto y si cae dentro de una coincidencia (CA-12.2). */
 export type Part = { text: string; hit: boolean };
@@ -40,21 +43,106 @@ export function oneLine(s: string): string {
   return String(s ?? "").replace(ESPACIOS_Y_CONTROLES, " ").trim();
 }
 
+// ── ancho en COLUMNAS de terminal ───────────────────────────────────────────
+//
+// ⚠️ Esta sección corrige el que era el bug de emojis de wacosas, y conviene
+// leer qué se midió antes de tocarla (OpenTUI 0.4.2 + Bun 1.3.14, con
+// `testRender` y contando los espacios de relleno de una caja de ancho fijo,
+// que es el único método que no depende de saber los anchos de antemano):
+//
+//  · **OpenTUI mide bien.** Agrupa por GRAFEMA y le da dos columnas a lo que el
+//    terminal dibuja en dos: `👨‍👩‍👧` (ZWJ) → 2, `🇦🇷` (bandera) → 2, `1️⃣`
+//    (keycap) → 2, `👍🏽` (tono de piel) → 2, `日` → 2, `⏳`/`❔` → 2. Y les da
+//    **cero** a las marcas combinantes, incluidas las que `Bun.stringWidth`
+//    cuenta como 1 (hebreo `U+0591`, árabe `U+064B`). O sea que el §7.4.11 del
+//    diseño se lee al revés de como está escrito: la que miente es
+//    `Bun.stringWidth`, y **por punto de código**; el renderer está bien.
+//  · **Quien contaba mal era `clip()`**, que contaba PUNTOS DE CÓDIGO. Medido:
+//    `clip("🎉🎉🎉🎉🎉 fiesta", 6)` devolvía 11 columnas para un presupuesto de
+//    6 —casi el doble—, y `clip("🇦🇷 argentina", 2)` partía la bandera al medio
+//    dejando un indicador regional suelto (que se dibuja como una "A" en un
+//    cuadrito). Cada `📷 imagen` de un preview se pasaba por una columna, así
+//    que OpenTUI se comía el último carácter de la fila.
+//
+// De ahí las dos reglas de abajo: cortar por GRAFEMA (nunca adentro de un
+// cluster) y contar COLUMNAS (nunca puntos de código).
+
 /**
- * Deja el texto en una sola línea de a lo sumo `width` caracteres, con `…` si
- * sobra (CA-4.6). Corta por PUNTOS DE CÓDIGO, no por unidades UTF-16: cortar al
- * medio de un par suplente escupiría un `` en pantalla.
+ * Marcas que NO ocupan columna y que `Bun.stringWidth` cuenta igual como 1.
  *
- * Ojo con el alcance: cuenta caracteres, no celdas de terminal (un emoji ocupa
- * dos columnas). El clip visual duro lo hace OpenTUI con `clipText` +
- * `wrapMode="none"` (design §7.4.1); esto es para armar el preview.
+ * `U+FE0F` (selector de variación 16) y `U+20E3` (keycap) quedan AFUERA a
+ * propósito aunque también sean `Mn`/`Me`: esos dos no se suman al ancho, lo
+ * CAMBIAN —`✉` mide 1 y `✉️` mide 2—, y `Bun.stringWidth` ya los resuelve bien.
+ */
+const MARCAS_SIN_ANCHO = /(?![\uFE0F\u20E3])[\p{Mn}\p{Me}]/gu;
+
+/** Segmentador de grafemas. Uno solo: construirlo cuesta y no tiene estado. */
+const GRAFEMAS = new Intl.Segmenter("es", { granularity: "grapheme" });
+
+/** Los grafemas de un texto: `👨‍👩‍👧` es UNO, no cinco puntos de código. */
+export function grafemas(s: string): string[] {
+  const out: string[] = [];
+  for (const g of GRAFEMAS.segment(String(s ?? ""))) out.push(g.segment);
+  return out;
+}
+
+/**
+ * Columnas que ocupa UN grafema (0, 1 o 2).
+ *
+ * `Bun.stringWidth` sobre el cluster entero acierta en todo lo que se midió
+ * —emoji, ZWJ, banderas, keycaps, tonos de piel, CJK— menos en las marcas
+ * combinantes, que suma de a 1: por eso se las saca antes de medir. El único
+ * desacuerdo que quedó contra OpenTUI es el keycap SIN selector (`1⃣`), donde
+ * esto devuelve 2 y el renderer 1: sobra una columna, o sea que se recorta un
+ * poco antes. Pasarse nunca; quedarse corto, sí.
+ */
+export function anchoGrafema(g: string): number {
+  const limpio = String(g ?? "").replace(MARCAS_SIN_ANCHO, "");
+  if (limpio === "") return 0;
+  return Math.max(0, Bun.stringWidth(limpio));
+}
+
+/** Columnas de terminal que ocupa un texto (CA-4.6). No cuenta caracteres. */
+export function anchoTexto(s: string): number {
+  let total = 0;
+  for (const g of grafemas(s)) total += anchoGrafema(g);
+  return total;
+}
+
+/**
+ * Deja el texto en una sola línea de a lo sumo `width` COLUMNAS de terminal, con
+ * `…` si sobra (CA-4.6).
+ *
+ * Dos garantías, las dos medidas contra el frame de OpenTUI:
+ *
+ *  1. **nunca se pasa del ancho pedido** —un `📷` cuenta 2, no 1—, así que la
+ *     caja que lo contiene no tiene que recortar nada y el `…` no desaparece;
+ *  2. **nunca corta adentro de un grafema**: ni un par suplente por la mitad
+ *     (`` ), ni una bandera partida en un indicador regional suelto, ni una
+ *     secuencia ZWJ dejando un `‍` colgado del `…`.
+ *
+ * La columna del `…` se reserva ANTES de repartir, así que el resultado entra
+ * siempre. Si el último grafema que entraría es ancho y sobra una sola columna,
+ * se lo deja afuera: queda un hueco de una columna, que es infinitamente mejor
+ * que pasarse.
  */
 export function clip(s: string, width: number): string {
   const linea = oneLine(s);
   if (!Number.isFinite(width) || width <= 0) return "";
-  const chars = Array.from(linea);
-  if (chars.length <= width) return linea;
-  return `${chars.slice(0, Math.floor(width) - 1).join("")}…`;
+  const tope = Math.floor(width);
+  if (anchoTexto(linea) <= tope) return linea;
+
+  // Se recorta: hay que reservar la columna del `…`.
+  const presupuesto = tope - 1;
+  let usado = 0;
+  let corte = "";
+  for (const g of grafemas(linea)) {
+    const w = anchoGrafema(g);
+    if (usado + w > presupuesto) break;
+    corte += g;
+    usado += w;
+  }
+  return `${corte}…`;
 }
 
 /** El último instante que `Date` sabe representar: ±8,64e15 ms desde epoch, o

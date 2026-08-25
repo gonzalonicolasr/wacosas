@@ -57,6 +57,8 @@ export type Maquina = {
   wa?: Pick<WaController, "stop">;
   appstate?: { stop(): void };
   identity?: { stop(): void };
+  /** La cola de fotos de perfil de la bandeja (`wa/avatars.ts`). */
+  avatars?: { stop(): void };
 };
 
 export type ShutdownDeps = {
@@ -198,6 +200,7 @@ export function createShutdown(deps: ShutdownDeps): Shutdown {
     paso("ingest.stop", () => m.ingest?.stop());
     paso("appstate.stop", () => m.appstate?.stop());
     paso("identity.stop", () => m.identity?.stop());
+    paso("avatars.stop", () => m.avatars?.stop());
 
     let enVuelo: Promise<void> | null = null;
     paso("send.inFlight", () => {

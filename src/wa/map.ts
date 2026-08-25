@@ -31,7 +31,7 @@ import {
 } from "baileys";
 import type { WAMessage, WAMessageContent } from "baileys";
 
-import type { AttachmentInfo, MappedMessage, MessageKind } from "../db/types";
+import type { AttachmentInfo, MappedMessage, MediaRef, MessageKind } from "../db/types";
 import { oneLine } from "../lib/fmt";
 import { placeholderFor } from "../lib/placeholder";
 
@@ -137,9 +137,61 @@ function segundosValidos(v: unknown): number | undefined {
   return typeof n === "number" && Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
 }
 
+/** Bytes de un `Uint8Array`/`Buffer` del proto en base64, o `""` si no hay. */
+function base64De(v: unknown): string {
+  if (v instanceof Uint8Array) return v.length > 0 ? Buffer.from(v).toString("base64") : "";
+  // protobufjs puede entregar el campo `bytes` como string base64 según cómo se
+  // haya decodificado el nodo: se acepta tal cual.
+  return typeof v === "string" ? v : "";
+}
+
 /**
- * El adjunto tal como se guarda: `label` ya resuelto (CA-7.1) y sólo los
- * metadatos que existen. Nada binario: wacosas no descarga adjuntos (CA-7.4).
+ * La referencia para volver a bajar la imagen (`db/types.ts` → `MediaRef`).
+ *
+ * ⚠️ **Es lo que ENMIENDA CA-7.4 del lado de la recepción**, así que conviene
+ * tener claro qué se guarda y qué no:
+ *
+ *  · se guarda la **referencia** (clave de descifrado + ruta del CDN + tamaño),
+ *    que son unos 90 bytes de texto en la celda `attachment`;
+ *  · **no** se guarda ni un byte del archivo, y **no** se baja nada acá: bajar
+ *    es una decisión del usuario, una tecla sobre una imagen concreta
+ *    (`wa/media.ts`, `^O`).
+ *
+ * Sin esto, "ver una imagen" sólo podría funcionar para lo que llegue con la
+ * aplicación abierta: el proto crudo no se persiste (§8.6) y WhatsApp no
+ * reenvía un mensaje viejo. Con esto funciona para todo lo que entre de acá en
+ * adelante — el historial ANTERIOR a esta versión no tiene referencia y no se
+ * puede bajar, y la interfaz lo dice con todas las letras.
+ *
+ * Devuelve `undefined` si falta la clave: sin ella no hay descarga posible y
+ * guardar media referencia sólo sería basura en la base.
+ */
+function mediaDe(nodo: Record<string, unknown> | undefined): MediaRef | undefined {
+  const key = base64De(nodo?.mediaKey);
+  if (!key) return undefined;
+  const directPath = texto(nodo?.directPath);
+  const url = texto(nodo?.url);
+  if (!directPath && !url) return undefined;
+  let bytes: number | undefined;
+  try {
+    const n = Number(toNumber(nodo?.fileLength as never));
+    if (Number.isFinite(n) && n > 0) bytes = Math.floor(n);
+  } catch {
+    // `fileLength` es un uint64 del proto: si viene con una forma rara se
+    // ignora, que es exactamente lo mismo que si no viniera.
+  }
+  return {
+    key,
+    ...(directPath ? { directPath } : {}),
+    ...(url ? { url } : {}),
+    ...(bytes !== undefined ? { bytes } : {}),
+  };
+}
+
+/**
+ * El adjunto tal como se guarda: `label` ya resuelto (CA-7.1), los metadatos que
+ * existen y —sólo en las imágenes— la referencia para poder bajarla a demanda.
+ * Nada binario: en la base no entra un solo byte de archivo.
  *
  * Los campos opcionales se omiten cuando faltan en vez de quedar en `undefined`:
  * así el JSON de la celda es chico y nadie río abajo tiene que defenderse de un
@@ -149,7 +201,18 @@ function adjuntoDe(kind: MessageKind, nodo: Record<string, unknown> | undefined)
   const mimetype = texto(nodo?.mimetype) || undefined;
 
   switch (kind) {
-    case "image":
+    case "image": {
+      // La referencia va SÓLO en las imágenes: es el único tipo que wacosas sabe
+      // mostrar (`^O`). Guardarla para un video de 80 MB sería guardar la llave
+      // de algo que no hay cómo abrir.
+      const media = mediaDe(nodo);
+      return {
+        label: placeholderFor(kind),
+        ...(mimetype ? { mimetype } : {}),
+        ...(media ? { media } : {}),
+      };
+    }
+
     case "sticker":
       return { label: placeholderFor(kind), ...(mimetype ? { mimetype } : {}) };
 

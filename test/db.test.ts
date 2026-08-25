@@ -493,6 +493,38 @@ describe("conversación", () => {
     db.close();
   });
 
+  test("imagesOf trae SÓLO las imágenes, de la más nueva a la más vieja (`^O`)", () => {
+    const { db, repo } = base();
+    repo.upsertChat({ jid: CHAT, name: "Ana" });
+    repo.tx(() => {
+      repo.insertMessage(mensaje({ waId: "T", ts: 1000, kind: "text", body: "hola" }));
+      repo.insertMessage(mensaje({ waId: "V", ts: 1001, kind: "video", body: "" }));
+      for (let i = 0; i < 3; i++) {
+        repo.insertMessage(
+          mensaje({
+            waId: `I${i}`,
+            ts: 2000 + i,
+            kind: "image",
+            body: `foto ${i}`,
+            attachment: { label: "📷 imagen", media: { key: "aaa=", directPath: "/x" } },
+          }),
+        );
+      }
+    });
+
+    const fotos = repo.imagesOf(CHAT);
+    // El orden es el de "la que me mandó recién", que es como uno busca una foto.
+    expect(fotos.map((m) => m.body)).toEqual(["foto 2", "foto 1", "foto 0"]);
+    // Un video no es una imagen, y la referencia vuelve parseada del JSON.
+    expect(fotos.every((m) => m.kind === "image")).toBe(true);
+    expect(fotos[0]!.attachment?.media?.key).toBe("aaa=");
+    expect(repo.imagesOf(CHAT, 2)).toHaveLength(2);
+    // Un chat sin imágenes no es un error: es una lista vacía.
+    repo.upsertChat({ jid: GRUPO, name: "Logística" });
+    expect(repo.imagesOf(GRUPO)).toEqual([]);
+    db.close();
+  });
+
   test("messagesBefore pagina hacia atrás y messagesAround centra en el ancla (CA-12.3)", () => {
     const { db, repo } = base();
     repo.upsertChat({ jid: CHAT, name: "Ana" });

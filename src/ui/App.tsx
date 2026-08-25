@@ -25,6 +25,7 @@ import { Conversation, HINTS_CONVO } from "./Conversation";
 import { ALTO_FOOTER, Footer } from "./Footer";
 import { ALTO_HEADER, Header } from "./Header";
 import { ayudaScrollea, Help } from "./Help";
+import { type ApiImagen, HINTS_IMAGEN, ImageView } from "./ImageView";
 import { HINTS_BANDEJA, Inbox } from "./Inbox";
 import { CANDADO_INICIAL, conDigito, type EstadoCandado, LockCode, siguientePaso, sinUltimo } from "./LockCode";
 import { Login, metodoDe } from "./Login";
@@ -47,8 +48,13 @@ import { BG, BORDER, ELEVATED, SURFACE, WARN } from "./theme";
  * `candado` es la pantalla de `Ctrl-P` (fijar el código de los chats con
  * candado). Tapa el cuerpo igual que la ayuda y **se come todas las teclas**: los
  * dígitos son el código y no pueden llegar a ningún otro lado.
+ *
+ * `imagen` es la pantalla de `Ctrl-O`: la foto que te mandaron, dibujada con
+ * celdas de color. Tapa el cuerpo por lo mismo que la ayuda —una imagen necesita
+ * filas— y también se come las teclas, así `←`/`→` caminan las fotos del chat sin
+ * mover la selección de la bandeja.
  */
-type Modo = "browse" | "help" | "compose" | "search" | "candado";
+type Modo = "browse" | "help" | "compose" | "search" | "candado" | "imagen";
 /** Un panel por vez cuando la terminal es angosta (§7.2). */
 type PanelMini = "inbox" | "convo";
 type Disposicion = "wide" | "compact" | "mini";
@@ -202,6 +208,9 @@ export function App({
   // Y con el campo de redacción, igual: el `^V` lo recibe este `useKeyboard` y
   // baja por acá (§7.4.2, mismo patrón que `busquedaRef`).
   const composerRef = useRef<ApiComposer | null>(null);
+  // Y con la pantalla de imágenes: `←`/`→` y `o` llegan a este `useKeyboard` y
+  // bajan por acá (mismo patrón que `busquedaRef`).
+  const imagenRef = useRef<ApiImagen | null>(null);
 
   const disposicion = disposicionDe(width);
 
@@ -279,6 +288,13 @@ export function App({
   useEffect(() => {
     if (modo === "compose" && (convo.jid === null || !verConvo)) setModo("browse");
   }, [modo, convo.jid, verConvo]);
+
+  // La pantalla de imágenes es DE un chat: si el chat se cierra mientras está
+  // abierta —el candado que lo esconde (`hideLocked`), un `^X`— no hay imágenes
+  // que mirar y quedarse ahí sería una pantalla que no se puede refrescar.
+  useEffect(() => {
+    if (modo === "imagen" && convo.jid === null) setModo("browse");
+  }, [modo, convo.jid]);
 
   // La vinculación se lleva la pantalla entera: si la ayuda quedó abierta cuando
   // WhatsApp desvinculó la sesión, dejarla "abierta abajo" haría que reaparezca
@@ -484,6 +500,38 @@ export function App({
       return;
     }
 
+    // ── imagen: ver la foto que te mandaron (`Ctrl-O`) ──────────────────────
+    // Se traga TODAS las teclas, igual que la ayuda y el candado: acá `←`/`→`
+    // caminan las imágenes del chat y no pueden mover la selección de la bandeja
+    // (que además está desmontada).
+    if (modo === "imagen") {
+      if (es("escape")) {
+        setModo("browse");
+        return;
+      }
+      // La misma tecla que abre, cierra: es lo que uno prueba primero.
+      if (key.ctrl && es("o")) {
+        setModo("browse");
+        return;
+      }
+      // El escape cuando la terminal no alcanza: la foto, en el visor de verdad.
+      // Es una letra pelada porque acá no hay ningún campo de texto que pueda
+      // recibirla (mismo criterio que los dígitos de la pantalla del candado).
+      if (es("o")) {
+        imagenRef.current?.abrirEnVisor();
+        return;
+      }
+      // `←`/`→` es el gesto de "la anterior / la siguiente" de cualquier visor;
+      // `↑`/`↓` hacen lo mismo para el que tenga las manos en las flechas de
+      // arriba. La lista viene de la MÁS NUEVA a la más vieja, así que `→` va
+      // hacia atrás en el tiempo, que es como se recuerdan las fotos.
+      if (es("right") || es("down")) imagenRef.current?.mover(1);
+      else if (es("left") || es("up")) imagenRef.current?.mover(-1);
+      else if (es("home")) imagenRef.current?.mover(-SALTO_EXTREMO);
+      else if (es("end")) imagenRef.current?.mover(SALTO_EXTREMO);
+      return;
+    }
+
     // ── búsqueda global (CA-12.*) ───────────────────────────────────────────
     // Sólo las teclas de NAVEGACIÓN: el texto lo escribe el `<input>` del
     // overlay, que recibe todo lo que no se maneje acá (incluido el `?`, que
@@ -548,6 +596,30 @@ export function App({
       if (!convo.jid) return;
       if (disposicion === "mini") setPanelMini("convo");
       setModo("compose");
+      return;
+    }
+
+    // `Ctrl-O`: ver las imágenes del chat abierto (`ui/ImageView.tsx`).
+    //
+    // POR QUÉ `^O`: es la última tecla que quedaba libre de verdad. No está entre
+    // los bindings de edición del `<input>`/`<textarea>` de OpenTUI 0.4.2
+    // —verificado en el fuente: sus combinaciones con `ctrl` son a/e/f/b/w/k/u/d,
+    // las flechas, backspace/delete, `-` y `.`—, así que el buscador de la
+    // bandeja, que está enfocado, no pierde ni un carácter.
+    //
+    // La lista se pide ACÁ, antes de cambiar de modo: entrar a una pantalla vacía
+    // y tener que salir con `Esc` es peor que un aviso en el pie. Es una consulta
+    // por índice, topeada en 200 filas.
+    if (key.ctrl && es("o")) {
+      if (!convo.jid) {
+        store.toast("abrí un chat para ver sus imágenes");
+        return;
+      }
+      if (commands.chatImages(convo.jid).length === 0) {
+        store.toast("este chat no tiene ninguna imagen");
+        return;
+      }
+      setModo("imagen");
       return;
     }
 
@@ -704,22 +776,35 @@ export function App({
   // (`MOTIVO_CONEXION_REEMPLAZADA`)—, mientras que una búsqueda global que no se
   // anuncia en ningún lado no existe. Los dos siguen en la ayuda (`?`).
   const cola = convo.jid ? "? ayuda · ^C salir" : "? ayuda · ^G buscar · ^C salir";
-  // ⚠️ Con un chat abierto esta línea mide EXACTAMENTE 78 caracteres, que es lo
-  // que entra a 80 columnas (RNF-1) descontando el padding. No es holgura: el
-  // próximo hint que se sume tiene que sacar otro.
-  const teclasChat = convo.jid ? ` · ^E escribí · ${HINTS_CONVO}` : "";
+  // ⚠️ El pie es UNA línea de 78 columnas útiles (RNF-1) y **cada hint nuevo
+  // tiene que sacar otro**. `^O imágenes` (tarea de las imágenes) entró sacando
+  // `⏎ abrir` y `Tab filtro`, y sólo CON UN CHAT ABIERTO:
+  //
+  //   · las dos que salieron son de la BANDEJA, y con un chat abierto lo que el
+  //     usuario está haciendo es leer, no navegar la lista;
+  //   · `⏎` sobre una lista es la tecla más adivinable que hay —el mismo
+  //     argumento por el que `↑↓ mover` ya había salido— y `Tab` además se puede
+  //     clickear en el encabezado, que está siempre a la vista;
+  //   · `^O` no se adivina de ninguna manera: sin el pie, no existe.
+  //
+  // Las dos siguen en la ayuda (`?`). Con un chat abierto la línea mide 69 de 78;
+  // sin chat, 64.
+  const teclasBandeja = convo.jid ? "^L leído" : HINTS_BANDEJA;
+  const teclasChat = convo.jid ? ` · ^E escribí · ^O imágenes · ${HINTS_CONVO}` : "";
   const hints =
     modo === "compose"
       ? `${HINTS_COMPOSER} · ^C salir`
       : modo === "candado"
         ? `${candado.fase === "listo" ? "⏎ / Esc cerrar" : "⏎ seguir · Esc cancelar"} · ^C salir`
+        : modo === "imagen"
+          ? `${HINTS_IMAGEN} · ^C salir`
         : modo === "search"
         ? `${HINTS_BUSQUEDA} · ^C salir`
         : modo === "help"
           ? `${scrollAyuda ? "↑↓ desplazar · " : ""}^R reconectar · Esc / ? cerrar la ayuda`
           : !verBandeja
             ? `↑↓ scroll · ^E escribí · Esc bandeja · ${cola}`
-            : `${HINTS_BANDEJA}${teclasChat} · ${cola}`;
+            : `${teclasBandeja}${teclasChat} · ${cola}`;
 
   return (
     <box flexDirection="column" width="100%" height="100%" backgroundColor={BG}>
@@ -746,6 +831,10 @@ export function App({
            desmonta, así que mientras se fija el código no hay ningún `<input>`
            enfocado que pueda recibir un dígito. */
         <LockCode estado={candado} yaHay={commands.hasLockCode()} ancho={width} alto={filasVisibles} />
+      ) : modo === "imagen" ? (
+        /* Mismo criterio que la ayuda y el candado: REEMPLAZA el cuerpo. Una
+           imagen necesita filas, y adentro de la conversación tendría cuatro. */
+        <ImageView ancho={width} alto={altoCuerpo} apiRef={imagenRef} />
       ) : modo === "search" ? (
         /* §7.1: el overlay REEMPLAZA el cuerpo (no se dibuja encima). La bandeja
            y la conversación se desmontan, así que el `<input>` de la búsqueda es
@@ -772,7 +861,11 @@ export function App({
               // con candado están a la vista. Sin él no habría cómo saber si lo
               // que se está viendo es la bandeja de siempre o la de después del
               // código —y el `Esc` que los esconde parecería no hacer nada—.
-              title={` chats ${inbox.counts.all}${ui.lockedRevealed ? " · candado" : ""} `}
+              //
+              // ⚠️ El total salió del título: ya estaba en el encabezado, en el
+              // tab `Todos N`, a cuatro columnas de acá. Un número repetido dos
+              // veces en la misma pantalla no informa, ocupa.
+              title={` chats${ui.lockedRevealed ? " · candado" : ""} `}
             >
               {/* El buscador de la bandeja tiene el foco SALVO mientras se
                   redacta: el reconciliador de OpenTUI aplica `focused` sólo

@@ -124,6 +124,17 @@ export type UiSnapshot = {
    * `db/repo.ts`).
    */
   lockedRevealed: boolean;
+  /**
+   * Color de cada chat en la bandeja: el promedio de su foto de perfil
+   * (`wa/avatars.ts`). `null` = ese chat no tiene foto (o no la comparte) y el
+   * glifo se queda del color de siempre; una clave AUSENTE es "todavía no se
+   * preguntó".
+   *
+   * **Sólo en memoria**, igual que `drafts`: lo que se guarda entre corridas es
+   * la miniatura en `<dataDir>/avatars/`, y el color se vuelve a derivar de ahí
+   * en el arranque siguiente sin preguntarle nada a WhatsApp.
+   */
+  avatars: Record<string, string | null>;
 };
 
 /** El mapa slice → snapshot. De acá salen `Slice` y `SnapshotOf`. */
@@ -203,6 +214,12 @@ export type Store = {
    * ASINCRÓNICO (la derivación scrypt tarda ~30 ms).
    */
   lockedRevealed(): boolean;
+  /**
+   * Anota el color de la foto de perfil de un chat (`wa/avatars.ts`). `null` =
+   * no tiene foto. Corta cuando el valor no cambió: los colores llegan de a uno
+   * cada segundo y cada uno es un flush de todo el slice `ui` (D3).
+   */
+  setAvatar(jid: string, color: string | null): void;
   /** Guarda (o borra, con `""`) el borrador de un chat (CA-8.6). */
   setDraft(jid: string | null, text: string): void;
   /**
@@ -264,6 +281,7 @@ export function createStore(opts: StoreOpts = {}): Store {
     selectedJid: null,
     drafts: {},
     lockedRevealed: false,
+    avatars: {},
   };
   let abierto: string | null = null;
   let ancla: number | null = null;
@@ -482,6 +500,18 @@ export function createStore(opts: StoreOpts = {}): Store {
 
     lockedRevealed() {
       return ui.lockedRevealed;
+    },
+
+    setAvatar(jid, color) {
+      if (!jid) return;
+      const valor = typeof color === "string" && color !== "" ? color : null;
+      // `in` y no `?? null`: "todavía no se preguntó" y "no tiene foto" son
+      // distintos, y el segundo también hay que anotarlo para no volver a pedirlo.
+      if (Object.hasOwn(ui.avatars, jid) && ui.avatars[jid] === valor) return;
+      // Objeto nuevo y no mutación, mismo motivo que `drafts`: `construir("ui")`
+      // publica una copia SUPERFICIAL.
+      ui.avatars = { ...ui.avatars, [jid]: valor };
+      markDirty("ui");
     },
 
     setDraft(jid, text) {

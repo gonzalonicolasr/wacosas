@@ -11,11 +11,14 @@
 // Hoy están los del esqueleto (tarea 9), los de vinculación (tarea 10), los de
 // la bandeja —selección, filtro y buscador— (tarea 12), los de envío (tarea 14),
 // los de leído (tarea 15) y los de la búsqueda global (tarea 16).
+import { type ResultadoImagen, renderizarImagen } from "../boot/chafa";
 import { type ClipboardResult, readClipboard } from "../boot/clipboard";
 import type { Logger } from "../boot/log";
 import type { LockCode } from "../boot/lockcode";
 import type { Repo } from "../db/repo";
-import type { ChatRow } from "../db/types";
+import type { ChatRow, MessageRow } from "../db/types";
+import type { Avatars } from "../wa/avatars";
+import type { MediaStore } from "../wa/media";
 import { clip, fold } from "../lib/fmt";
 import type { AppStateSync } from "../wa/appstate";
 import type { ReadReceipts } from "../wa/read";
@@ -64,6 +67,34 @@ export type CommandDeps = {
    * sin spawnear nada.
    */
   clipboard?: () => Promise<ClipboardResult>;
+  /**
+   * Descarga a demanda de las imágenes recibidas (`^O`, `wa/media.ts`). Opcional
+   * por el mismo motivo que `send`/`read`: un test de interfaz no baja nada, y
+   * sin ella `showImage` avisa en vez de romper.
+   *
+   * ⚠️ Se inyecta y no se importa, igual que `read`: `wa/media.ts` arrastra
+   * baileys (~260 ms) y este módulo lo carga la interfaz, que tiene que estar en
+   * pantalla en menos de 1 s (CA-13.1). El `import type` de arriba se borra al
+   * compilar.
+   */
+  media?: MediaStore;
+  /**
+   * Colores de las fotos de perfil de la bandeja (`wa/avatars.ts`). Opcional:
+   * sin ella la bandeja pinta los glifos como siempre y no se pierde nada —es un
+   * adorno, no un dato—. Se inyecta por lo mismo que `media`: cuelga del socket.
+   */
+  avatars?: Avatars;
+  /**
+   * Imagen → celdas de texto (`boot/chafa.ts`). A diferencia de `media`, **acá el
+   * default es el de verdad**: el módulo no arrastra nada pesado (mismo criterio
+   * que `clipboard`). La inyección existe para que el test no spawnee `chafa`.
+   */
+  chafa?: (ruta: string, cols: number, filas: number) => Promise<ResultadoImagen>;
+  /**
+   * Abrir un archivo con el visor del sistema (`xdg-open`). Se inyecta para que
+   * el test no le abra una ventana a nadie.
+   */
+  abrirArchivo?: (ruta: string) => void;
   /**
    * Cierre ordenado del proceso (`boot/shutdown.ts`, §6.6). El `motivo` no cambia
    * nada de lo que hace: va al log para que una salida quede explicada —después
@@ -388,6 +419,33 @@ export type Commands = {
    */
   sendImage(jid: string, image: ImagenSaliente, caption?: string): Resultado;
   /**
+   * Las imágenes del chat, de la más NUEVA a la más vieja (`^O`). Sin chat, sin
+   * base o sin imágenes devuelve una lista vacía: la pantalla lo explica.
+   */
+  chatImages(jid: string | null): MessageRow[];
+  /**
+   * Pide el color de la foto de perfil de esos chats (los que se VEN en la
+   * bandeja, `ui/Inbox.tsx`). Es idempotente y no consulta nada que ya sepa, así
+   * que se la puede llamar en cada render.
+   */
+  requestAvatars(jids: string[]): void;
+  /**
+   * Baja (si hace falta) y convierte a celdas la imagen de ese mensaje, para
+   * pintarla en `cols`×`filas` (`ui/ImageView.tsx`).
+   *
+   * Los dos pasos van juntos en UN comando porque son la misma pregunta del
+   * usuario —"mostrámela"— y porque el segundo no tiene sentido sin el primero.
+   * Lo que NO hace es decidir cuándo: eso es de la vista, que es la única que
+   * sabe si el usuario sigue parado en la misma imagen cuando la descarga vuelve.
+   */
+  showImage(msg: MessageRow, cols: number, filas: number): Promise<ResultadoImagen>;
+  /**
+   * Abre la imagen ya bajada en el visor del sistema (`xdg-open`). Es la salida
+   * para cuando la vista en la terminal no alcanza; si todavía no está bajada, lo
+   * dice en vez de abrir un visor con nada.
+   */
+  openImageExternally(msg: MessageRow): Resultado;
+  /**
    * Reintenta un envío fallado (`Ctrl-Y`, CA-9.3). Sin argumentos toma el ÚLTIMO
    * `failed` del chat abierto, que es lo que hace la tecla: la interfaz no tiene
    * por qué salir a buscar cuál era.
@@ -471,6 +529,18 @@ export type Commands = {
    */
   quit(code?: number, motivo?: string): void;
 };
+
+/**
+ * Abre un archivo con el visor del sistema.
+ *
+ * Se desprende del proceso a propósito (`stdio` a `ignore`, sin esperar la
+ * salida): un visor de imágenes vive minutos y wacosas no puede quedarse
+ * esperándolo, ni dejar que le escriba en la terminal —que está en la pantalla
+ * alternativa y con el layout de OpenTUI—.
+ */
+function abrirConElSistema(ruta: string): void {
+  Bun.spawn({ cmd: ["xdg-open", ruta], stdin: "ignore", stdout: "ignore", stderr: "ignore" }).unref();
+}
 
 /** Último teléfono VÁLIDO usado: lo reusa el `Ctrl-R` de "código nuevo" (CA-2.5). */
 let ultimoTelefono = "";
@@ -809,6 +879,60 @@ export const commands: Commands = {
     d.store.toast(r.reason);
     d.log.warn("send.imagen_rechazada", { motivo: r.reason });
     return { ok: false, reason: r.reason };
+  },
+
+  chatImages(jid) {
+    const d = deps;
+    if (!d || !jid) return [];
+    try {
+      return d.repo.imagesOf(jid);
+    } catch (e) {
+      // Ningún comando lanza: una consulta que falla es una lista vacía y una
+      // línea en el log, no una pantalla rota.
+      d.log.warn("media.listado_fallido", { motivo: e instanceof Error ? e.message : String(e) });
+      return [];
+    }
+  },
+
+  requestAvatars(jids) {
+    // Sin `avatars` cableado no pasa nada: la bandeja se pinta igual.
+    deps?.avatars?.request(jids ?? []);
+  },
+
+  async showImage(msg, cols, filas) {
+    const d = deps;
+    if (!d) return { ok: false, reason: "todavía no arrancó la aplicación" };
+    if (!d.media) return { ok: false, reason: "la descarga de imágenes todavía no está disponible" };
+    if (!msg || msg.kind !== "image") return { ok: false, reason: "ese mensaje no es una imagen" };
+
+    const bajada = await d.media.ensureImage(msg);
+    if (!bajada.ok) return { ok: false, reason: bajada.reason };
+    return (d.chafa ?? renderizarImagen)(bajada.path, cols, filas);
+  },
+
+  openImageExternally(msg) {
+    const d = deps;
+    if (!d) return { ok: false, reason: "todavía no arrancó la aplicación" };
+    if (!d.media) return { ok: false, reason: "la descarga de imágenes todavía no está disponible" };
+    // Sólo lo que YA está en disco: `xdg-open` sobre una ruta que no existe abre
+    // un visor con un error adentro, que es peor que decirlo acá.
+    const ruta = d.media.cached(msg);
+    if (!ruta) {
+      const motivo = "todavía no está bajada: mirala primero con ^O";
+      d.store.toast(motivo);
+      return { ok: false, reason: motivo };
+    }
+    try {
+      (d.abrirArchivo ?? abrirConElSistema)(ruta);
+    } catch (e) {
+      const motivo = e instanceof Error ? e.message : String(e);
+      d.store.toast(`no se pudo abrir el visor: ${motivo}`);
+      d.log.warn("media.visor_fallido", { motivo });
+      return { ok: false, reason: motivo };
+    }
+    d.store.toast("abriendo la imagen en el visor del sistema…");
+    d.log.info("media.visor", {});
+    return { ok: true };
   },
 
   retrySend(chatJid, waId) {

@@ -30,6 +30,13 @@ import type {
  */
 export const VENTANA_DEFAULT = 500;
 
+/**
+ * Tope de imágenes que se listan de un chat (`^O`). No es una ventana de lectura
+ * como `VENTANA_DEFAULT`: es la lista por la que uno se mueve con las flechas, y
+ * doscientas fotos ya son más de las que nadie recorre de a una.
+ */
+export const TOPE_IMAGENES = 200;
+
 export type Counts = { all: number; unread: number; groups: number };
 
 /**
@@ -130,6 +137,14 @@ export type Repo = {
   /** Una fila por su id de WhatsApp: el estado para la escalera y el texto del reintento. */
   getMessageByWaId(chatJid: string, waId: string): MessageRow | null;
   lastMessages(jid: string, limit?: number): MessageRow[];
+  /**
+   * Las imágenes del chat, de la más NUEVA a la más vieja (`^O`, `ui/ImageView`).
+   *
+   * Va contra la base y no contra la ventana de 500 del slice `convo` porque la
+   * pantalla de imágenes no tiene nada que ver con lo que se esté leyendo: si
+   * hay una foto de hace tres meses, tiene que estar en la lista.
+   */
+  imagesOf(jid: string, limit?: number): MessageRow[];
   messagesBefore(jid: string, beforeId: number, limit: number): MessageRow[];
   messagesAround(jid: string, anchorId: number, span?: number): MessageRow[];
   searchMessages(match: string, limit: number, revealLocked?: boolean): SearchHit[];
@@ -398,6 +413,18 @@ export function createRepo(db: Database): Repo {
   const qOpenSends = db.query<FilaMensaje, []>(
     `SELECT ${COLS_MSG} FROM messages WHERE status IN ('pending','failed') ORDER BY id`,
   );
+  // Las imágenes del chat, de la más NUEVA a la más vieja: es el orden en el que
+  // uno busca una foto ("la que me mandó recién"). Usa el mismo índice
+  // `(chat_jid, ts, id)` que la ventana de conversación; el filtro por `kind` es
+  // sobre las filas que ya trajo el índice.
+  //
+  // No se filtra por "¿tiene referencia para bajarla?" a propósito: una imagen
+  // vieja —de antes de que wacosas guardara la referencia— se sigue listando, y
+  // el panel explica por qué no se puede ver. Esconderla sería peor: el usuario
+  // la tiene ahí, con su `📷 imagen`, y no entendería por qué `^O` no la ve.
+  const qImagenes = db.query<FilaMensaje, [string, number]>(
+    `SELECT ${COLS_MSG} FROM messages WHERE chat_jid = ? AND kind = 'image' ORDER BY ts DESC, id DESC LIMIT ?`,
+  );
 
   const qSearch = db.query<FilaHit, [string, number, number]>(
     `SELECT m.id, m.chat_jid, c.name AS chat_name, c.is_group, m.ts, m.from_me,
@@ -563,6 +590,12 @@ export function createRepo(db: Database): Repo {
 
     lastMessages(jid, limit = VENTANA_DEFAULT) {
       return ordenarCronologico(qLastMessages.all(jid, limit));
+    },
+
+    // Sin `ordenarCronologico`: acá el orden es al revés (la más nueva primero) y
+    // la consulta ya lo trae resuelto.
+    imagesOf(jid, limit = TOPE_IMAGENES) {
+      return qImagenes.all(jid, Math.max(1, Math.floor(limit))).map(aMessageRow);
     },
 
     messagesBefore(jid, beforeId, limit) {

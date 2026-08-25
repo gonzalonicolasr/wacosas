@@ -47,6 +47,49 @@ export function lerpHex(a: string, b: string, t: number): string {
   return "#" + m.map((v) => v.toString(16).padStart(2, "0")).join("");
 }
 
+/** Los tres canales de un `#rrggbb`, 0..255. */
+function canales(hex: string): [number, number, number] {
+  const [r, g, b] = [1, 3, 5].map((i) => parseInt(String(hex ?? "").slice(i, i + 2), 16) || 0);
+  return [r as number, g as number, b as number];
+}
+
+/**
+ * Luminancia relativa (WCAG 2.x), 0..1. Se usa para decidir si un color que
+ * viene de AFUERA —el promedio de una foto de perfil— se ve o no sobre el fondo
+ * del panel.
+ */
+export function luminancia(hex: string): number {
+  const lineal = (c: number): number => {
+    const s = c / 255;
+    return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+  };
+  const [r, g, b] = canales(hex);
+  return 0.2126 * lineal(r) + 0.7152 * lineal(g) + 0.0722 * lineal(b);
+}
+
+/** Piso de luminancia para que un color se despegue del fondo (`SURFACE`). */
+const LUM_MINIMA = 0.18;
+
+/**
+ * Aclara un color hasta que se lea sobre el panel, conservando su TONO.
+ *
+ * Hace falta porque los colores de las fotos de perfil no los elegimos nosotros:
+ * el promedio de una foto nocturna puede dar `#111` y sobre un fondo `#111f1a`
+ * sería un glifo invisible —o sea, un chat que desaparece de la lista—. Se mezcla
+ * hacia el blanco de a poco: cambiar el tono lo volvería un color inventado, y la
+ * gracia es justamente que sea EL de esa foto.
+ */
+export function legibleSobrePanel(hex: string): string {
+  if (!/^#[0-9a-fA-F]{6}$/.test(String(hex ?? ""))) return TEXT_DIM;
+  let color = hex;
+  // Doce pasos de 8 %: alcanzan para levantar hasta un negro puro y son un ciclo
+  // acotado (nada de `while` sobre una condición que podría no cumplirse nunca).
+  for (let i = 0; i < 12 && luminancia(color) < LUM_MINIMA; i++) {
+    color = lerpHex(color, "#ffffff", 0.08);
+  }
+  return color;
+}
+
 /** Color a lo largo del gradiente de marca, t∈[0,1] (para animaciones). */
 export function brand(t: number): string {
   const x = Math.max(0, Math.min(1, t)) * (STOPS.length - 1);

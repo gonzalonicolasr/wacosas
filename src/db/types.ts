@@ -58,12 +58,42 @@ export type ContactRow = {
   phone: string;
 };
 
+/**
+ * La referencia con la que se puede volver a bajar UNA imagen del CDN de
+ * WhatsApp (`^O`, `wa/media.ts`). Son los tres campos que pide
+ * `downloadContentFromMessage` de baileys y nada más.
+ *
+ * ⚠️ **Esto es material sensible y hay que decirlo en voz alta.** `key` es la
+ * clave con la que se descifra el archivo, y la base local **no se cifra** (es
+ * la regla que ya está en la ayuda y en el README). O sea: quien pueda leer el
+ * `.sqlite` puede, además de leer los mensajes, bajarse las imágenes del CDN
+ * mientras WhatsApp las siga sirviendo. Es una ampliación real de lo que ya
+ * quedaba expuesto, y se aceptó a cambio de que "ver una imagen" funcione con
+ * el historial y no sólo con lo que llegue mientras la app está abierta.
+ *
+ * Lo que NO se guarda: **ningún byte del archivo**. La imagen vive en
+ * `<dataDir>/media/` sólo si el usuario pidió verla, y ese directorio se puede
+ * borrar entero sin perder nada (se vuelve a bajar).
+ */
+export type MediaRef = {
+  /** `mediaKey` en base64. */
+  key: string;
+  /** Ruta del CDN (`/o1/v/t62.…`). Es la que se usa cuando está. */
+  directPath?: string;
+  /** URL completa, para los mensajes viejos que no traen `directPath`. */
+  url?: string;
+  /** Tamaño que declara el mensaje, para poder frenar ANTES de bajar. */
+  bytes?: number;
+};
+
 export type AttachmentInfo = {
   /** Lo que se muestra en lugar del archivo: "📷 imagen", "🎤 audio 0:12", … */
   label: string;
   filename?: string;
   seconds?: number;
   mimetype?: string;
+  /** Sólo en las imágenes RECIBIDAS: con qué bajarlas a demanda (ver `MediaRef`). */
+  media?: MediaRef;
 };
 
 export type MessageRow = {

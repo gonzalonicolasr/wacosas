@@ -1139,13 +1139,20 @@ sería invisible) y sale con **3**. El `<ErrorScreen/>` queda **sólo** para la 
 
 | Modo | Ancho | Disposición |
 |---|---|---|
-| `wide` | ≥ 100 | header 3 · bandeja 40% / conversación 60% · footer 1 |
-| `compact` | 72–99 | header 3 · bandeja 34 cols fijas / conversación resto · footer 1. **Los tabs siguen en el encabezado** (ver abajo). |
-| `mini` | 60–71 | **un panel por vez**: bandeja, `⏎` entra a la conversación, `Esc` vuelve. Header 3 · cuerpo · footer 1 |
+| `wide` | ≥ 100 | header 1 · bandeja 40% / conversación 60% · footer 1 |
+| `compact` | 72–99 | header 1 · bandeja 34 cols fijas / conversación resto · footer 1. **Los tabs siguen en el encabezado** (ver abajo). |
+| `mini` | 60–71 | **un panel por vez**: bandeja, `⏎` entra a la conversación, `Esc` vuelve. Header 1 · cuerpo · footer 1 |
 | — | < 60 cols o < 15 filas | `<TooSmall/>` (RNF-2) |
 
-A 80×24 (el caso de RNF-1) el modo es `compact`: 3 + 20 + 1 = 24 filas, bandeja 34 / conversación 44.
+A 80×24 (el caso de RNF-1) el modo es `compact`: 1 + 22 + 1 = 24 filas, bandeja 34 / conversación 44.
 Verificable a ojo con `grim` + Read.
+
+⚠️ **El encabezado pasó de 3 filas a 1** (tarea de diseño). Eran una fila de contenido y **dos de
+marco**: a 24 filas, dos rayas horizontales gastando el 8 % de la pantalla; a 60×15 (el mínimo de
+RNF-2), el **13 %**. Y el marco no separaba nada, porque los paneles de abajo ya empiezan con su
+propio borde. Lo que lo reemplaza es el FONDO (una barra `ELEVATED` de una fila). Las dos filas
+liberadas van al cuerpo —a 80×24 pasa de 20 a 22, a 60×15 de 11 a 13— y también a la ayuda, que a
+80×19 volvió a entrar entera sin scrollear.
 
 ⚠️ **Corrección: los tabs con contadores NO se mudan al `title` del panel en `compact`.** El diseño
 lo proponía y el código no lo hizo, con motivo: **CA-5.5, CA-10.3 y CA-19.1 piden los contadores en
@@ -1183,6 +1190,10 @@ las combinaciones con `Shift` se evalúan **antes** que las teclas peladas.
 | `Ctrl-N` | **todos** | volver a pedir las colecciones de app-state (los nombres de la agenda) | — (tarea 17) |
 | `Ctrl-P` | browse | fijar el código que revela los chats con candado | — (tarea 17) |
 | `Ctrl-X` | browse | esconder/mostrar a mano el chat seleccionado (**dos veces**: pregunta y confirma) | — (tarea 17) |
+| `Ctrl-O` | browse | **ver las imágenes del chat abierto** (pantalla aparte, reemplaza el cuerpo) | — (enmienda de CA-7.4) |
+| `←`/`→`, `↑`/`↓`, `Inicio`/`Fin` | imagen | la anterior / la siguiente / las puntas | — |
+| `o` | imagen | abrirla en el visor del sistema (`xdg-open`) | — |
+| `Esc` / `Ctrl-O` | imagen | cerrar y volver a la conversación | — |
 | *(el código, tipeado)* | browse | revelar los chats con candado desde el buscador de la bandeja | — (tarea 17) |
 | `Esc` | browse | volver de panel en `mini` → esconder el candado → limpiar el buscador (en ese orden) | 5.4 |
 | `⏎` | compose | **enviar** (binding invertido, V6) | 8.2 |
@@ -1200,10 +1211,10 @@ las combinaciones con `Shift` se evalúan **antes** que las teclas peladas.
 
 **Por qué esas teclas y no otras.** El `<input>`/`<textarea>` de OpenTUI consume para edición
 `Ctrl-A/E/W/K/U/D/F/B`, `Ctrl-←/→`, `Ctrl-Backspace/Delete`, `Ctrl--`, `Ctrl-.`. Los comandos elegidos
-(`Ctrl-E`, `Ctrl-L`, `Ctrl-G`, `Ctrl-R`, `Ctrl-Y`, `Ctrl-N`, `Ctrl-P`, `Ctrl-X`) o no colisionan o
-colisionan de forma inocua (mover el cursor del buscador); verificado en el fuente de OpenTUI 0.4.2,
-donde además `handleKeyPress` devuelve `false` para cualquier combinación con `ctrl` que no tenga
-binding. **Prohibido** `Ctrl-M` (= `⏎`), `Ctrl-I` (= `Tab`), `Ctrl-[` (= `Esc`) y `Ctrl-H`
+(`Ctrl-E`, `Ctrl-L`, `Ctrl-G`, `Ctrl-R`, `Ctrl-Y`, `Ctrl-N`, `Ctrl-O`, `Ctrl-P`, `Ctrl-X`) o no
+colisionan o colisionan de forma inocua (mover el cursor del buscador); verificado en el fuente de
+OpenTUI 0.4.2, donde además `handleKeyPress` devuelve `false` para cualquier combinación con `ctrl`
+que no tenga binding. **Prohibido** `Ctrl-M` (= `⏎`), `Ctrl-I` (= `Tab`), `Ctrl-[` (= `Esc`) y `Ctrl-H`
 (= backspace): son el mismo byte y romperían la navegación. `Ctrl-S`/`Ctrl-Q` son el control de flujo
 XON/XOFF de la tty y `Ctrl-Z` suspende el proceso — por eso `Ctrl-X` fue la última libre.
 
@@ -1266,15 +1277,28 @@ síntoma reproducido y arreglado.
    Lo que **no** recorta es el **desborde vertical**: seis hijos en una caja de alto 3 se dibujan los
    seis, encimados sobre lo que haya abajo. Por eso las listas se **presupuestan** (`ventana()` en la
    bandeja, `lineasQueEntran()` en la ayuda) en vez de confiar en el recorte.
-10. **`clip()` cuenta puntos de código, no columnas** (`lib/fmt.ts`). Corta por code points para no
-    escupir medio par suplente, pero un emoji ocupa dos columnas y cuenta como uno: el recorte visual
-    duro lo tiene que hacer OpenTUI (punto 9) o una caja de ancho fijo. Por eso las columnas de la
-    bandeja son **cajas**, no `padEnd` adentro de un string (además, `clip` aplasta los espacios
-    repetidos porque usa `oneLine`).
-11. **`Bun.stringWidth` miente con algunas marcas combinantes.** Medido en Bun 1.3.14: las latinas
-    dan bien (`U+0301`, `U+0303`, `U+0308` → 0), pero **`U+0591` (hebreo) y `U+064B` (árabe) dan 1
-    cuando deberían dar 0**, y `U+20E3` (keycap) da 2. O sea que no sirve como oráculo de ancho para
-    texto arbitrario; en este proyecto sólo se usa **en tests** y sobre texto latino.
+10. ~~**`clip()` cuenta puntos de código, no columnas**~~ — **ARREGLADO** (tarea de las imágenes).
+    Era el bug de emojis de wacosas y estaba acá descrito como si fuera una limitación aceptable.
+    Medido con `testRender`: `clip("🎉🎉🎉🎉🎉 fiesta", 6)` devolvía **11 columnas** para un
+    presupuesto de 6, y `clip("🇦🇷 argentina", 2)` partía la bandera dejando un indicador regional
+    suelto (que se dibuja como una "A" en un cuadrito). Cada `📷 imagen` de un preview se pasaba por
+    una columna y OpenTUI se comía el último carácter de la fila. Ahora `clip()` corta por **grafema**
+    (`Intl.Segmenter`) y cuenta **columnas** (`anchoTexto`), así que **nunca se pasa del ancho pedido
+    y nunca parte un cluster**. Lo que sigue valiendo del punto original: `clip` aplasta los espacios
+    repetidos (usa `oneLine`), así que alinear con `padEnd` adentro de un texto recortado no funciona
+    — las columnas de la bandeja son **cajas**.
+11. **`Bun.stringWidth` miente POR PUNTO DE CÓDIGO; OpenTUI mide bien.** ⚠️ Este punto estaba escrito
+    al revés de lo que pasa, y por eso conviene la corrección completa. Medido en OpenTUI 0.4.2 + Bun
+    1.3.14, contando los espacios de relleno de una caja de ancho fijo (el único método que no
+    depende de saber los anchos de antemano):
+    · **el renderer agrupa por GRAFEMA y acierta**: `👨‍👩‍👧` (ZWJ) → 2, `🇦🇷` (bandera) → 2, `1️⃣`
+      (keycap) → 2, `👍🏽` (tono de piel) → 2, `日` → 2, `⏳`/`❔` → 2, y las marcas combinantes → 0
+      (incluidas `U+0591` hebreo y `U+064B` árabe, donde `Bun.stringWidth` da 1);
+    · **`Bun.stringWidth` sirve igual**, pero **sobre un grafema entero y sacándole antes las marcas
+      `Mn`/`Me`** (menos `U+FE0F` y `U+20E3`, que no suman ancho sino que lo cambian). Con esa
+      corrección coincide con el renderer en todo lo medido; el único desacuerdo que queda es el
+      keycap **sin** selector (`1⃣`: 2 contra 1), donde sobra una columna y se recorta un poco antes.
+      Eso es lo que hace `anchoGrafema` en `lib/fmt.ts`.
 12. **El `<input>`/`<textarea>` se come los `Ctrl-<letra>` que tiene bindeados**: `Ctrl-K` es
     `delete-to-line-end`, y están además `Ctrl-A/E/W/U/D/F/B`, `Ctrl-←/→`, `Ctrl-Backspace/Delete`,
     `Ctrl--` y `Ctrl-.`. Cualquier atajo nuevo hay que elegirlo **fuera** de esa lista (§7.3).
