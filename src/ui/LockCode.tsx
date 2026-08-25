@@ -64,7 +64,11 @@ export function siguientePaso(e: EstadoCandado): { estado: EstadoCandado; guarda
     if (e.digitos !== e.primero) {
       return { estado: { ...CANDADO_INICIAL, motivo: MOTIVO_NO_COINCIDEN } };
     }
-    return { estado: { ...e, motivo: null }, guardar: e.primero };
+    // OJO con el `...e`: arrastraba `fase: "repetir"` y la pantalla seguía
+    // pidiendo el código aunque ya lo hubiera guardado. El usuario lo volvía a
+    // tipear, se guardaba otro, y después el que escribía en el buscador no era
+    // el último que había quedado. La fase tiene que quedar en `listo`.
+    return { estado: { ...e, fase: "listo", motivo: null }, guardar: e.primero };
   }
   return { estado: e };
 }

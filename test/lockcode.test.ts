@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createLockCode, MAX_DIGITOS, MIN_DIGITOS, validarCodigo } from "../src/boot/lockcode";
+import { CANDADO_INICIAL, conDigito, siguientePaso } from "../src/ui/LockCode";
 import { openDb } from "../src/db/open";
 import { createRepo, type Repo } from "../src/db/repo";
 import type { MappedMessage } from "../src/db/types";
@@ -580,5 +581,42 @@ describe("chat abierto al que le llega el candado", () => {
     repo.setLocked(ANA_LID, true);
     s.markDirty("convo");
     expect(cuerpos(s)).toEqual([]);
+  });
+});
+
+// ── la pantalla de `Ctrl-P` ─────────────────────────────────────────────────
+//
+// Estos tres faltaban, y su ausencia dejó pasar un bug que el usuario sufrió en
+// vivo: el `...e` del paso "repetir" arrastraba `fase: "repetir"`, así que la
+// pantalla seguía pidiendo el código DESPUÉS de haberlo guardado. El usuario lo
+// tipeaba de nuevo, se guardaba otro, y el que después escribía en el buscador
+// ya no era el que había quedado en disco. Tres códigos fijados, cero revelados.
+describe("pantalla del código (Ctrl-P)", () => {
+  const tipear = (e: any, digitos: string) => [...digitos].reduce(conDigito, e);
+
+  test("dos veces el mismo código lo guarda Y deja la pantalla en `listo`", () => {
+    let e = tipear(CANDADO_INICIAL, "482913");
+    e = siguientePaso(e).estado;
+    expect(e.fase).toBe("repetir");
+
+    const r = siguientePaso(tipear(e, "482913"));
+    expect(r.guardar).toBe("482913");
+    // Lo que faltaba: sin esto la pantalla vuelve a pedir el código y el usuario
+    // termina fijando uno distinto del que cree.
+    expect(r.estado.fase).toBe("listo");
+  });
+
+  test("si la repetición no coincide se vuelve al principio y NO se guarda", () => {
+    let e = siguientePaso(tipear(CANDADO_INICIAL, "482913")).estado;
+    const r = siguientePaso(tipear(e, "482914"));
+    expect(r.guardar).toBeUndefined();
+    expect(r.estado.fase).toBe("nuevo");
+    expect(r.estado.digitos).toBe("");
+  });
+
+  test("una vez en `listo` no se siguen acumulando dígitos", () => {
+    let e = siguientePaso(tipear(CANDADO_INICIAL, "482913")).estado;
+    e = siguientePaso(tipear(e, "482913")).estado;
+    expect(tipear(e, "999").digitos).toBe(e.digitos);
   });
 });
