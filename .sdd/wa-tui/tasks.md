@@ -629,11 +629,50 @@
     §12 del diseño quedan alineados con lo implementado.
   - depends-on: 15, 16, 17
 
+- [x] 19. Pegar una imagen del portapapeles con `Ctrl-V` y mandarla al chat abierto
+  - *(pedido del usuario DESPUÉS del plan original — **sale del alcance de v1**, que declaraba los
+    adjuntos como placeholder. Ver la enmienda de CA-7.4 en "Cobertura de criterios".)*
+  - covers: ninguna CA existente (feature nueva). Reusa CA-8.2, CA-8.7, CA-9.1, CA-9.3, CA-7.1,
+    CA-7.2, CA-14.7, CA-19.5, RNF-8, RNF-9 sin cambiarles nada.
+  - files: `src/boot/clipboard.ts` (nuevo), `src/wa/send.ts` (`enqueueImage`), `src/state/commands.ts`
+    (`paste`, `sendImage`), `src/ui/Composer.tsx` (`ApiComposer.pegar`), `src/ui/App.tsx` (ruteo de
+    `^V` en modo compose), `src/ui/Help.tsx`, `README.md`,
+    `test/clipboard.test.ts` + `test/paste.test.tsx` (nuevos), `test/send.test.ts`, `test/ui.test.tsx`
+  - detalle / decisiones que NO se re-abren:
+    · **El terminal no le puede pasar una imagen a una TUI**: el bracketed paste entrega texto. `^V`
+      no *recibe* nada — es la tecla que autoriza a wacosas a leer el portapapeles del sistema
+      spawneando `wl-paste` → `xclip` → `xsel` → `pbpaste` (el primero que exista; los dos últimos
+      sólo texto). Está escrito en el encabezado de `boot/clipboard.ts` y en el README.
+    · **La MISMA cola de envío que el texto** (`enqueueImage` comparte `admitir()` con `enqueue`):
+      mismo rate limit 1/s y 20/min, mismos reintentos 1/3/9 s, misma fila optimista con id propio,
+      mismo eco que no duplica. Ningún camino paralelo — es lo que protege del ban (R8).
+    · **`^V` estaba LIBRE** en el `<textarea>` de OpenTUI 0.4.2: no está en
+      `defaultTextareaKeyBindings` y `handleKeyPress` corta con `return false` ante un `ctrl` sin
+      binding. Verificado en el fuente ANTES de codear (el precedente es el `^K` de la tarea 12) y
+      clavado con un test.
+    · **Sólo vale en modo `compose`**, no en la bandeja: es una tecla que puede terminar mandando una
+      imagen y no puede dispararse por accidente desde la lista de chats.
+    · **Portapapeles con TEXTO ⇒ se pega en el campo y NO se manda.** Mandarlo sigue siendo `⏎`: la
+      única acción irreversible queda siempre detrás de la misma tecla.
+    · **Tope de 16 MB**, chequeado ANTES de persistir y de tocar la red. Baileys **no impone ninguno**
+      (verificado: no hay constante de tamaño en `Utils/messages-media.js` ni en `Defaults/index.js`).
+      El único número de primera mano es el de la Cloud API de Meta (imagen 5 MB), que es **otra API**;
+      del protocolo del consumidor no hay número publicado. Se eligió 16 MB porque quedarse corto
+      rechaza capturas que sí habrían salido. Es una constante (`LIMITE_IMAGEN_BYTES`).
+    · **Robustez del proceso externo**: timeout de 3 s que es una **carrera contra la lectura**, no
+      sólo un `kill` — matar al hijo no destraba el `read()` si dejó un nieto con el pipe abierto.
+      Lectura acotada a 32 MB, mime resuelto por **firma de bytes** (no por lo que anuncie el
+      portapapeles), texto limpiado de ANSI y de caracteres de control antes de entrar a la terminal.
+  - done when: `bun test` completo verde (**600** en 27 archivos, contra 557 en 25 antes de la
+    tarea); `bun run typecheck` en cero; el `grep` de CA-7.4 sigue dando cero en el camino de
+    mensajes.
+  - depends-on: 14
+
 ---
 
 ## Cobertura de criterios
 
-Todos los `CA-*` y `RNF-*` del requirements quedan cubiertos por al menos una tarea, con estas dos
+Todos los `CA-*` y `RNF-*` del requirements quedan cubiertos por al menos una tarea, con estas tres
 salvedades ya decididas por el orquestador:
 
 - **CA-6.8** — se cubre **parcialmente y a propósito**: la ventana al abrir un chat pasa de 200 a 500
@@ -642,3 +681,17 @@ salvedades ya decididas por el orquestador:
 - **CA-12.1** — la mitad "sobre los nombres de chat" ya no se resuelve con FTS sino con el filtro de
   la bandeja (CA-5.2, tarea 12). El resultado para el usuario es el mismo; la §12 del diseño se
   corrige en la tarea 18.
+- **CA-7.4** — ⚠️ **pasa a aplicar SÓLO al camino de RECEPCIÓN** (enmienda de la tarea 19, `^V`).
+  El criterio dice "no descargar el contenido binario de ningún adjunto **ni escribir archivos
+  multimedia en disco**", y las dos mitades siguen valiendo enteras para lo que llega: una imagen
+  recibida se ve `📷 imagen`, no se baja ni un byte y no se escribe ningún archivo. Lo que cambió es
+  que ahora se puede **mandar** una imagen del portapapeles: bytes que el usuario ya eligió, que van
+  y vuelven **en memoria** y **no tocan el disco** ni antes ni después.
+  · El `grep -rn "downloadMediaMessage\|writeFile" src/` del done-when de la tarea 13 **sigue dando
+  cero en todo el camino de mensajes** (`src/wa`, `src/db`, `src/state`, `src/ui`): verificado. El
+  único `writeFile` de `src/` es el de `boot/lockcode.ts`, que guarda el hash del candado y es previo.
+  · Lo que la asimetría cuesta: los bytes no se persisten, así que **`^Y` no puede reintentar una
+  imagen fallada** (los reintentos automáticos 1/3/9 s sí, porque el job vive en memoria). Se avisa
+  con un motivo propio en vez de fallar en silencio.
+  · Documentado en el README ("Imágenes: se **mandan**, pero no se **descargan**") y en el
+  encabezado de la sección de imágenes de `src/wa/send.ts`.

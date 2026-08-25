@@ -32,6 +32,7 @@ import type { Logger } from "../boot/log";
 import type { Repo } from "../db/repo";
 import type { MappedMessage } from "../db/types";
 import { SEND_MAX_ATTEMPTS, sendRetryDelayMs } from "../lib/backoff";
+import { placeholderFor } from "../lib/placeholder";
 import { createLimiter, MIN_GAP_MS, type Limiter } from "../lib/ratelimit";
 import type { Cancelar, Store } from "../state/store";
 import { previewFor } from "./map";
@@ -71,8 +72,80 @@ export const MOTIVO_NO_ESTA = "ese mensaje ya no está en la base";
 export const MOTIVO_NO_FALLADO = "ese mensaje no está fallado";
 export const AVISO_EN_COLA = "espaciando los envíos: 1 por segundo, 20 por minuto";
 
-/** Un envío pendiente. `attempt` son los REINTENTOS ya gastados (0 = primero). */
-export type SendJob = { chatJid: string; waId: string; text: string; attempt: number };
+// ── imágenes salientes (`^V`) ───────────────────────────────────────────────
+//
+// ⚠️ **La asimetría es a propósito**: wacosas MANDA imágenes pero **no descarga
+// ninguna**. CA-7.4 sigue valiendo entero para el camino de RECEPCIÓN —una
+// imagen que llega se ve `📷 imagen` y no se baja ni un byte— y acá los bytes
+// vienen del portapapeles del usuario, nunca de WhatsApp. Por eso el `grep` con
+// el que se verifica CA-7.4 (la API de descarga de medios de baileys) sigue
+// dando cero: no se nombra en ningún lado, ni siquiera acá.
+//
+// Y no se guardan en la base: la fila que queda es la misma que la de una imagen
+// recibida (`kind: "image"` + el placeholder), así que el `.sqlite` sigue sin
+// tener un solo byte binario adentro. La consecuencia práctica está abajo, en
+// `retry`.
+
+/** Una imagen lista para subir. Los bytes viven SÓLO en memoria, nunca en la base. */
+export type ImagenSaliente = { bytes: Uint8Array; mime: string };
+
+/**
+ * Tope de una imagen saliente, en bytes.
+ *
+ * ⚠️ **De dónde sale este número, porque no es obvio**: baileys **no impone
+ * ningún límite** (verificado: no hay una sola constante de tamaño en
+ * `Utils/messages-media.js` ni en `Defaults/index.js`), así que si no frenamos
+ * acá el rechazo llega recién después de subir el archivo entero —minutos, en el
+ * peor caso— y disfrazado de error de red. El único número que se pudo verificar
+ * en documentación de primera mano es el de la referencia de medios de la Cloud
+ * API de Meta (`developers.facebook.com/docs/whatsapp/cloud-api/reference/media/`,
+ * consultada el 2026-08-25): **imagen 5 MB, video 16 MB, audio 16 MB, documento
+ * 100 MB**. Esa es OTRA API —la de negocios—, no el protocolo de WhatsApp Web que
+ * habla baileys, y del consumidor no hay número publicado: el que se cita en todos
+ * lados (16 MB para foto/video) **no se pudo confirmar en una fuente de primera
+ * mano**, así que queda dicho que es lo mejor que hay y no un dato duro.
+ *
+ * Se tomó **16 MB** y no 5 MB porque los dos errores no cuestan lo mismo: pasarse
+ * termina en un `failed` con el motivo del servidor a la vista y un `^V` de nuevo,
+ * mientras que quedarse corto **rechaza capturas de pantalla que sí habrían
+ * salido** (un PNG de un monitor 4K pasa los 5 MB sin esfuerzo) y el usuario no
+ * tiene forma de saber que el que se plantó fuimos nosotros. Si algún día las
+ * imágenes de entre 5 y 16 MB empiezan a rebotar del lado de WhatsApp, esto es
+ * una constante: bajala a 5 MB y listo.
+ */
+export const LIMITE_IMAGEN_BYTES = 16 * 1024 * 1024;
+
+export const MOTIVO_IMAGEN_VACIA = "la imagen no tiene contenido";
+export const MOTIVO_IMAGEN_NO_REINTENTABLE =
+  "esa imagen ya no está en memoria: copiala de nuevo y pegala con ^V";
+
+/** Los MB con un decimal, sin `NaN` ni `1.0999999`. */
+const mb = (bytes: number): string => (Math.round((bytes / (1024 * 1024)) * 10) / 10).toString();
+
+/**
+ * Lo mismo pero redondeando HACIA ARRIBA. No es un detalle: con redondeo normal,
+ * una imagen de un byte por encima del tope daba el mensaje
+ * "la imagen pesa 16 MB y el tope es 16 MB", que se lee como un bug nuestro.
+ */
+const mbArriba = (bytes: number): string => (Math.ceil((bytes / (1024 * 1024)) * 10) / 10).toString();
+
+export const motivoImagenGrande = (bytes: number): string =>
+  `la imagen pesa ${mbArriba(bytes)} MB y el tope es ${mb(LIMITE_IMAGEN_BYTES)} MB: no se mandó`;
+
+/**
+ * Un envío pendiente. `attempt` son los REINTENTOS ya gastados (0 = primero).
+ *
+ * `image` es lo único que distingue un envío de imagen de uno de texto: con él,
+ * `text` pasa a ser el **caption** (lo que hace WhatsApp cuando mandás una foto
+ * con algo escrito). Los bytes viajan en el job y NO se persisten en ningún lado.
+ */
+export type SendJob = {
+  chatJid: string;
+  waId: string;
+  text: string;
+  attempt: number;
+  image?: ImagenSaliente | null;
+};
 
 /**
  * El `reason?: undefined` / `waId?: undefined` de las ramas que no los usan no es
@@ -88,6 +161,18 @@ export type ResultadoEnvio =
 export type SendQueue = {
   /** Persiste la fila optimista y encola. NO manda: eso lo hace el worker. */
   enqueue(chatJid: string, text: string): ResultadoEnvio;
+  /**
+   * Lo mismo pero con una imagen del portapapeles (`^V`): **la MISMA cola**, o
+   * sea el mismo ritmo de RNF-8 (1/s, 20/min), los mismos reintentos 1/3/9 s de
+   * RNF-9, la misma fila optimista con id propio y el mismo eco que no duplica.
+   * No hay un camino paralelo para las imágenes — todo lo que este archivo cuida
+   * para no comerse un ban (R8) vale igual acá.
+   *
+   * `caption` es el texto que había en el campo de redacción: viaja pegado a la
+   * imagen, que es lo que hace WhatsApp. Puede ser vacío (una foto sola es un
+   * mensaje válido, así que acá NO aplica CA-8.3).
+   */
+  enqueueImage(chatJid: string, image: ImagenSaliente, caption?: string): ResultadoEnvio;
   /** `Ctrl-Y` (CA-9.3): vuelve a encolar un mensaje que quedó en `failed`. */
   retry(chatJid: string, waId: string): ResultadoEnvio;
   /** El trabajo en vuelo, para el tope de 2 s del cierre ordenado (CA-17.7). */
@@ -172,8 +257,19 @@ export function createSendQueue(deps: SendDeps): SendQueue {
     store.markDirty("inbox", chatJid === store.openChatJid() ? "convo" : null);
   }
 
-  function recordar(waId: string, msg: proto.IMessage | null | undefined, fallback: string): void {
-    sentCache.set(waId, msg ?? { conversation: fallback });
+  /**
+   * Guarda el proto para `getMessage` (§8.6).
+   *
+   * `fallback` es `null` cuando el mensaje NO se puede reconstruir sin los bytes
+   * —o sea, en un envío de imagen—: ahí es preferible no cachear nada (baileys
+   * no re-entrega ese mensaje puntual, riesgo ya aceptado y documentado en
+   * `getMessage`) antes que guardar un `{conversation: caption}` que convertiría
+   * la foto en un mensaje de texto suelto al re-cifrarla.
+   */
+  function recordar(waId: string, msg: proto.IMessage | null | undefined, fallback: string | null): void {
+    const guardar = msg ?? (fallback === null ? null : { conversation: fallback });
+    if (!guardar) return;
+    sentCache.set(waId, guardar);
     // `Map` conserva el orden de inserción: la primera clave es la más vieja.
     while (sentCache.size > MAX_SENT_CACHE) {
       const vieja = sentCache.keys().next().value;
@@ -211,9 +307,20 @@ export function createSendQueue(deps: SendDeps): SendQueue {
     // error de la BASE (SQLITE_BUSY, disco lleno, la base cerrada por el apagado)
     // volvería a la red y el destinatario recibiría el mismo mensaje hasta 4
     // veces —el peor bug posible en un cliente de mensajería—.
+    // Texto o imagen con caption: mismo `sendMessage`, mismo id, misma cola. La
+    // única diferencia es el contenido. `caption: undefined` cuando no hay texto,
+    // para no mandarle a WhatsApp un caption vacío.
+    const contenido = job.image
+      ? {
+          image: Buffer.from(job.image.bytes),
+          mimetype: job.image.mime,
+          ...(job.text ? { caption: job.text } : {}),
+        }
+      : { text: job.text };
+
     let sent: Awaited<ReturnType<typeof sock.sendMessage>>;
     try {
-      sent = await sock.sendMessage(job.chatJid, { text: job.text }, { messageId: job.waId });
+      sent = await sock.sendMessage(job.chatJid, contenido, { messageId: job.waId });
     } catch (e) {
       await fallar(job, motivo(e));
       return;
@@ -229,7 +336,7 @@ export function createSendQueue(deps: SendDeps): SendQueue {
       // El cache va PRIMERO por ser memoria: así una base que no acepta escrituras
       // no se lleva puesto el `getMessage` de §8.6 (el retry receipt del peer
       // llega segundos después y no espera a que la base se recupere).
-      recordar(idFinal, sent?.message, job.text);
+      recordar(idFinal, sent?.message, job.image ? null : job.text);
       repo.tx(() => {
         if (idFinal !== job.waId) repo.setMessageWaId(job.chatJid, job.waId, idFinal);
         // `setMessageStatus` sólo avanza: si el `DELIVERY_ACK` llegó antes de que
@@ -237,7 +344,12 @@ export function createSendQueue(deps: SendDeps): SendQueue {
         repo.setMessageStatus(job.chatJid, idFinal, "sent", null);
       });
       marcar(job.chatJid);
-      log.info("send.ok", { chat_grupo: !!isJidGroup(job.chatJid), reintentos: job.attempt });
+      log.info("send.ok", {
+        chat_grupo: !!isJidGroup(job.chatJid),
+        reintentos: job.attempt,
+        // Ni el caption ni los bytes: sólo QUÉ se mandó (CA-14.7).
+        imagen: !!job.image,
+      });
     } catch (e) {
       log.error("send.post_envio", { motivo: motivo(e) });
     }
@@ -313,6 +425,67 @@ export function createSendQueue(deps: SendDeps): SendQueue {
     corriendo = Promise.resolve().then(trabajar);
   }
 
+  /**
+   * El tramo COMÚN de `enqueue` y `enqueueImage`: persistir la fila optimista,
+   * avisar si va a esperar y empujar el job.
+   *
+   * Existe para que las imágenes no puedan tener su propio camino. Lo que cambia
+   * entre un texto y una imagen es QUÉ se valida antes (arriba); de acá para
+   * abajo —id propio, fila `pending` antes de tocar la red, aviso de cola, rate
+   * limit, worker— es exactamente lo mismo, y duplicarlo sería la forma más fácil
+   * de que un día un `^V` se saltee el ritmo de RNF-8.
+   */
+  function admitir(jid: string, cuerpo: string, image: ImagenSaliente | null): ResultadoEnvio {
+    const self = jidNormalizedUser(wa.selfJid() || undefined);
+    const waId = nuevoId(wa.selfJid());
+    const fila: MappedMessage = {
+      chatJid: jid,
+      waId,
+      fromMe: true,
+      senderJid: self,
+      // Vacío a propósito: la conversación pinta "vos" en todo mensaje propio
+      // (`MessageRow.autorDe`), congelar acá el `pushName` propio no aporta.
+      senderName: "",
+      ts: Math.floor(ahora() / 1000),
+      kind: image ? "image" : "text",
+      body: cuerpo,
+      // La fila de una imagen que MANDAMOS es idéntica a la de una que recibimos:
+      // el placeholder y el mime, cero bytes. Así la conversación la pinta
+      // `📷 imagen` con el caption debajo (CA-7.1, CA-7.2) sin enterarse de quién
+      // la mandó, y la base sigue sin un solo byte binario adentro.
+      attachment: image ? { label: placeholderFor("image"), mimetype: image.mime } : null,
+      status: "pending",
+    };
+
+    try {
+      repo.tx(() => {
+        // El chat va primero: la FK de `messages.chat_jid` aborta si no existe
+        // (§8.4). Con un chat abierto ya está, pero el envío no puede depender
+        // de eso.
+        repo.upsertChat({ jid, isGroup: !!isJidGroup(jid) });
+        repo.insertMessage(fila);
+        repo.touchChatActivity(jid, fila.ts, previewFor(fila), true);
+      });
+    } catch (e) {
+      log.error("send.no_persistido", { motivo: motivo(e) });
+      return { ok: false, reason: MOTIVO_NO_GUARDADO };
+    }
+
+    // CA-9.1: la fila aparece al toque en `⏳ enviando`, sin esperar la red.
+    marcar(jid);
+    // D8 / CA-19.5: cuánto va a esperar ESTE mensaje ≈ uno por segundo por cada
+    // uno que tiene adelante. `corriendo` ya está seteado con el job todavía en
+    // la cola (el worker arranca un microtask después), así que en una ráfaga
+    // esto cuenta uno de más y el aviso sale desde el SEGUNDO mensaje: es
+    // exactamente lo que se quiere avisar —"hay más de uno encolado, por eso el
+    // ⏳"— y no una medición fina.
+    const adelante = cola.length + (corriendo ? 1 : 0);
+    if (adelante * MIN_GAP_MS >= UMBRAL_AVISO_MS) store.toast(AVISO_EN_COLA);
+    cola.push({ chatJid: jid, waId, text: cuerpo, attempt: 0, image });
+    bombear();
+    return { ok: true, waId };
+  }
+
   // ── API ───────────────────────────────────────────────────────────────────
 
   return {
@@ -327,51 +500,29 @@ export function createSendQueue(deps: SendDeps): SendQueue {
       // CA-8.7: sin conexión no se encola NI se inserta. El aviso lo da el
       // comando; acá sólo se devuelve el motivo.
       if (!wa.isOpen()) return { ok: false, reason: MOTIVO_SIN_CONEXION };
+      return admitir(jid, cuerpo, null);
+    },
 
-      const self = jidNormalizedUser(wa.selfJid() || undefined);
-      const waId = nuevoId(wa.selfJid());
-      const fila: MappedMessage = {
-        chatJid: jid,
-        waId,
-        fromMe: true,
-        senderJid: self,
-        // Vacío a propósito: la conversación pinta "vos" en todo mensaje propio
-        // (`MessageRow.autorDe`), congelar acá el `pushName` propio no aporta.
-        senderName: "",
-        ts: Math.floor(ahora() / 1000),
-        kind: "text",
-        body: cuerpo,
-        attachment: null,
-        status: "pending",
-      };
-
-      try {
-        repo.tx(() => {
-          // El chat va primero: la FK de `messages.chat_jid` aborta si no existe
-          // (§8.4). Con un chat abierto ya está, pero el envío no puede depender
-          // de eso.
-          repo.upsertChat({ jid, isGroup: !!isJidGroup(jid) });
-          repo.insertMessage(fila);
-          repo.touchChatActivity(jid, fila.ts, previewFor(fila), true);
-        });
-      } catch (e) {
-        log.error("send.no_persistido", { motivo: motivo(e) });
-        return { ok: false, reason: MOTIVO_NO_GUARDADO };
+    enqueueImage(chatJid, image, caption) {
+      const jid = texto(chatJid);
+      const bytes = image?.bytes;
+      // El caption se recorta igual que un mensaje de texto, pero acá vacío NO es
+      // un error: una foto sola es un mensaje válido (CA-8.3 no aplica).
+      const cuerpo = texto(caption).trim();
+      if (detenido) return { ok: false, reason: MOTIVO_CERRANDO };
+      if (!jid) return { ok: false, reason: MOTIVO_SIN_CHAT };
+      if (!bytes || bytes.length === 0) return { ok: false, reason: MOTIVO_IMAGEN_VACIA };
+      // ⚠️ El tope se chequea ACÁ, ANTES de persistir y ANTES de tocar la red:
+      // subir 40 MB para que WhatsApp los rechace es tiempo del usuario tirado a
+      // la basura, y encima el rechazo llegaría disfrazado de error de red. Ver
+      // `LIMITE_IMAGEN_BYTES` para de dónde sale el número.
+      if (bytes.length > LIMITE_IMAGEN_BYTES) {
+        return { ok: false, reason: motivoImagenGrande(bytes.length) };
       }
-
-      // CA-9.1: la fila aparece al toque en `⏳ enviando`, sin esperar la red.
-      marcar(jid);
-      // D8 / CA-19.5: cuánto va a esperar ESTE mensaje ≈ uno por segundo por cada
-      // uno que tiene adelante. `corriendo` ya está seteado con el job todavía en
-      // la cola (el worker arranca un microtask después), así que en una ráfaga
-      // esto cuenta uno de más y el aviso sale desde el SEGUNDO mensaje: es
-      // exactamente lo que se quiere avisar —"hay más de uno encolado, por eso el
-      // ⏳"— y no una medición fina.
-      const adelante = cola.length + (corriendo ? 1 : 0);
-      if (adelante * MIN_GAP_MS >= UMBRAL_AVISO_MS) store.toast(AVISO_EN_COLA);
-      cola.push({ chatJid: jid, waId, text: cuerpo, attempt: 0 });
-      bombear();
-      return { ok: true, waId };
+      if (!wa.isOpen()) return { ok: false, reason: MOTIVO_SIN_CONEXION };
+      // El `|| "image/png"` es defensivo: el portapapeles resuelve el mime por la
+      // firma de los bytes (`boot/clipboard.ts`) y nunca manda uno vacío.
+      return admitir(jid, cuerpo, { bytes, mime: texto(image.mime) || "image/png" });
     },
 
     retry(chatJid, waId) {
@@ -382,6 +533,12 @@ export function createSendQueue(deps: SendDeps): SendQueue {
       const fila = repo.getMessageByWaId(jid, id);
       if (!fila) return { ok: false, reason: MOTIVO_NO_ESTA };
       if (fila.status !== "failed") return { ok: false, reason: MOTIVO_NO_FALLADO };
+      // ⚠️ Consecuencia directa de NO guardar bytes en la base (CA-7.4): la fila
+      // de una imagen tiene el placeholder y el caption, no el archivo. Los
+      // reintentos AUTOMÁTICOS (1/3/9 s) sí funcionan —el job vive en memoria y
+      // se lleva los bytes—, pero un `^Y` puede llegar horas después, y ahí ya no
+      // hay qué mandar. Se dice en vez de fallar en silencio.
+      if (fila.kind === "image") return { ok: false, reason: MOTIVO_IMAGEN_NO_REINTENTABLE };
       if (!wa.isOpen()) return { ok: false, reason: MOTIVO_SIN_CONEXION };
 
       // Vuelve a `pending` (⏳) y el contador de reintentos arranca de cero: es

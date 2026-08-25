@@ -11,6 +11,7 @@
 // Hoy están los del esqueleto (tarea 9), los de vinculación (tarea 10), los de
 // la bandeja —selección, filtro y buscador— (tarea 12), los de envío (tarea 14),
 // los de leído (tarea 15) y los de la búsqueda global (tarea 16).
+import { type ClipboardResult, readClipboard } from "../boot/clipboard";
 import type { Logger } from "../boot/log";
 import type { LockCode } from "../boot/lockcode";
 import type { Repo } from "../db/repo";
@@ -18,7 +19,7 @@ import type { ChatRow } from "../db/types";
 import { clip, fold } from "../lib/fmt";
 import type { AppStateSync } from "../wa/appstate";
 import type { ReadReceipts } from "../wa/read";
-import type { SendQueue } from "../wa/send";
+import type { ImagenSaliente, SendQueue } from "../wa/send";
 import type { WaController } from "../wa/socket";
 import { TOAST_MS, type InboxFilter, type LinkSnapshot, type Store } from "./store";
 
@@ -55,6 +56,14 @@ export type CommandDeps = {
    * ella el buscador de la bandeja es un buscador y nada más.
    */
   lockCode?: LockCode;
+  /**
+   * Lectura del portapapeles del sistema (`^V`). A diferencia de `send`/`read`,
+   * **acá el default es el de verdad** (`readClipboard`): el módulo no arrastra
+   * ninguna dependencia pesada, así que no hay motivo para degradarlo. La
+   * inyección existe para que el test pueda decidir qué había en el portapapeles
+   * sin spawnear nada.
+   */
+  clipboard?: () => Promise<ClipboardResult>;
   /**
    * Cierre ordenado del proceso (`boot/shutdown.ts`, §6.6). El `motivo` no cambia
    * nada de lo que hace: va al log para que una salida quede explicada —después
@@ -362,6 +371,22 @@ export type Commands = {
    * que el composer sepa que tiene que conservar el texto (CA-8.7).
    */
   send(jid: string, text: string): Resultado;
+  /**
+   * Lee el portapapeles del sistema (`^V`). **No manda nada**: sólo dice qué
+   * había, y el que decide qué hacer con eso es el campo de redacción
+   * (`ui/Composer.tsx`), que es el único que sabe si el usuario sigue parado en
+   * el mismo chat cuando la lectura vuelve.
+   *
+   * Los casos que no dan nada usable —sin backend, vencido, basura, vacío— se
+   * AVISAN por el pie acá y vuelven igual en el resultado: una tecla que a veces
+   * no hace nada visible parece rota (mismo criterio que `retrySend`).
+   */
+  paste(): Promise<ClipboardResult>;
+  /**
+   * Manda una imagen al chat con el texto del campo como caption (CA-8.2 con
+   * `^V`). Devuelve el motivo cuando NO se mandó, igual que `send`.
+   */
+  sendImage(jid: string, image: ImagenSaliente, caption?: string): Resultado;
   /**
    * Reintenta un envío fallado (`Ctrl-Y`, CA-9.3). Sin argumentos toma el ÚLTIMO
    * `failed` del chat abierto, que es lo que hace la tecla: la interfaz no tiene
@@ -738,6 +763,51 @@ export const commands: Commands = {
     // nada visible y parece que la tecla no anduvo.
     d.store.toast(r.reason);
     d.log.warn("send.rechazado", { motivo: r.reason });
+    return { ok: false, reason: r.reason };
+  },
+
+  async paste() {
+    const d = deps;
+    if (!d) return { kind: "error", reason: "todavía no arrancó la aplicación" };
+    let r: ClipboardResult;
+    try {
+      r = await (d.clipboard ?? readClipboard)();
+    } catch (e) {
+      // `readClipboard` no lanza; esto es para que un backend inyectado que sí lo
+      // haga no termine en un unhandled rejection que se lleve el proceso.
+      r = { kind: "error", reason: e instanceof Error ? e.message : String(e) };
+    }
+    if (r.kind === "error") {
+      d.store.toast(r.reason);
+      d.log.warn("pegar.fallo", { motivo: r.reason });
+    } else if (r.kind === "empty") {
+      d.store.toast("el portapapeles está vacío");
+    } else {
+      // NUNCA el contenido: ni el texto pegado ni un byte de la imagen (CA-14.7).
+      d.log.info("pegar.ok", {
+        tipo: r.kind,
+        bytes: r.kind === "image" ? r.bytes.length : r.text.length,
+      });
+    }
+    return r;
+  },
+
+  sendImage(jid, image, caption) {
+    const d = deps;
+    if (!d) return { ok: false, reason: "todavía no arrancó la aplicación" };
+    if (!d.send) return { ok: false, reason: "el envío todavía no está disponible" };
+    const r = d.send.enqueueImage(jid, image, caption);
+    if (r.ok) {
+      // El caption viajó con la imagen: el campo queda limpio, igual que con un
+      // mensaje de texto que sí entró en la cola.
+      d.store.setDraft(jid, "");
+      return { ok: true };
+    }
+    // Mismo criterio que `send` (CA-8.7): el rechazo se AVISA. Acá encima es
+    // obligatorio — el usuario no tiene forma de adivinar que su captura pesaba
+    // de más.
+    d.store.toast(r.reason);
+    d.log.warn("send.imagen_rechazada", { motivo: r.reason });
     return { ok: false, reason: r.reason };
   },
 

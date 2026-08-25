@@ -77,7 +77,16 @@ const ATAJOS_BANDEJA: Array<[string, string]> = [
 // scroll también a 80×20.
 const ATAJOS_CONVO: Array<[string, string]> = [
   ["⇧↑↓ ⇧PgUp/PgDn", "scrollear el chat · ⇧Inicio ⇧Fin a las puntas"],
-  ["^E ⏎ Alt-⏎ ^Y", "escribir · enviar · salto de línea · reintentar"],
+  // ⚠️ `^V` entró en la columna de TEXTO y no en la de teclas: `^E ⏎ Alt-⏎ ^V ^Y`
+  // mide exactamente 16, que es `COL`, así que `padEnd(COL)` no dejaría ni un
+  // espacio y las teclas se pegarían a la descripción. Y una fila propia tampoco:
+  // a 80×24 el cuerpo son 20 filas y la ayuda mide 20, así que un renglón más le
+  // hace tirar los huecos de las tres secciones (mismo motivo por el que `^L` y
+  // `^G` viajan pegados a otra tecla más arriba).
+  //
+  // Va TERCERO en la línea, no último: a 72 columnas la descripción se recorta a
+  // 52 y ahí `^V pegar imagen` sigue entrando entero.
+  ["^E ⏎ Alt-⏎ ^Y", "escribir · enviar · salto · ^V pegar imagen · reintentar"],
 ];
 
 const ATAJOS_MINI: Array<[string, string]> = [

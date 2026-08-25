@@ -18,7 +18,7 @@
 //  4. **Sin conexión el envío se RECHAZA y el texto se queda** (CA-8.7, CA-13.3):
 //     no hay outbox diferido. El motivo lo avisa `commands.send` por el pie.
 import type { KeyBinding, TextareaRenderable } from "@opentui/core";
-import { useRef } from "react";
+import { type RefObject, useImperativeHandle, useRef } from "react";
 
 import { commands } from "../state/commands";
 import { useSlice } from "../state/hooks";
@@ -60,6 +60,14 @@ export function altoCampo(texto: string, ancho: number): number {
   return Math.max(1, filas);
 }
 
+/**
+ * Lo que `App` le puede pedir al campo. Mismo patrón que `ApiBusqueda`
+ * (`ui/SearchOverlay.tsx`) y por el mismo motivo: el `useKeyboard` es **UNO
+ * solo** y vive en `App` (§7.4), así que las teclas no llegan acá — llegan allá
+ * y bajan por esta ref.
+ */
+export type ApiComposer = { pegar(): void };
+
 export type PropsComposer = {
   /** Chat abierto. El componente no se pinta sin uno (lo decide `App`). */
   jid: string;
@@ -69,12 +77,16 @@ export type PropsComposer = {
   enfocado: boolean;
   /** Click sobre el campo: `App` pasa a modo compose (CA-19.7). */
   onEnfocar: () => void;
+  /** Por acá le baja `App` el `^V` (ver `ApiComposer`). */
+  apiRef?: RefObject<ApiComposer | null>;
 };
 
-export function Composer({ jid, ancho, enfocado, onEnfocar }: PropsComposer) {
+export function Composer({ jid, ancho, enfocado, onEnfocar, apiRef }: PropsComposer) {
   const ui = useSlice("ui");
   const conn = useSlice("conn");
   const campo = useRef<TextareaRenderable | null>(null);
+  /** ¿Hay un `^V` leyendo el portapapeles ahora mismo? (ver `pegar`). */
+  const pegando = useRef(false);
 
   const abierta = conn.state === "open";
   const borrador = ui.drafts[jid] ?? "";
@@ -101,10 +113,73 @@ export function Composer({ jid, ancho, enfocado, onEnfocar }: PropsComposer) {
     if (commands.send(jid, texto).ok) c.setText("");
   };
 
+  /**
+   * `^V` (CA nueva): pegar del portapapeles del SISTEMA.
+   *
+   * ⚠️ **Lo que hay que entender antes de tocar esto**: la terminal no le puede
+   * pasar una imagen a una TUI —el bracketed paste entrega texto y nada más—,
+   * así que `^V` no *recibe* nada: es la tecla con la que el usuario nos autoriza
+   * a salir a leer el portapapeles nosotros (`boot/clipboard.ts` spawnea
+   * `wl-paste`). Por eso es asincrónico y por eso hay tantas guardas.
+   *
+   * Las tres decisiones:
+   *
+   *  1. **Con una IMAGEN se manda** por la misma cola que el texto, y lo que haya
+   *     escrito en el campo viaja como **caption** (es lo que hace WhatsApp).
+   *  2. **Con TEXTO se pega en el campo y NO se manda.** Es lo que espera
+   *     cualquiera que apriete "pegar", y sobre todo: la única acción
+   *     irreversible —mandarle algo a otra persona— queda detrás del `⏎` de
+   *     siempre. Un `^V` nunca puede, por sí solo, mandar un texto.
+   *  3. **Una lectura por vez** (`pegando`) y **sólo si el campo sigue siendo el
+   *     mismo** al volver. `wl-paste` puede tardar hasta 3 s; en ese rato el
+   *     usuario pudo cambiar de chat, y como el `<textarea>` se remonta con
+   *     `key={jid}`, comparar la instancia (`campo.current === c`) es comparar el
+   *     chat. Sin esto, un `^V` en un chat podía terminar mandando la imagen en
+   *     otro.
+   */
+  const pegar = (): void => {
+    const c = campo.current;
+    if (!c || pegando.current) return;
+    pegando.current = true;
+    // El caption se lee AHORA, no cuando vuelve la lectura: es lo que el usuario
+    // tenía escrito cuando apretó la tecla.
+    const caption = c.plainText ?? "";
+    commands
+      .paste()
+      .then((r) => {
+        pegando.current = false;
+        // ¿Sigue siendo el mismo campo del mismo chat? (ver punto 3).
+        if (campo.current !== c) return;
+        if (r.kind === "image") {
+          if (commands.sendImage(jid, { bytes: r.bytes, mime: r.mime }, caption).ok) c.setText("");
+          return;
+        }
+        if (r.kind === "text") {
+          c.insertText(r.text);
+          // El borrador se guarda a mano y no se confía en `onContentChange`: es
+          // el mismo camino que ya usa `enviar`, y una tecla que no dispara el
+          // evento dejaría el borrador viejo guardado.
+          store.setDraft(jid, c.plainText ?? "");
+        }
+        // `empty` y `error` ya los avisó `commands.paste` por el pie.
+      })
+      .catch(() => {
+        // `commands.paste` no rechaza; el catch es para que nada quede trabado en
+        // `pegando: true` si algún día lo hiciera.
+        pegando.current = false;
+      });
+  };
+
+  // `useImperativeHandle` y no una asignación en el render: es el mismo camino
+  // que `ApiBusqueda` en `ui/SearchOverlay.tsx`. Depende de `jid` porque `pegar`
+  // lo captura: sin eso, al cambiar de chat `App` seguiría llamando al `pegar`
+  // del chat anterior.
+  useImperativeHandle(apiRef, () => ({ pegar }), [jid]);
+
   const placeholder = !abierta
     ? "sin conexión: no se puede enviar"
     : enfocado
-      ? "escribí · ⏎ envía · Alt-⏎ salto de línea"
+      ? "escribí · ⏎ envía · ^V pega"
       : "^E para escribir";
 
   return (
@@ -147,5 +222,9 @@ export function Composer({ jid, ancho, enfocado, onEnfocar }: PropsComposer) {
   );
 }
 
-/** Teclas del composer para el pie (`App` las muestra en modo compose). */
-export const HINTS_COMPOSER = "⏎ enviar · Alt-⏎ salto · Esc volver";
+/**
+ * Teclas del composer para el pie (`App` las muestra en modo compose). Con
+ * `· ^C salir` que le agrega `App` mide 58 columnas: entra holgado en las 78 de
+ * RNF-1 (el pie apretado es el de la bandeja, no éste).
+ */
+export const HINTS_COMPOSER = "⏎ enviar · Alt-⏎ salto · ^V pegar imagen · Esc volver";

@@ -21,6 +21,8 @@ completo (requisitos, diseño y tareas) vive en `.sdd/wa-tui/`.
 - **Bun ≥ 1.3** — es el único runtime soportado. Con Node no arranca: OpenTUI usa FFI nativo que en
   Node no levanta.
 - Linux con una terminal de al menos **80 × 24** (abajo de 60 × 15 te va a pedir que la agrandes).
+- *(opcional)* **`wl-clipboard`** —o `xclip` en X11— para pegar imágenes con `Ctrl-V`. Sin ninguno de
+  los dos, todo lo demás anda igual y `Ctrl-V` te avisa que le falta el comando.
 
 ## Instalación
 
@@ -147,6 +149,7 @@ tipeado el `?` es un carácter más).
 | `Ctrl-E` | enfocar el campo de redacción |
 | `⏎` | **enviar** |
 | `Alt-⏎` | salto de línea dentro del mensaje |
+| `Ctrl-V` | **pegar**: si hay una imagen copiada, **la manda**; si hay texto, lo escribe en el campo |
 | `Esc` | volver a la bandeja **conservando el borrador** |
 | `Ctrl-Y` | reintentar el último envío que falló en ese chat |
 
@@ -155,6 +158,36 @@ tipeado el `?` es un carácter más).
 >
 > **`Ctrl-K`/`Ctrl-J`** andan en cualquier terminal: sin el protocolo de teclado kitty, `Ctrl-J` llega
 > como *linefeed* y se distingue igual de `⏎`. Las flechas son el camino de siempre.
+
+#### `Ctrl-V`: pegar una imagen del portapapeles
+
+Copiás una captura (`Print`, un `grim -g`, `Ctrl-C` sobre una imagen del navegador), abrís el chat,
+`Ctrl-E` para escribir y **`Ctrl-V`**. Si además tenías algo escrito en el campo, ese texto viaja como
+**epígrafe** de la imagen, que es lo que hace WhatsApp.
+
+**Lo contraintuitivo, por si algún día parece un bug:** una terminal **no le puede pasar una imagen a
+una aplicación de terminal**. El pegado de la terminal (*bracketed paste*) entrega **texto** y nada
+más. Así que `Ctrl-V` no *recibe* la imagen: es la tecla con la que le decís a wacosas que salga
+**él** a leer el portapapeles del sistema. Por eso hace falta que tengas instalado uno de estos:
+
+| Backend | Sirve para | Dónde |
+| --- | --- | --- |
+| **`wl-paste`** (paquete `wl-clipboard`) | **imágenes** y texto | Wayland — el que usa Gon |
+| **`xclip`** | **imágenes** y texto | X11 |
+| `xsel` | sólo texto | X11 |
+| `pbpaste` | sólo texto | macOS |
+
+Se usa **el primero que exista**, en ese orden. Si no hay ninguno, `Ctrl-V` te lo dice en el pie y no
+pasa nada más. Con `xsel` o `pbpaste` el pegado de **texto** anda igual; el de imágenes no.
+
+Lo que **no** puede hacer `Ctrl-V`:
+
+- **mandar un texto solo.** Si en el portapapeles hay texto, se escribe en el campo y ahí se queda:
+  mandarlo sigue siendo `⏎`. La única acción irreversible está siempre detrás de la misma tecla.
+- **mandar algo de un chat en el que ya no estás.** Leer el portapapeles tarda (hasta 3 s si el
+  backend no contesta); si en el medio cambiaste de chat, el pegado se descarta.
+- **subir cualquier cosa.** Los bytes se validan por su **firma** (PNG, JPEG, GIF, WebP), no por lo
+  que el portapapeles diga tener, y **arriba de 16 MB se rechaza antes de subir nada**.
 
 ### En la búsqueda global (`Ctrl-G`)
 
@@ -182,7 +215,9 @@ Un solo proceso Bun con los dos mundos adentro y **un límite explícito** entre
   33 ms). React lo lee con `useSyncExternalStore` por *slice* y es dueño sólo de lo que no toca ni la
   red ni el disco. La UI habla con la máquina por un único módulo de comandos.
 - **`src/ui/`** — OpenTUI + React. Un solo manejador de teclado que rutea por modo.
-- **`src/boot/`** — rutas XDG, permisos, log con rotación, instancia única y cierre ordenado.
+- **`src/boot/`** — rutas XDG, permisos, log con rotación, instancia única, cierre ordenado y la
+  lectura del portapapeles (`clipboard.ts`: spawnea `wl-paste` y compañía con timeout y tope de
+  tamaño, porque un proceso externo puede no existir, colgarse o devolver basura).
 
 El diseño completo (con los gotchas ya pagados, que son varios) está en `.sdd/wa-tui/design.md`.
 
@@ -403,6 +438,26 @@ alguien que ya está sentado en tu sesión: esa persona puede volver a fijar el 
 (no se pide el anterior, justamente para que no te quedes afuera si lo olvidás) y, sobre todo, puede
 abrir la base con `sqlite3` y leer todo sin preguntarle nada a nadie.
 
+### Imágenes: se **mandan**, pero no se **descargan** (la asimetría es a propósito)
+
+wacosas manda imágenes con `Ctrl-V` (ver arriba), pero **no baja ni un byte de las que te llegan**:
+una imagen recibida se sigue viendo como `📷 imagen` con su epígrafe debajo, y no hay tecla que la
+abra. Lo mismo con audio, video, documentos y stickers, que **tampoco se pueden mandar**.
+
+No es un olvido, es la regla original del proyecto (**CA-7.4**) sostenida a medias a propósito:
+
+- **Recibir** un adjunto significa descargarlo y **escribir un archivo en disco** por cada cosa que
+  te manden. Eso es un directorio que crece solo, permisos que cuidar y contenido de terceros en tu
+  máquina sin que hayas pedido nada. Esa mitad **no se hizo y no está planeada**.
+- **Mandar** una imagen son bytes **que ya elegiste vos** y que van y vuelven **en memoria**: no
+  tocan el disco ni antes ni después. La fila que queda en la base es la misma que la de una imagen
+  recibida —el `📷 imagen` y el mime, cero binario—, así que el `.sqlite` sigue sin tener un solo
+  byte de archivo adentro.
+
+**Consecuencia práctica**: si una imagen que mandaste falla, **`Ctrl-Y` no la puede reintentar** —los
+bytes no están guardados en ningún lado—. Los reintentos automáticos (1/3/9 s) sí funcionan; para uno
+manual hay que volver a copiarla y `Ctrl-V` de nuevo. La app te lo dice cuando pasa.
+
 ### Un chat abre con 500 mensajes, y no hay "cargar más"
 
 Al abrir un chat se cargan los **últimos 500** mensajes y **eso es todo**: no hay paginado hacia
@@ -472,7 +527,9 @@ terminal, **no** contra alguien sentado en tu sesión.
 
 ### Lo que directamente no está en v1
 
-Enviar o descargar multimedia (los adjuntos se ven como `📷 imagen`, `🎤 audio 0:12`, `📎 informe.pdf`
-y nada más), reacciones, responder citando, editar, borrar para todos, reenviar, fijar, archivar,
+Descargar multimedia y enviar cualquier cosa que no sea una imagen o texto (los adjuntos que llegan
+se ven como `📷 imagen`, `🎤 audio 0:12`, `📎 informe.pdf` y nada más; **mandar** una imagen sí se
+puede, con `Ctrl-V` — ver la asimetría más arriba), reacciones, responder citando, editar, borrar
+para todos, reenviar, fijar, archivar,
 silenciar, bloquear, llamadas, estados, administrar grupos (leer y escribir texto en grupos **sí**),
 multi-cuenta, notificaciones del sistema, y **cifrado de la base**.

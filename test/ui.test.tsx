@@ -49,7 +49,9 @@ const ATAJOS_BANDEJA = [
 ];
 const ATAJOS_CONVO = [
   "⇧↑↓ ⇧PgUp/PgDn  scrollear el chat · ⇧Inicio ⇧Fin a las puntas",
-  "^E ⏎ Alt-⏎ ^Y   escribir · enviar · salto de línea · reintentar",
+  // `^V` (pegar del portapapeles) vive en la columna de TEXTO y no en la de
+  // teclas: `^E ⏎ Alt-⏎ ^V ^Y` mide justo `COL` y `padEnd` no dejaría espacio.
+  "^E ⏎ Alt-⏎ ^Y   escribir · enviar · salto · ^V pegar imagen · reintentar",
 ];
 const ATAJOS_MINI = [
   "⏎               entrar a la conversación",

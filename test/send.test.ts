@@ -31,9 +31,13 @@ import { createIngest, MOTIVO_ACK_RECHAZO, MOTIVO_ACK_RESTRINGIDA } from "../src
 import {
   AVISO_EN_COLA,
   createSendQueue,
+  LIMITE_IMAGEN_BYTES,
+  MOTIVO_IMAGEN_NO_REINTENTABLE,
+  MOTIVO_IMAGEN_VACIA,
   MOTIVO_NO_FALLADO,
   MOTIVO_SIN_CONEXION,
   MOTIVO_VACIO,
+  motivoImagenGrande,
   type SendQueue,
 } from "../src/wa/send";
 
@@ -91,7 +95,18 @@ async function asentar(vueltas = 4): Promise<void> {
 
 // ── doble de socket ─────────────────────────────────────────────────────────
 
-type Enviado = { jid: string; texto: string; waId: string; at: number };
+/** Lo que le llega a `sock.sendMessage`: texto, o imagen con caption (`^V`). */
+type ContenidoFalso = { text?: string; image?: Buffer; mimetype?: string; caption?: string };
+
+type Enviado = {
+  jid: string;
+  /** El cuerpo visible: el texto, o el caption cuando va una imagen. */
+  texto: string;
+  waId: string;
+  at: number;
+  /** El contenido CRUDO, para poder afirmar sobre los bytes de la imagen. */
+  contenido: ContenidoFalso;
+};
 
 function socketFalso(reloj: ReturnType<typeof relojVirtual>) {
   const enviados: Enviado[] = [];
@@ -108,12 +123,22 @@ function socketFalso(reloj: ReturnType<typeof relojVirtual>) {
       falla = null;
     },
     sock: {
-      async sendMessage(jid: string, contenido: { text: string }, opts: { messageId: string }) {
-        enviados.push({ jid, texto: contenido.text, waId: opts.messageId, at: reloj.now() });
+      async sendMessage(jid: string, contenido: ContenidoFalso, opts: { messageId: string }) {
+        enviados.push({
+          jid,
+          texto: contenido.text ?? contenido.caption ?? "",
+          waId: opts.messageId,
+          at: reloj.now(),
+          contenido,
+        });
         if (falla) throw new Error(falla);
         return {
           key: { id: opts.messageId, remoteJid: jid, fromMe: true },
-          message: { conversation: contenido.text },
+          // Baileys devuelve el proto que armó: para una imagen es un
+          // `imageMessage`, nunca un `conversation`.
+          message: contenido.image
+            ? { imageMessage: { caption: contenido.caption ?? "", mimetype: contenido.mimetype } }
+            : { conversation: contenido.text },
         };
       },
     },
@@ -485,6 +510,231 @@ describe("la fila optimista", () => {
       undefined,
     );
   });
+});
+
+// ── imágenes del portapapeles (`^V`) ────────────────────────────────────────
+//
+// Lo que se prueba acá NO es "que la imagen salga": es que **use la misma cola
+// que el texto**. El riesgo real de esta feature era abrirle un camino paralelo
+// —mandar la imagen derecho al socket— y saltearse el ritmo de RNF-8, que es lo
+// único que separa a wacosas de parecer un bot y comerse un ban (R8).
+
+/** Un PNG mínimo pero con la firma REAL: el mime sale de los bytes. */
+const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
+const imagen = (bytes: Uint8Array = PNG, mime = "image/png") => ({ bytes, mime });
+
+describe("enviar una imagen", () => {
+  test("va por la MISMA cola que el texto y respeta el ritmo de 1/s", async () => {
+    const a = armar();
+    // Mezcladas a propósito: si las imágenes tuvieran su propio camino, se
+    // adelantarían a los textos o saldrían todas juntas.
+    expect(a.cola.enqueue(ANTO, "mirá esto").ok).toBe(true);
+    expect(a.cola.enqueueImage(ANTO, imagen(), "la captura").ok).toBe(true);
+    expect(a.cola.enqueueImage(ANTO, imagen()).ok).toBe(true);
+    expect(a.cola.enqueue(ANTO, "listo").ok).toBe(true);
+
+    // Las cuatro filas ya están en `⏳` antes de que salga la primera (CA-9.1).
+    expect(a.repo.lastMessages(ANTO).map((m) => m.status)).toEqual([
+      "pending",
+      "pending",
+      "pending",
+      "pending",
+    ]);
+
+    await drenar(a);
+
+    expect(a.falso.enviados.length).toBe(4);
+    // RNF-8, exactamente igual que con cuatro textos: uno por segundo y en orden.
+    expect(offsets(a)).toEqual([0, 1000, 2000, 3000]);
+    expect(a.falso.enviados.map((e) => !!e.contenido.image)).toEqual([false, true, true, false]);
+    expect(a.repo.lastMessages(ANTO).every((m) => m.status === "sent")).toBe(true);
+  });
+
+  test(`el ${MAX_PER_WINDOW + 1}.º del minuto también espera si es una imagen`, async () => {
+    const a = armar();
+    for (let i = 1; i <= MAX_PER_WINDOW; i++) a.cola.enqueue(ANTO, `m${i}`);
+    a.cola.enqueueImage(ANTO, imagen(), "la que se pasa del tope");
+    await drenar(a, 2_000);
+
+    expect(a.falso.enviados.length).toBe(MAX_PER_WINDOW + 1);
+    // El tope de 20 por minuto no distingue imágenes de textos.
+    expect(offsets(a)[MAX_PER_WINDOW]).toBe(60_000);
+    expect(a.toasts).toContain(AVISO_EN_COLA);
+  });
+
+  test("una imagen que falla se reintenta 3 veces con 1/3/9 s y termina en failed", async () => {
+    const a = armar();
+    a.falso.fallarSiempre("la subida se cortó");
+    expect(a.cola.enqueueImage(ANTO, imagen(), "esta no va a salir").ok).toBe(true);
+
+    await drenar(a);
+
+    // Mismos reintentos que un texto (RNF-9): 1 intento + 3.
+    expect(a.falso.enviados.length).toBe(SEND_MAX_ATTEMPTS + 1);
+    const t = offsets(a);
+    expect([t[1], t[2], t[3]]).toEqual([1_000, 4_000, 13_000]);
+    // Y siempre el MISMO id: un reintento no es un mensaje nuevo (D7).
+    expect(new Set(a.falso.enviados.map((e) => e.waId)).size).toBe(1);
+    // Los bytes viajaron en los cuatro intentos: el job los lleva en memoria.
+    expect(a.falso.enviados.every((e) => (e.contenido.image as Buffer)?.length === PNG.length)).toBe(true);
+
+    const fila = a.repo.lastMessages(ANTO)[0];
+    expect(fila?.status).toBe("failed");
+    expect(fila?.error).toBe("la subida se cortó");
+  });
+
+  test("la fila optimista se ve como imagen, con el caption debajo", async () => {
+    const a = armar();
+    const r = a.cola.enqueueImage(ANTO, imagen(), "  mirá la terminal  ");
+    expect(r.ok).toBe(true);
+
+    const fila = a.repo.lastMessages(ANTO)[0];
+    expect(fila?.kind).toBe("image");
+    expect(fila?.fromMe).toBe(true);
+    // El placeholder es el MISMO que el de una imagen recibida (CA-7.1): la
+    // conversación pinta `📷 imagen` y el caption abajo (CA-7.2).
+    expect(fila?.attachment?.label).toBe("📷 imagen");
+    expect(fila?.attachment?.mimetype).toBe("image/png");
+    // El caption se recorta en las puntas, igual que un mensaje de texto.
+    expect(fila?.body).toBe("mirá la terminal");
+    // ⚠️ CA-7.4 en el otro sentido: en la base NO queda ni un byte de la imagen.
+    expect(JSON.stringify(fila?.attachment)).not.toContain("bytes");
+    // Y el preview de la bandeja lleva las dos cosas.
+    expect(a.repo.getChat(ANTO)?.lastPreview).toBe("📷 imagen · mirá la terminal");
+
+    await drenar(a);
+    // A WhatsApp le fue la imagen con su mime, el caption y NUESTRO id (D7).
+    const enviado = a.falso.enviados[0];
+    expect(Array.from(enviado?.contenido.image as Buffer)).toEqual(Array.from(PNG));
+    expect(enviado?.contenido.mimetype).toBe("image/png");
+    expect(enviado?.contenido.caption).toBe("mirá la terminal");
+    expect(enviado?.waId).toBe(r.waId as string);
+  });
+
+  test("sin caption no se manda un caption vacío (y el mensaje es válido igual)", async () => {
+    const a = armar();
+    // CA-8.3 (vacío no manda nada) NO aplica: una foto sola es un mensaje.
+    expect(a.cola.enqueueImage(ANTO, imagen()).ok).toBe(true);
+    await drenar(a);
+    expect("caption" in (a.falso.enviados[0]?.contenido ?? {})).toBe(false);
+    expect(a.repo.lastMessages(ANTO)[0]?.body).toBe("");
+    expect(a.repo.getChat(ANTO)?.lastPreview).toBe("📷 imagen");
+  });
+
+  test("también en un grupo", async () => {
+    const a = armar();
+    expect(a.cola.enqueueImage(GRUPO, imagen(), "acá está").ok).toBe(true);
+    await drenar(a);
+    expect(a.falso.enviados[0]?.jid).toBe(GRUPO);
+    expect(a.repo.lastMessages(GRUPO)[0]?.status).toBe("sent");
+  });
+
+  test("el eco de WhatsApp tampoco duplica la imagen (CA-9.4)", async () => {
+    const a = armar();
+    const r = a.cola.enqueueImage(ANTO, imagen(), "una sola vez");
+    await drenar(a);
+    const eco = a.repo.insertMessage({
+      chatJid: ANTO,
+      waId: r.waId as string,
+      fromMe: true,
+      senderJid: SELF_NORM,
+      senderName: "",
+      ts: Math.floor(a.reloj.now() / 1000),
+      kind: "image",
+      body: "una sola vez",
+      attachment: { label: "📷 imagen" },
+      status: "sent",
+    });
+    expect(eco.inserted).toBe(false);
+    expect(a.repo.lastMessages(ANTO).length).toBe(1);
+  });
+
+  test("getMessage NO devuelve la imagen como si fuera un texto", async () => {
+    const a = armar();
+    const r = a.cola.enqueueImage(ANTO, imagen(), "el caption");
+    await drenar(a);
+    const msg = await a.cola.getMessage({ id: r.waId as string, remoteJid: ANTO, fromMe: true });
+    // Lo que se cachea es el proto que devolvió baileys. El bug que esto evita
+    // sería guardar `{conversation: caption}` de fallback: al re-cifrar por un
+    // retry receipt, la foto le llegaría al otro como un mensaje de texto suelto.
+    expect(msg?.imageMessage).toBeDefined();
+    expect(msg?.conversation).toBeUndefined();
+  });
+});
+
+// ── el tope de tamaño: rechazar ANTES de subir ──────────────────────────────
+
+describe("el tope de tamaño de una imagen", () => {
+  test("una imagen que se pasa se rechaza ANTES de tocar la red", async () => {
+    const a = armar();
+    // Un byte más que el tope. Lo importante no es el número: es que el rechazo
+    // ocurra sin haber subido nada.
+    const gorda = new Uint8Array(LIMITE_IMAGEN_BYTES + 1);
+    gorda.set(PNG, 0);
+
+    const r = a.cola.enqueueImage(ANTO, imagen(gorda), "esta no entra");
+    expect(r).toEqual({ ok: false, reason: motivoImagenGrande(gorda.length) });
+    // El mensaje tiene que ser entendible: qué pesa y cuál es el tope.
+    expect(r.reason).toContain("16 MB");
+
+    // Ni fila, ni preview, ni trabajo encolado…
+    expect(a.repo.lastMessages(ANTO)).toEqual([]);
+    expect(a.repo.getChat(ANTO)?.lastPreview).toBe("");
+    expect(a.cola.size()).toBe(0);
+    // …y sobre todo: NINGUNA llamada a la red. Ese es el punto del tope.
+    await drenar(a);
+    expect(a.falso.enviados.length).toBe(0);
+
+    // Control positivo: justo en el tope SÍ entra (el rechazo es `>`, no `>=`).
+    const justa = new Uint8Array(LIMITE_IMAGEN_BYTES);
+    justa.set(PNG, 0);
+    expect(a.cola.enqueueImage(ANTO, imagen(justa), "esta sí").ok).toBe(true);
+    await drenar(a);
+    expect(a.falso.enviados.length).toBe(1);
+  });
+
+  test("una imagen sin bytes no manda nada", async () => {
+    const a = armar();
+    expect(a.cola.enqueueImage(ANTO, imagen(new Uint8Array()))).toEqual({
+      ok: false,
+      reason: MOTIVO_IMAGEN_VACIA,
+    });
+    expect(a.repo.lastMessages(ANTO)).toEqual([]);
+  });
+
+  test("sin conexión tampoco se encola ni se inserta (CA-8.7)", async () => {
+    const a = armar();
+    a.abierta.valor = false;
+    expect(a.cola.enqueueImage(ANTO, imagen(), "quedate")).toEqual({
+      ok: false,
+      reason: MOTIVO_SIN_CONEXION,
+    });
+    expect(a.repo.lastMessages(ANTO)).toEqual([]);
+  });
+});
+
+// ── `Ctrl-Y` sobre una imagen ───────────────────────────────────────────────
+
+test("Ctrl-Y sobre una imagen fallada explica que ya no está en memoria", async () => {
+  // Consecuencia directa de no guardar bytes en la base (CA-7.4): los reintentos
+  // AUTOMÁTICOS funcionan (el job vive en memoria), pero un `^Y` de más tarde ya
+  // no tiene qué mandar. Lo que no puede pasar es que la tecla falle en silencio
+  // o, peor, que mande una imagen vacía.
+  const a = armar();
+  a.falso.fallarSiempre();
+  const r = a.cola.enqueueImage(ANTO, imagen(), "se cayó");
+  await drenar(a);
+  expect(a.repo.lastMessages(ANTO)[0]?.status).toBe("failed");
+
+  a.falso.curar();
+  expect(a.cola.retry(ANTO, r.waId as string)).toEqual({
+    ok: false,
+    reason: MOTIVO_IMAGEN_NO_REINTENTABLE,
+  });
+  await drenar(a);
+  // No salió NADA de más: ni una imagen vacía ni el caption como texto suelto.
+  expect(a.falso.enviados.length).toBe(SEND_MAX_ATTEMPTS + 1);
+  expect(a.falso.enviados.every((e) => !!e.contenido.image)).toBe(true);
 });
 
 // ── escalera del estado de entrega (⚠️ del plan) ────────────────────────────

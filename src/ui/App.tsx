@@ -20,7 +20,7 @@ import { clip } from "../lib/fmt";
 import { commands, etiquetaChat, SALTO_EXTREMO } from "../state/commands";
 import { useSlice } from "../state/hooks";
 import { store } from "../state/store";
-import { Composer, HINTS_COMPOSER } from "./Composer";
+import { type ApiComposer, Composer, HINTS_COMPOSER } from "./Composer";
 import { Conversation, HINTS_CONVO } from "./Conversation";
 import { ALTO_FOOTER, Footer } from "./Footer";
 import { ALTO_HEADER, Header } from "./Header";
@@ -199,6 +199,9 @@ export function App({
   // que mover la selección y abrir un resultado se le piden al overlay por esta
   // ref (§7.4.2). Lo que no se maneja acá cae en su `<input>`.
   const busquedaRef = useRef<ApiBusqueda | null>(null);
+  // Y con el campo de redacción, igual: el `^V` lo recibe este `useKeyboard` y
+  // baja por acá (§7.4.2, mismo patrón que `busquedaRef`).
+  const composerRef = useRef<ApiComposer | null>(null);
 
   const disposicion = disposicionDe(width);
 
@@ -419,7 +422,28 @@ export function App({
       // CA-8.5: `Esc` devuelve el foco a la bandeja CONSERVANDO el borrador. No
       // hay que hacer nada para conservarlo: cada tecla ya lo dejó guardado en
       // el store (`onContentChange`), y el campo ni siquiera se desmonta.
-      if (es("escape")) setModo("browse");
+      if (es("escape")) {
+        setModo("browse");
+        return;
+      }
+      // `^V`: pegar del portapapeles del SISTEMA (una imagen se manda, un texto
+      // se pega en el campo — ver `Composer.pegar`).
+      //
+      // ⚠️ **`^V` está LIBRE en el `<textarea>` de OpenTUI 0.4.2** (verificado en
+      // el fuente, `defaultTextareaKeyBindings`): no tiene binding, y su
+      // `handleKeyPress` corta con `return false` ante cualquier combinación con
+      // `ctrl` sin binding, así que no inserta nada ni pisa ninguna acción de
+      // edición. Es el chequeo que en la tarea 12 no se había hecho con `^K`
+      // —que sí estaba mapeado a `delete-to-line-end` y le borraba media
+      // búsqueda al usuario—, así que acá se hizo primero.
+      //
+      // Sólo vale en modo `compose`, o sea con el campo enfocado a propósito
+      // (`^E`) sobre un chat abierto: es una tecla que puede terminar mandando
+      // una imagen, y no puede dispararse desde la bandeja por accidente.
+      if (key.ctrl && es("v")) {
+        composerRef.current?.pegar();
+        return;
+      }
       return;
     }
 
@@ -785,6 +809,7 @@ export function App({
                   ancho={anchoConvo}
                   enfocado={modo === "compose"}
                   onEnfocar={() => setModo("compose")}
+                  apiRef={composerRef}
                 />
               ) : null}
             </box>
