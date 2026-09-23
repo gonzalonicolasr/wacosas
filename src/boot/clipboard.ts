@@ -24,7 +24,7 @@
 //     que dicen los bytes, no el que dijo el anuncio. Sin esto podríamos subirle
 //     a WhatsApp cualquier cosa.
 //
-// El orden de los backends es el que ya usa Gon en `miscosas`: `wl-paste`
+// El orden de los backends va del más capaz al menos capaz: `wl-paste`
 // (Wayland) → `xclip` → `xsel` → `pbpaste` (macOS), el primero que exista. Los
 // dos últimos **sólo saben de texto** —`xsel` no tiene forma de pedir un target
 // arbitrario y `pbpaste` necesitaría `osascript`—, así que ahí `^V` pega texto y

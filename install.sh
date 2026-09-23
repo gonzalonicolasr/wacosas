@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # wacosas — instalador local. Idempotente y sin sudo: se puede correr las veces
 # que haga falta. Deja el comando `wacosas` (+ alias corto `wa`) en ~/.local/bin
-# apuntando a este repo (CA-19.6, RNF-14).
+# apuntando a este repo.
 #
 # Uso:  git clone … && cd wacosas && ./install.sh
 set -euo pipefail
@@ -16,7 +16,7 @@ STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/wacosas"
 c "$WA" "▶ wacosas — instalación local"
 echo "  repo: $REPO"
 
-# ── Bun (RNF-13: no se soporta Node como runtime) ─────────────────────────
+# ── Bun (no se soporta Node como runtime) ───────────────────────────────
 BUN="$(command -v bun 2>/dev/null || true)"
 [ -z "$BUN" ] && BUN="$(mise which bun 2>/dev/null || true)"
 if [ -z "$BUN" ] && command -v mise >/dev/null 2>&1; then
@@ -40,7 +40,7 @@ else
   exit 1
 fi
 
-# ── Directorios de datos y de estado (CA-14.5, CA-14.6) ───────────────────
+# ── Directorios de datos y de estado ────────────────────────────────
 # El proceso igual los crea/endurece al arrancar (boot/paths.ts); acá se
 # adelantan para que el wrapper pueda escribir el log desde el vamos.
 mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
@@ -49,7 +49,7 @@ mkdir -p "${XDG_DATA_HOME:-$HOME/.local/share}/wacosas" \
 c "$OK" "  ✓ datos: ${XDG_DATA_HOME:-$HOME/.local/share}/wacosas   log: $STATE_DIR/wacosas.log"
 
 # ── Comando `wacosas` (+ alias corto `wa`) ────────────────────────────────
-# El wrapper redirige fd 2 al log (2>>): defensa en profundidad de RNF-4, por si
+# El wrapper redirige fd 2 al log (2>>): defensa en profundidad, por si
 # el dup2 por FFI del entry no levanta (otra libc, dlopen fallado). Los dos
 # caminos escriben al mismo archivo en modo append, así que no se pisan.
 mkdir -p "$BIN"

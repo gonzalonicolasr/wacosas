@@ -12,3 +12,7 @@ wacosas.lock
 # Basura del sistema / editor
 .DS_Store
 *.swp
+
+# Artefactos de herramientas de desarrollo (rutas y sesiones locales)
+.pi/
+.nodd/

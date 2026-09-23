@@ -10,7 +10,7 @@
 // Se corre con `bun run tools/demo-avatares.tsx <dir-con-avX.jpg>` y se captura
 // con `tmux capture-pane`. NO abre ningún socket ni toca la cuenta real: son
 // archivos locales.
-const RAIZ = "/home/gon/projects/wacosas";
+const RAIZ = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 
 const { colorDominante, renderizarImagen } = await import(`${RAIZ}/src/boot/chafa.ts`);
 const { legibleSobrePanel, ACCENT2, BORDER, FAINT, GOLD, MUT, SURFACE, TEXT_DIM } = await import(

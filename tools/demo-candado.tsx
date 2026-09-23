@@ -17,7 +17,7 @@
 // Sirve igual para el ocultamiento A MANO (`^X`): con `WACOSAS_CANDADO_CODE` ya
 // hay código fijado y la tecla anda; sin la variable, la demo arranca SIN código
 // y `^X` contesta que hay que fijarlo con `^P` primero.
-const RAIZ = "/home/gon/projects/wacosas";
+const RAIZ = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 
 const { openDb } = await import(`${RAIZ}/src/db/open.ts`);
 const { createRepo } = await import(`${RAIZ}/src/db/repo.ts`);

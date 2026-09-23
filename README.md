@@ -3,6 +3,19 @@
 Cliente de WhatsApp en la terminal (TUI), en un solo proceso: interfaz y conexión juntas, sin
 servicio aparte. Corre con **Bun**.
 
+> ## ⚠️ Cliente NO oficial: te pueden banear la cuenta
+>
+> wacosas **no está afiliado, asociado ni respaldado por WhatsApp LLC ni por Meta**. "WhatsApp" es
+> marca de ellos; acá no hay ningún acuerdo ni bendición de por medio.
+>
+> Es un cliente **no oficial**, construido sobre [Baileys](https://github.com/WhiskeySockets/Baileys),
+> que es una implementación de **ingeniería inversa** del protocolo de WhatsApp Web. Usar un cliente
+> no oficial **puede violar los Términos de Servicio de WhatsApp**, y eso **puede terminar en que te
+> suspendan o te baneen la cuenta**. No es un riesgo teórico ni una fórmula para cubrirse: es el
+> riesgo real que corrés, y lo corrés vos.
+>
+> El software se entrega **como está**, sin garantía de ningún tipo (ver [`LICENSE`](LICENSE)).
+
 > ## ⚠️ Aviso: la base local **NO se cifra**
 >
 > Todo el historial (chats, mensajes, contadores) vive en un SQLite en claro y las credenciales de
@@ -15,12 +28,11 @@ servicio aparte. Corre con **Bun**.
 > recibida, la **clave con la que se descifra** el archivo en el servidor de WhatsApp. O sea que quien
 > pueda leer el `.sqlite` puede además **bajarse las fotos** mientras WhatsApp las siga sirviendo. Es
 > una ampliación real de lo que ya quedaba expuesto, y está acá para que la sepas: el archivo en sí
-> **no** se guarda hasta que lo pedís.
+> se guarda cuando su foto entra en la conversación visible (o cuando la ampliás).
 
 **Estado: usable.** Vincula, sincroniza el historial, lista la bandeja, abre conversaciones, envía
 texto, marca leído, busca en todo lo guardado y sale limpio. Lo que **no** hace está en
-[Limitaciones conocidas](#limitaciones-conocidas) — leelas antes de esperar algo que no está. El plan
-completo (requisitos, diseño y tareas) vive en `.sdd/wa-tui/`.
+[Limitaciones conocidas](#limitaciones-conocidas) — leelas antes de esperar algo que no está.
 
 ## Requisitos
 
@@ -29,14 +41,15 @@ completo (requisitos, diseño y tareas) vive en `.sdd/wa-tui/`.
 - Linux con una terminal de al menos **80 × 24** (abajo de 60 × 15 te va a pedir que la agrandes).
 - *(opcional)* **`wl-clipboard`** —o `xclip` en X11— para pegar imágenes con `Ctrl-V`. Sin ninguno de
   los dos, todo lo demás anda igual y `Ctrl-V` te avisa que le falta el comando.
-- *(opcional)* **`chafa`** para **ver** las imágenes que te mandan (`Ctrl-O`) y para el color de cada
-  chat en la bandeja. Sin él, `Ctrl-O` te lo dice y te queda `o`, que abre la imagen en el visor del
-  sistema (`xdg-open`).
+- *(opcional)* **`chafa`** para preparar fotos inline y avatares reales. Para píxeles inline hace
+  falta **Ghostty directo, sin tmux**, y una respuesta positiva a la consulta Kitty. No alcanza
+  con la variable `TERM_PROGRAM`. Sin soporte se muestra un aviso, no bloques disfrazados de fotos;
+  `Ctrl-O` conserva el visor ampliado y `o` abre el visor del sistema (`xdg-open`).
 
 ## Instalación
 
 ```bash
-git clone <repo> wacosas && cd wacosas
+git clone https://github.com/gonzalonicolasr/wacosas.git && cd wacosas
 ./install.sh
 ```
 
@@ -99,16 +112,17 @@ Se respeta XDG; si no tenés las variables seteadas, los defaults son:
 | Código del candado (hash) | `~/.local/share/wacosas/lock-code.json` |
 | QR como PNG (sólo con `--qr-png`) | `~/.local/share/wacosas/qr.png` |
 | Marca de instancia única | `~/.local/share/wacosas/wacosas.lock` |
-| Imágenes que pediste ver (`Ctrl-O`) | `~/.local/share/wacosas/media/` |
+| Imágenes visibles y ampliaciones (`Ctrl-O`) | `~/.local/share/wacosas/media/` |
 | Fotos de perfil de la bandeja | `~/.local/share/wacosas/avatars/` |
 | Log | `~/.local/state/wacosas/wacosas.log` (+ `.log.1`) |
 
 Los directorios se crean solos al arrancar, con permisos `0700`, y los archivos con `0600`.
 
 **`media/` y `avatars/` son caché descartable**: borralos cuando quieras y no perdés nada —lo único
-que pasa es que la próxima vez se vuelven a bajar—. `media/` sólo tiene las imágenes que **pediste**
-ver con `Ctrl-O`; `avatars/` tiene las miniaturas de perfil de los chats que se te aparecieron en la
-bandeja, y de ahí sale el color de cada fila.
+que pasa es que la próxima vez se vuelven a bajar—. `media/` contiene las imágenes que entraron en el área visible de una conversación y las que
+ampliaste con `Ctrl-O`. Si el mensaje trae una miniatura JPEG, se usa esa primero y el original
+no se baja hasta ampliar. `avatars/` contiene las fotos de perfil de las filas visibles. Estas
+cachés de disco no tienen límite global ni borrado automático.
 
 Para desvincular la sesión y empezar de cero: cerrá wacosas y borrá `~/.local/share/wacosas/creds/`.
 
@@ -198,7 +212,7 @@ más. Así que `Ctrl-V` no *recibe* la imagen: es la tecla con la que le decís 
 
 | Backend | Sirve para | Dónde |
 | --- | --- | --- |
-| **`wl-paste`** (paquete `wl-clipboard`) | **imágenes** y texto | Wayland — el que usa Gon |
+| **`wl-paste`** (paquete `wl-clipboard`) | **imágenes** y texto | Wayland |
 | **`xclip`** | **imágenes** y texto | X11 |
 | `xsel` | sólo texto | X11 |
 | `pbpaste` | sólo texto | macOS |
@@ -246,13 +260,16 @@ Un solo proceso Bun con los dos mundos adentro y **un límite explícito** entre
   conversión de imágenes a celdas de color (`chafa.ts`). Los dos con timeout y tope de tamaño, porque
   un proceso externo puede no existir, colgarse o devolver basura.
 
-**Las imágenes se dibujan con `chafa`, no con el protocolo gráfico de la terminal**, aunque Ghostty
-lo soporte y se vea mejor: **OpenTUI es el dueño de la pantalla** y una imagen escrita por fuera de
-su buffer la pisa el frame siguiente. `chafa` devuelve celdas de texto con color —medio bloque `▄`,
-dos píxeles por celda—, que entran en el layout como cualquier otro texto. Es el mismo camino que ya
-usaba el QR de vinculación.
+**Las fotos inline son píxeles reales, no medios bloques.** `chafa` sólo decodifica y reduce la
+foto a RGBA; `boot/pixels.ts` descarta sus secuencias y transmite esos píxeles como imágenes
+virtuales Kitty (`U=1`). OpenTUI dibuja los placeholders Unicode con ID/color y coordenadas de
+cada celda: el mismo buffer controla scroll, recorte, capas y redibujado. No se suspende la TUI
+ni se posicionan imágenes por encima del renderer. El transporte usa la salida nativa ordenada
+de OpenTUI 0.4.2. El soporte se verificó en Ghostty 1.3.1 directo; tmux queda deshabilitado para
+inline (no se verificó el passthrough de placeholders).
 
-El diseño completo (con los gotchas ya pagados, que son varios) está en `.sdd/wa-tui/design.md`.
+El visor aparte (`Ctrl-O`) sigue disponible: `⏎` pide calidad real a pantalla completa,
+suspendiendo temporalmente la TUI, y `o` abre el original en el visor del sistema.
 
 ### El log
 
@@ -336,10 +353,21 @@ enlaza el dispositivo, y no hay forma de pedirla después. En la cuenta donde se
 después de re-vincular aparecieron 3 claves donde había 2 y llegaron los 11 chats con candado. El
 historial local **no se pierde** al re-vincular (la base es aparte de `creds/`).
 
-wacosas lo repara solo: **30 segundos después de conectar** mira qué colecciones no quedaron al día y
-le pide a WhatsApp **sólo esas**. Si la sincronización de Baileys anduvo bien, no encuentra nada que
-pedir y no manda ni una consulta. Está topeado (tres reparaciones por proceso, una por conexión) y se
-apaga solo si un intento no trae nada nuevo: es una reparación, no un reintento en loop.
+**Actualización automática al abrir o volver a vincular (2026-09-09):** 30 segundos después de
+cada conexión, wacosas pide las cinco colecciones de app-state desde sus versiones guardadas,
+incluso si todas tienen estado local. Actualiza datos de chats y contactos; los mensajes pendientes
+entran por los eventos normales de Baileys. No borra la base, no cierra sesión y no pide el historial
+antiguo completo. Cerrar la app con `Ctrl-C` conserva la vinculación.
+
+El pedido se cancela si la conexión se cierra antes de ejecutarlo. Las reconexiones rápidas respetan
+un mínimo de 60 segundos entre actualizaciones automáticas, sin solaparse con `Ctrl-N` ni con una
+reparación en curso. El pie avisa si la actualización falló o quedó parcial: no se anuncia que todo
+el historial está sincronizado. Si quedan colecciones pendientes, sigue el diagnóstico y la
+reparación acotada (hasta tres reparaciones por proceso), sin un bucle de reintentos ilimitado.
+
+Contrato consultado: Baileys instalado, `lib/Socket/chats.js` (`resyncAppState` y el handler de
+`receivedPendingNotifications`). La sincronización inicial al re-vincular sigue siendo la de
+Baileys; esta actualización incremental no reemplaza la entrega de historial del teléfono.
 
 Queda un caso que **puede** no tener arreglo del lado de la app. A veces WhatsApp manda una colección
 cifrada con una clave que tu teléfono nunca compartió con esta sesión; Baileys la reintenta dos veces
@@ -471,32 +499,31 @@ alguien que ya está sentado en tu sesión: esa persona puede volver a fijar el 
 (no se pide el anterior, justamente para que no te quedes afuera si lo olvidás) y, sobre todo, puede
 abrir la base con `sqlite3` y leer todo sin preguntarle nada a nadie.
 
-### Imágenes: se ven con `Ctrl-O`, y **sólo las que pedís**
+### Imágenes dentro de la conversación, sin `Ctrl-O`
 
-Una imagen que te llega se sigue viendo `📷 imagen` en la conversación. **No se baja sola**: con el
-chat abierto, `Ctrl-O` abre una pantalla con las fotos de ese chat, dibujadas con bloques de color, y
-`←`/`→` te mueve entre ellas. La que estás mirando es la única que se baja; con `o` la abrís en el
-visor del sistema cuando la terminal no alcanza.
+Al abrir una conversación, las fotos **visibles** se cargan automáticamente y se muestran entre
+los mensajes, con el epígrafe debajo. Se reserva un espacio de hasta **32 columnas × 8 filas**;
+la foto conserva su proporción y usa píxeles reales dentro de ese espacio. `Ctrl-O` sigue
+ampliando y recorriendo los originales; `⏎` dentro del visor pide calidad real a pantalla completa.
 
-Lo que eso cambió respecto de la regla original (**CA-7.4**, "no descargar ni escribir archivos"), y
-lo que **no**:
+**Privacidad y descargas automáticas:**
 
-- **se baja sólo lo que pedís, de a una.** Nada de prefetch, nada en el sync de historial, nada al
-  arrancar. Sin apretar `Ctrl-O` no se baja ni un byte;
-- **queda en `~/.local/share/wacosas/media/`**, `0700` el directorio y `0600` cada archivo. Es caché:
-  borralo cuando quieras. Mirar dos veces la misma foto no la baja dos veces;
-- **el `.sqlite` sigue sin un solo byte de archivo adentro.** Lo que se guarda por imagen son ~90
-  bytes de texto: la **referencia** para poder volver a bajarla (⚠️ ahí adentro va la clave con la
-  que se descifra, y **la base no se cifra** — ver más abajo);
-- **audio, video, documentos y stickers no se bajan ni se pueden mandar.** Sólo imágenes;
-- **las imágenes anteriores a esta versión no se pueden ver.** No guardábamos la referencia y WhatsApp
-  no reenvía un mensaje viejo: `Ctrl-O` te las lista igual y te dice por qué esa no se puede abrir.
-  Las que lleguen de acá en adelante, sí;
-- **WhatsApp borra los archivos viejos de su servidor.** Si pasó mucho tiempo, la pantalla te lo dice
-  con todas las letras en vez de quedarse pensando.
-
-Para **dibujarlas** hace falta **`chafa`** instalado (`pacman -S chafa`, `apt install chafa`). Sin él,
-`Ctrl-O` te lo dice y te queda `o` para abrirla en el visor.
+- no se descarga todo el historial ni las imágenes fuera del viewport. Scroll y cambio de chat
+  descartan los pedidos pendientes que dejaron de verse; una descarga ya iniciada puede terminar
+  en la caché privada, pero nunca se pinta en otro chat;
+- si el mensaje trae `jpegThumbnail`, se conserva esa miniatura JPEG (máximo **64 KiB**, base64 en
+  el SQLite **sin cifrar**) y se usa sin pedir el original. Los mensajes viejos sin miniatura
+  usan la referencia guardada para bajar el original automáticamente cuando entran en pantalla;
+- los pedidos/conversiones inline son seriales, con un segundo entre trabajos y caché de hasta
+  32 resultados. Las colocaciones de terminal se liberan al salir de pantalla; no quedan fotos
+  flotando sobre el siguiente chat. El archivo original se deduplica y queda en `media/`;
+- `media/` tiene permisos `0700` y cada archivo `0600`. Las miniaturas usan archivos separados
+  (`*.thumb.jpg`), así que ampliar nunca confunde una miniatura con el original;
+- sin referencia ni miniatura (historial antiguo), con archivo vencido en WhatsApp, error de red,
+  falta de `chafa` o terminal sin soporte, aparece un texto explicativo. No se intenta dibujar
+  bloques como reemplazo de una foto real;
+- audio, video, documentos y stickers siguen sin descargarse. Los originales tienen tope de
+  16 MB; no se piden reenvíos de archivos vencidos.
 
 **Mandar** una imagen (`Ctrl-V`) es otra cosa y sigue igual: son bytes que ya elegiste vos y que van y
 vuelven **en memoria**, sin tocar el disco. **Consecuencia práctica**: si una imagen que mandaste
@@ -504,22 +531,17 @@ falla, **`Ctrl-Y` no la puede reintentar** —esos bytes no están guardados en 
 reintentos automáticos (1/3/9 s) sí funcionan; para uno manual hay que volver a copiarla y `Ctrl-V`
 de nuevo. La app te lo dice cuando pasa.
 
-### El color de cada chat sale de su foto de perfil
+### Fotos de perfil pequeñas al lado de cada chat
 
-El `▪`/`▣` de cada fila de la bandeja está teñido con el color más vivo de la foto de perfil de esa
-persona. Es para recorrer la lista con el ojo; **la foto no se dibuja** —en una o dos celdas una cara
-es una mancha, y probado al lado del glifo teñido se ve peor—.
+Cada fila reserva **8 columnas × 4 filas** para la foto real de perfil: a 80×24 entran menos chats
+que antes, pero se ve la persona en lugar de un cuadrado teñido. Nombre, indicador de grupo,
+fecha, no leídos y selección siguen al lado; `PgUp`/`PgDn` saltan esa nueva ventana visible.
 
-Lo que cuesta, porque acá hay ~890 chats y cada foto es una consulta a WhatsApp:
-
-- **sólo se piden las filas que se VEN** (a 80×24 son 18), y recién cuando aparecen;
-- **una vez por chat y para siempre**: la miniatura queda en `~/.local/share/wacosas/avatars/` y el
-  arranque siguiente no consulta nada. Lo que **no** tiene foto también se anota, y se vuelve a
-  preguntar recién a los 7 días;
-- **de a una y espaciadas** (una por segundo, el mismo ritmo que los envíos). Si scrolleás los 890
-  chats de un saque, terminar de pintarse le lleva unos 15 minutos — y está bien que así sea;
-- si el contacto no tiene foto, no te la comparte, no hay conexión o falta `chafa`, el glifo queda del
-  color de siempre y no pasa nada más.
+Sólo se consultan las filas visibles, en serie y espaciadas a un segundo. Al scrollear, la cola
+se reemplaza por las nuevas filas (no sigue bajando todos los chats recorridos). La miniatura
+`preview` de WhatsApp queda en `avatars/` con permisos privados; una foto cacheada no vuelve a
+consultar la red. La marca de falta de foto vale siete días. Sin foto o sin permiso aparece el
+indicador de siempre; no se inventa un avatar ni se reemplaza por un promedio de color.
 
 ### Un chat abre con 500 mensajes, y no hay "cargar más"
 
@@ -591,7 +613,7 @@ terminal, **no** contra alguien sentado en tu sesión.
 ### Lo que directamente no está en v1
 
 Bajar audio, video, documentos y stickers (se ven como `🎤 audio 0:12`, `🎬 video 1:07`,
-`📎 informe.pdf` y nada más — las **imágenes** sí se ven, con `Ctrl-O`), enviar cualquier cosa que no
+`📎 informe.pdf` y nada más — las **imágenes** sí se ven inline y se amplían con `Ctrl-O`), enviar cualquier cosa que no
 sea texto o una imagen (`Ctrl-V`), reacciones, responder citando, editar, borrar para todos,
 reenviar, fijar, archivar, silenciar, bloquear, llamadas, estados, administrar grupos (leer y
 escribir texto en grupos **sí**), multi-cuenta, notificaciones del sistema, y **cifrado de la base**.
