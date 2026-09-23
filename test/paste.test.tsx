@@ -16,7 +16,7 @@
 //     nada — de que `wl-paste` no cuelgue se encarga `clipboard.test.ts`.
 //   · **NADA toca la cuenta real de WhatsApp**: no hay socket de verdad en todo
 //     el archivo, y la única imagen que existe son 12 bytes con firma de PNG.
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { testRender } from "@opentui/react/test-utils";
 import { act } from "react";
 
@@ -25,7 +25,7 @@ import { MOTIVO_SIN_BACKEND, MOTIVO_TIMEOUT } from "../src/boot/clipboard";
 import { openDb } from "../src/db/open";
 import { createRepo, type Repo } from "../src/db/repo";
 import { commands, configureCommands, type CommandDeps } from "../src/state/commands";
-import { store } from "../src/state/store";
+import { store, TOAST_MS } from "../src/state/store";
 import { App } from "../src/ui/App";
 import { createSendQueue, LIMITE_IMAGEN_BYTES, type SendQueue } from "../src/wa/send";
 
@@ -99,6 +99,25 @@ beforeEach(() => {
 afterEach(() => {
   store.setOpenChat(null);
   store.setDraft(ANTO, "");
+  store.flushNow();
+});
+
+/**
+ * El `store` es el SINGLETON del proceso y varios de estos tests dejan un aviso
+ * efímero VIVO (`^V` sin nada que pegar avisa "el portapapeles está vacío"). Ese
+ * aviso se apaga solo a los `TOAST_MS` de reloj de pared, pero el archivo entero
+ * corre en ~0,5 s: sin drenarlo, el toast SOBREVIVE al archivo y se pinta en el
+ * pie del primer test de otro archivo que mire el footer. Así rompía los cuatro
+ * `la ayuda a N×M se lee sin filas encimadas` de `ui.test.tsx`, que leen el pie
+ * esperando "Esc / ? cerrar la ayuda" y encontraban el aviso de acá.
+ *
+ * Se espera una sola vez, al final, y no en cada `afterEach`: dentro de este
+ * archivo los tests ya se toleran entre sí (`montarEnCompose` mira el
+ * placeholder del campo, no el pie).
+ */
+afterAll(async () => {
+  const toast = store.getSnapshot("ui").toast;
+  if (toast) await Bun.sleep(Math.max(0, TOAST_MS - (Date.now() - toast.at)) + 20);
   store.flushNow();
 });
 

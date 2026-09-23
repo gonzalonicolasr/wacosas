@@ -52,7 +52,7 @@ const ATAJOS_CONVO = [
   // `^V` (pegar del portapapeles) vive en la columna de TEXTO y no en la de
   // teclas: `^E ⏎ Alt-⏎ ^V ^Y` mide justo `COL` y `padEnd` no dejaría espacio.
   "^E ⏎ Alt-⏎ ^Y   escribir · enviar · salto · ^V pegar imagen · reintentar",
-  "^O              ver las imágenes del chat (← → cambiar · o abre el visor)",
+  "^O              ver las imágenes (⏎ calidad real · o el visor)",
 ];
 const ATAJOS_MINI = [
   "⏎               entrar a la conversación",
@@ -142,6 +142,8 @@ function cablearComandos() {
     } as CommandDeps["wa"],
     appstate: {
       onOpen() {},
+      onConnectionOpen() {},
+      onConnectionClose() {},
       force() {
         visto.resyncs++;
       },

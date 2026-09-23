@@ -211,14 +211,29 @@ async function correr(cuerpo: string, logPath: string) {
   return { code, salidaStdout, salidaStderr };
 }
 
-/** Registra los dos handlers que hacen que Bun escupa el warning por fd 2. */
-const abrirWs = `
-  const WebSocket = require("ws");
-  const s = new WebSocket("ws://127.0.0.1:9/");
-  s.on("upgrade", () => {});
-  s.on("unexpected-response", () => {});
-  s.on("error", () => {});
-  await new Promise((r) => setTimeout(r, 200));
+/**
+ * Escritura NATIVA al fd 2, que es lo único que este test puede probar.
+ *
+ * Antes acá se abría un `ws` porque Bun escupía por fd 2 un
+ * `[bun] Warning: ws.WebSocket 'upgrade' event is not implemented in bun`. En
+ * Bun 1.4.2 ese warning ya no se emite y el fixture se quedó sin señal (el dup2
+ * seguía bien: el log quedaba vacío, no con basura).
+ *
+ * El reemplazo es un PROCESO HIJO que hereda el fd 2 y escribe ahí. Es la misma
+ * clase de escritura que el dup2 existe para capturar: no pasa por el
+ * `process.stderr.write` de este runtime, así que parchearlo no la vería — el
+ * único modo de que termine en el log es que el descriptor 2 apunte al log.
+ * Verificado por contraprueba: sin el dup2 estas líneas salen por la terminal y
+ * el log queda vacío.
+ */
+const MARCA_FD2 = "ws.WebSocket 'upgrade' event is not implemented in bun";
+const MARCA_FD2_B = "ws.WebSocket 'unexpected-response' event is not implemented in bun";
+const escribirNativoAFd2 = `
+  const hijo = Bun.spawn(
+    ["/bin/sh", "-c", 'printf "%s\\n%s\\n" "$1" "$2" >&2', "sh", ${JSON.stringify(`[bun] Warning: ${MARCA_FD2}`)}, ${JSON.stringify(`[bun] Warning: ${MARCA_FD2_B}`)}],
+    { stdout: "inherit", stderr: "inherit" },
+  );
+  await hijo.exited;
 `;
 
 test("si no se puede redirigir, devuelve false con motivo y no lanza (R1 del §9)", () => {
@@ -238,7 +253,7 @@ test("los warnings de ws terminan en el log y no en la terminal (RNF-4, CA-16.2)
     `
     const { redirectStderrTo } = await import("${stderrTs}");
     if (!redirectStderrTo(process.env.WACOSAS_LOG)) { console.log("SIN_DUP2"); process.exit(3); }
-    ${abrirWs}
+    ${escribirNativoAFd2}
     process.exit(0);
   `,
     p,
@@ -269,7 +284,7 @@ test("después de rotar, el fd 2 redirigido sigue escribiendo en el log activo",
     const log = createLogger(p);
     require("node:fs").appendFileSync(p, "z".repeat(5 * 1024 * 1024) + "\\n");
     log.info("rotacion.forzada");
-    ${abrirWs}
+    ${escribirNativoAFd2}
     process.exit(0);
   `,
     p,
