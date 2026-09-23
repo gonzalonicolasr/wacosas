@@ -44,10 +44,10 @@ if (process.env.WACOSAS_DEMO_SEED !== "0") {
       [jid, nombre, grupo, ahora - hace, prev, unread],
     );
 
-  chat(ANTO, "anto 🌻", 0, 60, "dale, nos vemos", 0);
+  chat(ANTO, "caro 🌻", 0, 60, "dale, nos vemos", 0);
   chat(GRUPO, "Grupo mañana", 1, 900, "quedamos 8am", 3);
   db.run(
-    `INSERT OR REPLACE INTO contacts (jid, name, phone) VALUES (?, 'Antonella', '549115000001')`,
+    `INSERT OR REPLACE INTO contacts (jid, name, phone) VALUES (?, 'Carolina', '549115000001')`,
     [ANTO],
   );
 
@@ -66,7 +66,7 @@ if (process.env.WACOSAS_DEMO_SEED !== "0") {
         `A${i}`,
         propio ? 1 : 0,
         propio ? "self@s.whatsapp.net" : ANTO,
-        propio ? "yo" : "anto 🌻",
+        propio ? "yo" : "caro 🌻",
         ahora - (900 - i) * 60,
         "text",
         propio ? `mensaje propio número ${i}` : `mensaje de ella número ${i}`,
@@ -92,7 +92,7 @@ if (process.env.WACOSAS_DEMO_SEED !== "0") {
         `X${k}`,
         status === "read" ? 1 : 0,
         status === "read" ? "self@s.whatsapp.net" : ANTO,
-        status === "read" ? "yo" : "anto 🌻",
+        status === "read" ? "yo" : "caro 🌻",
         ahora - 60 * (9 - n),
         kind,
         body,
@@ -120,7 +120,7 @@ if (process.env.WACOSAS_DEMO_SEED !== "0") {
         waId,
         0,
         ANTO,
-        "anto 🌻",
+        "caro 🌻",
         // Las más NUEVAS del chat: así `^O` abre directo en una que se puede
         // ver, y la que quedó sin referencia (`X0`) está una a la derecha.
         ahora - 20 * (2 - n),
@@ -374,7 +374,7 @@ process.on("SIGUSR2", () => {
       waId: `NUEVO${process.pid}-${n}`,
       fromMe: false,
       senderJid: jid,
-      senderName: "anto 🌻",
+      senderName: "caro 🌻",
       ts,
       kind: "text",
       body: `mensaje inyectado a mano número ${n}`,
