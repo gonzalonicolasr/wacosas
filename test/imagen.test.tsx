@@ -35,6 +35,8 @@ let visto: {
   bajadas: number[];
   visor: number[];
   render: Array<[number, number]>;
+  /** Las rutas que se pidieron VER EN GRANDE (`⏎`), en orden. */
+  grande: string[];
   fallar: string | null;
 };
 
@@ -80,7 +82,7 @@ function baseCon(conReferencia: boolean): Repo {
 }
 
 function cablear(r: Repo): void {
-  visto = { bajadas: [], visor: [], render: [], fallar: null };
+  visto = { bajadas: [], visor: [], render: [], grande: [], fallar: null };
   configureCommands({
     repo: r,
     wa: { isOpen: () => true } as CommandDeps["wa"],
@@ -102,6 +104,13 @@ function cablear(r: Repo): void {
       return { ok: true as const, filas: CELDAS };
     },
     abrirArchivo: (ruta: string) => visto.visor.push(Number(ruta.replace(/\D/g, ""))),
+    // ⚠️ El renderer y el visor van INYECTADOS: `verEnGrande` de verdad suspende
+    // la terminal y la pone en modo crudo, y acá la terminal es la de `bun test`.
+    renderer: { suspend() {}, resume() {} },
+    visor: async (o) => {
+      visto.grande.push(o.ruta);
+      return { ok: true as const, calidad: "kitty" as const };
+    },
     shutdown() {},
   });
 }
@@ -248,6 +257,44 @@ test("un fallo de descarga se lee en la pantalla, no voltea nada", async () => {
   const frame = t.captureCharFrame();
   expect(frame).toContain("WhatsApp ya no tiene esta imagen");
   expect(frame).toContain("imagen 1 de 2"); // la pantalla sigue en pie
+});
+
+// ── calidad real (`⏎`) ───────────────────────────────────────────────────────
+
+test("⏎ manda la imagen que se está mirando a la vista de calidad real", async () => {
+  const t = await montar();
+  commands.openChat(ANA);
+  await pintar(t);
+  await tecla(t, "o", { ctrl: true });
+  await tecla(t, "RETURN");
+
+  // La que se está MIRANDO (la más nueva), no otra: el id sale del mensaje.
+  expect(visto.grande).toHaveLength(1);
+  expect(visto.grande[0]).toContain("/tmp/foto-");
+  // Y la pantalla sigue siendo la de las imágenes: al volver de la suspensión,
+  // la TUI está donde estaba (no se cambió de modo ni se cerró nada).
+  expect(t.captureCharFrame()).toContain("imagen 1 de 2");
+});
+
+test("⏎ sobre una imagen que no se pudo bajar avisa y no suspende nada", async () => {
+  const t = await montar();
+  commands.openChat(ANA);
+  await pintar(t);
+  await tecla(t, "o", { ctrl: true });
+  // La segunda es la del historial viejo, sin referencia: no hay archivo.
+  await tecla(t, "ARROW_RIGHT");
+  await tecla(t, "RETURN");
+
+  expect(visto.grande).toEqual([]);
+  expect(t.captureCharFrame()).toContain("no guardamos la referencia");
+});
+
+test("el pie de la pantalla de imágenes anuncia la calidad real", async () => {
+  const t = await montar();
+  commands.openChat(ANA);
+  await pintar(t);
+  await tecla(t, "o", { ctrl: true });
+  expect(t.captureCharFrame()).toContain("⏎ calidad real");
 });
 
 // ── el visor del sistema ─────────────────────────────────────────────────────

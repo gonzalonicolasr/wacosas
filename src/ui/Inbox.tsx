@@ -1,16 +1,9 @@
-// La bandeja: buscador siempre activo, filas de una línea y mouse (CA-4.*,
+// La bandeja: buscador siempre activo, filas de dos líneas y mouse (CA-4.*,
 // CA-5.*, CA-10.2/10.4, CA-19.7).
 //
 // Cinco cosas que gobiernan este archivo:
 //
-//  1. **Cada fila mide EXACTAMENTE una línea** (`height={1}` + `wrapMode="none"`
-//     + `clip()` sobre cada string, §7.4.1). No es cosmético, y las tres cosas
-//     van por motivos distintos: sin `height={1}` un texto más largo que el panel
-//     se mide en dos renglones desde el PRIMER frame, empuja a las filas de abajo
-//     y la lista queda corrida (CA-19.7); `wrapMode="none"` recupera las columnas
-//     que el wrap se comía. (Lo que NO pasa —refutado en la tarea 18 con
-//     `mockMouse`, §7.4— es que un evento de mouse re-mida el `<text>`: el frame
-//     sale idéntico antes y después de mover y clickear.)
+//  1. Cada fila reserva dos líneas, con una foto real compacta de 2×1 celdas.
 //  2. **Las filas que se pintan se PRESUPUESTAN, no se recortan.** OpenTUI no
 //     esconde a los hijos que no entran en el alto de una caja: los dibuja
 //     ENCIMADOS. Por eso la ventana visible se calcula a mano (`ventana()`) y se
@@ -29,6 +22,7 @@
 //     El `<input>` de OpenTUI toma el valor por su cuenta; forzarle el texto en
 //     cada render le movería el cursor. Sólo se le escribe cuando alguien lo
 //     cambió desde afuera (el `Esc` que limpia la búsqueda, CA-5.4).
+import { PixelImage } from "./PixelImage";
 import type { InputRenderable, KeyBinding, MouseEvent } from "@opentui/core";
 import { useEffect, useMemo, useRef } from "react";
 
@@ -40,6 +34,9 @@ import { ACCENT, ACCENT2, ELEVATED, FAINT, GOLD, INPUT_FG, legibleSobrePanel, MU
 
 /** El buscador se lleva una fila del panel; el resto es lista. */
 export const ALTO_BUSCADOR = 1;
+export const ALTO_CHAT = 2;
+const ANCHO_AVATAR = 2;
+const ALTO_AVATAR = 1;
 
 /** CA-5.6: dos clicks sobre la MISMA fila dentro de esta ventana abren el chat. */
 export const DOBLE_CLICK_MS = 350;
@@ -129,30 +126,29 @@ type PropsFila = {
    * no tiene / todavía no llegó. Ver `GLIFO` más abajo.
    */
   color?: string;
+  photo?: string | null;
   onClick: (jid: string) => void;
 };
 
-function Fila({ chat, seleccionada, ahoraSeg, cols, color, onClick }: PropsFila) {
+function Fila({ chat, seleccionada, ahoraSeg, cols, color, photo, onClick }: PropsFila) {
   const sinLeer = chat.unreadCount > 0;
   const badge = badgeDe(chat.unreadCount);
   const fecha = fmtRelDate(chat.lastMessageAt, ahoraSeg);
-  // ⚠️ El color de la foto tiñe el glifo que YA estaba, no agrega columnas: a una
-  // o dos celdas una miniatura es una mancha, y el ancho de la bandeja es lo más
-  // escaso que hay (34 columnas fijas en `compact`). Lo que distingue grupo de
-  // 1:1 sigue siendo la FORMA (`▣` vs `▪`), así que CA-4.8 se cumple igual aunque
-  // el color pase a ser el de la persona.
   const colorGlifo = color ?? (chat.isGroup ? ACCENT2 : FAINT);
 
   return (
     <box
       flexDirection="row"
-      height={1}
+      height={ALTO_CHAT}
       flexShrink={0}
       paddingLeft={1}
       paddingRight={1}
       backgroundColor={seleccionada ? SELBG : undefined}
       onMouseDown={() => onClick(chat.jid)}
     >
+      <box width={ANCHO_AVATAR + 1} flexShrink={0}>
+        <PixelImage source={photo ?? null} cols={ANCHO_AVATAR} rows={ALTO_AVATAR} visible={true} compact fallback={chat.isGroup ? "▣ grupo" : "▪ sin foto"} />
+      </box>
       <box width={ANCHO_GLIFO + cols.nombre} flexShrink={0}>
         <text wrapMode="none">
           {/* CA-4.8: el grupo se distingue por glifo Y por color. */}
@@ -237,7 +233,7 @@ export function Inbox({
     0,
     visibles.findIndex((c) => c.jid === jidSel),
   );
-  const filasLista = Math.max(0, alto - ALTO_BUSCADOR);
+  const filasLista = Math.max(0, Math.floor((alto - ALTO_BUSCADOR) / ALTO_CHAT));
   const desde = (desdeRef.current = ventana(visibles.length, idxSel, filasLista, desdeRef.current));
   const enPantalla = visibles.slice(desde, desde + filasLista);
 
@@ -253,7 +249,7 @@ export function Inbox({
   const usable = Math.max(0, ancho - 2); // paddingLeft + paddingRight de la fila
   const reservaDerecha = 1 + anchoFecha + (anchoBadge > 0 ? anchoBadge + 1 : 0);
   const cols = {
-    ...repartirColumnas(Math.max(0, usable - ANCHO_GLIFO - reservaDerecha)),
+    ...repartirColumnas(Math.max(0, usable - ANCHO_AVATAR - 1 - ANCHO_GLIFO - reservaDerecha)),
     fecha: anchoFecha,
     badge: anchoBadge > 0 ? anchoBadge + 1 : 0,
   };
@@ -265,7 +261,18 @@ export function Inbox({
   // llamarlo en cada cambio de la ventana visible no cuesta nada.
   const jidsVisibles = enPantalla.map((c) => c.jid).join("|");
   useEffect(() => {
-    commands.requestAvatars(jidsVisibles === "" ? [] : jidsVisibles.split("|"));
+    let alive = true;
+    let timer: ReturnType<typeof setTimeout>;
+    const request = () => {
+      const terminal = commands.pixelTerminal();
+      // The UI mounts before the machine finishes loading at startup.
+      if (!terminal) { timer = setTimeout(request, 200); return; }
+      void terminal.ready().then(ready => {
+        if (alive && ready) commands.requestAvatars(jidsVisibles === "" ? [] : jidsVisibles.split("|"));
+      });
+    };
+    request();
+    return () => { alive = false; clearTimeout(timer); commands.requestAvatars([]); };
   }, [jidsVisibles]);
 
   const clickEnFila = (jid: string): void => {
@@ -344,6 +351,7 @@ export function Inbox({
               ahoraSeg={ahoraSeg}
               cols={cols}
               color={colorDe(ui.avatars[c.jid])}
+              photo={ui.avatarPhotos[c.jid]}
               onClick={clickEnFila}
             />
           ))

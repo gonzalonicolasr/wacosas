@@ -11,8 +11,11 @@
 // Hoy están los del esqueleto (tarea 9), los de vinculación (tarea 10), los de
 // la bandeja —selección, filtro y buscador— (tarea 12), los de envío (tarea 14),
 // los de leído (tarea 15) y los de la búsqueda global (tarea 16).
+import { preparePixels, type PixelResult, type PixelTerminal } from "../boot/pixels";
+import { createPreviewQueue } from "./previews";
 import { type ResultadoImagen, renderizarImagen } from "../boot/chafa";
 import { type ClipboardResult, readClipboard } from "../boot/clipboard";
+import { type ResultadoVista, verEnGrande } from "../boot/grafica";
 import type { Logger } from "../boot/log";
 import type { LockCode } from "../boot/lockcode";
 import type { Repo } from "../db/repo";
@@ -78,6 +81,8 @@ export type CommandDeps = {
    * compilar.
    */
   media?: MediaStore;
+  pixels?: PixelTerminal;
+  preparePixels?: typeof preparePixels;
   /**
    * Colores de las fotos de perfil de la bandeja (`wa/avatars.ts`). Opcional:
    * sin ella la bandeja pinta los glifos como siempre y no se pierde nada —es un
@@ -96,6 +101,22 @@ export type CommandDeps = {
    */
   abrirArchivo?: (ruta: string) => void;
   /**
+   * El renderer de OpenTUI, SÓLO para suspenderlo mientras se ve una imagen a
+   * calidad real (`boot/grafica.ts`). Es la única pieza de la interfaz que
+   * necesita algo del renderer, y por eso entra por acá y no por un import: los
+   * comandos no saben nada de OpenTUI.
+   *
+   * Opcional por lo mismo que `send`/`read`: un test de interfaz no tiene una
+   * terminal de verdad que suspender, y sin esto la tecla avisa en vez de romper.
+   */
+  renderer?: { suspend(): void; resume(): void };
+  /**
+   * La vista a calidad real. **Acá el default es el de verdad** (mismo criterio
+   * que `chafa` y `clipboard`: el módulo no arrastra nada pesado). Se inyecta
+   * para que el test no le suspenda la terminal a `bun test`.
+   */
+  visor?: typeof verEnGrande;
+  /**
    * Cierre ordenado del proceso (`boot/shutdown.ts`, §6.6). El `motivo` no cambia
    * nada de lo que hace: va al log para que una salida quede explicada —después
    * de una que nadie pidió, la primera pregunta es "¿quién la disparó?"—.
@@ -104,9 +125,12 @@ export type CommandDeps = {
 };
 
 let deps: CommandDeps | null = null;
+let previews = createPreviewQueue<PixelResult>({ limit: 32, error: { ok: false, reason: "no se pudo cargar la foto" } });
 
 /** Cablea los comandos. Se llama UNA vez, desde el entry, antes de renderizar. */
 export function configureCommands(d: CommandDeps): void {
+  previews.stop();
+  previews = createPreviewQueue<PixelResult>({ limit: 32, error: { ok: false, reason: "no se pudo cargar la foto" } });
   deps = d;
   // Otro mundo (otro repo, otro store): una confirmación a medias del anterior no
   // puede esconder un chat del nuevo.
@@ -439,6 +463,18 @@ export type Commands = {
    * sabe si el usuario sigue parado en la misma imagen cuando la descarga vuelve.
    */
   showImage(msg: MessageRow, cols: number, filas: number): Promise<ResultadoImagen>;
+  pixelTerminal(): PixelTerminal | undefined;
+  requestPixels(source: MessageRow | string, cols: number, rows: number, listener: (r: PixelResult) => void): () => void;
+  /**
+   * La misma imagen, a CALIDAD REAL y a pantalla completa (`⏎`): suspende la
+   * TUI, dibuja con el protocolo gráfico de la terminal y vuelve con la
+   * siguiente tecla (`boot/grafica.ts`).
+   *
+   * Es lo que hace legible una captura de pantalla: con los medios bloques del
+   * panel, el texto de una captura es una mancha. No reemplaza a `showImage` —el
+   * panel sigue siendo el que se navega con `←`/`→`—, es el "mirala de verdad".
+   */
+  showImageFullQuality(msg: MessageRow): Promise<ResultadoVista>;
   /**
    * Abre la imagen ya bajada en el visor del sistema (`xdg-open`). Es la salida
    * para cuando la vista en la terminal no alcanza; si todavía no está bajada, lo
@@ -899,6 +935,27 @@ export const commands: Commands = {
     deps?.avatars?.request(jids ?? []);
   },
 
+  pixelTerminal() { return deps?.pixels; },
+
+  requestPixels(source, cols, rows, listener) {
+    const d = deps;
+    const key = `${typeof source === "string" ? source : `${source.chatJid}:${source.id}:${source.kind}:${source.attachment?.thumbnail ?? ""}`}:${cols}:${rows}`;
+    return previews.request(key, async wanted => {
+      if (!d?.pixels || !await d.pixels.ready()) return { ok: false, reason: "fotos inline no disponibles en esta terminal" };
+      if (!wanted()) return { ok: false, reason: "foto fuera de pantalla" };
+      let path: string;
+      if (typeof source === "string") path = source;
+      else {
+        if (!d.media) return { ok: false, reason: "descarga no disponible" };
+        const r = await (d.media.ensurePreview?.(source) ?? d.media.ensureImage(source));
+        if (!r.ok) return { ok: false, reason: r.reason };
+        path = r.path;
+      }
+      if (!wanted()) return { ok: false, reason: "foto fuera de pantalla" };
+      return (d.preparePixels ?? preparePixels)(path, cols, rows);
+    }, listener);
+  },
+
   async showImage(msg, cols, filas) {
     const d = deps;
     if (!d) return { ok: false, reason: "todavía no arrancó la aplicación" };
@@ -908,6 +965,41 @@ export const commands: Commands = {
     const bajada = await d.media.ensureImage(msg);
     if (!bajada.ok) return { ok: false, reason: bajada.reason };
     return (d.chafa ?? renderizarImagen)(bajada.path, cols, filas);
+  },
+
+  async showImageFullQuality(msg) {
+    const d = deps;
+    if (!d) return { ok: false, reason: "todavía no arrancó la aplicación" };
+    // TODOS los caminos que no dibujan AVISAN por el pie: acá la pantalla se va
+    // a negro y vuelve, así que una tecla que "no hizo nada" es peor que en
+    // cualquier otro lado —parece que se colgó—.
+    const avisar = (motivo: string): ResultadoVista => {
+      d.store.toast(motivo);
+      return { ok: false, reason: motivo };
+    };
+    if (!d.media) return avisar("la descarga de imágenes todavía no está disponible");
+    if (!msg || msg.kind !== "image") return avisar("ese mensaje no es una imagen");
+    if (!d.renderer) return avisar("la vista a calidad real todavía no está disponible");
+
+    // Se baja igual que en `showImage` —normalmente ya está en el caché de disco,
+    // porque para llegar acá la imagen se estaba MIRANDO—.
+    const bajada = await d.media.ensureImage(msg);
+    if (!bajada.ok) return avisar(bajada.reason);
+
+    const r = await (d.visor ?? verEnGrande)({
+      ruta: bajada.path,
+      renderer: d.renderer,
+      // `^C` con la imagen en pantalla cierra wacosas, igual que en cualquier
+      // otra pantalla (CA-17.1): la suspensión no puede volver la salida
+      // inalcanzable.
+      alSalir: () => d.shutdown(0, "tecla ^C sobre la imagen"),
+    });
+    if (!r.ok) {
+      d.log.warn("media.grande_fallida", { motivo: r.reason });
+      return avisar(r.reason);
+    }
+    d.log.info("media.grande", { calidad: r.calidad });
+    return r;
   },
 
   openImageExternally(msg) {

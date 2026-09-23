@@ -88,10 +88,15 @@ const ATAJOS_CONVO: Array<[string, string]> = [
   // 52 y ahí `^V pegar imagen` sigue entrando entero.
   ["^E ⏎ Alt-⏎ ^Y", "escribir · enviar · salto · ^V pegar imagen · reintentar"],
   // `^O` sí se ganó una fila propia: es una PANTALLA, no una acción sobre el
-  // campo, y con ella vienen tres teclas más que no se adivinan (`← →` para
-  // moverse entre las fotos y `o` para abrirla en el visor del sistema). Cabe
-  // porque el encabezado pasó de tres filas a una y el cuerpo ganó dos.
-  ["^O", "ver las imágenes del chat (← → cambiar · o abre el visor)"],
+  // campo, y con ella vienen teclas que no se adivinan. Cabe porque el
+  // encabezado pasó de tres filas a una y el cuerpo ganó dos.
+  //
+  // ⚠️ De las tres teclas de adentro se nombran DOS, y `← →` quedó afuera: la
+  // descripción se recorta a 52 columnas en una terminal de 72 (RNF-1) y las
+  // tres no entran. `← →` es la que sí se adivina —y además está en el pie de
+  // esa pantalla, que se lee mientras se la usa—; `⏎ calidad real` es la que sin
+  // anunciar no existe, y es justo la que hace legible una captura de pantalla.
+  ["^O", "ver las imágenes (⏎ calidad real · o el visor)"],
 ];
 
 const ATAJOS_MINI: Array<[string, string]> = [

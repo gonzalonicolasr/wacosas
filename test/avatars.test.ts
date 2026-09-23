@@ -239,3 +239,26 @@ test("`request` con basura no lanza (cuelga de un render)", async () => {
   await drenar(a);
   expect(a.consultados).toEqual([]);
 });
+
+test("avatar requests replace viewport queue; late hidden completion publishes no photo", async () => {
+  let finish!: (url: string) => void;
+  const consulted: string[] = [], photos: string[] = [];
+  const { schedule, correrTodo } = agendadorManual();
+  const avatars = createAvatars({ dir: dirNuevo(), log: LOG, schedule,
+    urlDe: async jid => { consulted.push(jid); if (jid === "a" && consulted.length === 1) return new Promise(r => { finish = r; }); return "fixture"; },
+    bajar: async () => JPG, color: async () => "#ff0000", publicar() {},
+    publicarFoto: (jid, path) => { if (path) photos.push(jid); },
+  });
+  avatars.request(["a", "hidden"]);
+  await Bun.sleep(0);
+  avatars.request(["visible"]);
+  finish("fixture");
+  await correrTodo();
+  expect(consulted).toEqual(["a", "visible"]);
+  expect(photos).toEqual(["visible"]);
+  avatars.request(["a"]);
+  await correrTodo();
+  expect(photos).toEqual(["visible", "a"]);
+  expect(consulted).toEqual(["a", "visible", "a"]); // cancelled before CDN download, so re-request
+  avatars.stop();
+});

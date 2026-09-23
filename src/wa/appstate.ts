@@ -241,6 +241,10 @@ export type Pendientes = {
 };
 
 export type AppStateSync = {
+  /** Actualización incremental por conexión, incluso con versiones locales completas. */
+  onConnectionOpen(): void;
+  /** Cancela pedidos diferidos y avisos de una conexión que ya no existe. */
+  onConnectionClose(): void;
   /**
    * La conexión abrió: agenda el chequeo diferido. Idempotente por conexión —
    * llamarlo dos veces no agenda dos.
@@ -398,6 +402,10 @@ export function createAppStateSync(deps: AppStateDeps): AppStateSync {
   const ahora = deps.now ?? Date.now;
 
   let cancelar: Cancelar | null = null;
+  let cancelarActualizacion: Cancelar | null = null;
+  let conexion = 0;
+  let conectado = false;
+  let ultimaActualizacion: number | null = null;
   /** Cuándo arrancó el último `force()`. `0` = nunca. */
   let ultimoManual = 0;
   let detenido = false;
@@ -459,9 +467,10 @@ export function createAppStateSync(deps: AppStateDeps): AppStateSync {
    */
   async function correr(
     names: readonly WAPatchName[],
-    origen: "auto" | "manual",
+    origen: "auto" | "manual" | "apertura",
   ): Promise<Pendientes | null> {
     enVuelo = true;
+    const epoch = conexion;
     const t0 = Date.now();
     log.info("appstate.resync", {
       colecciones: lista(names),
@@ -490,6 +499,7 @@ export function createAppStateSync(deps: AppStateDeps): AppStateSync {
       return null;
     }
     const ms = Date.now() - t0;
+    if (detenido || epoch !== conexion) { enVuelo = false; return null; }
     const siguen = await pendientes();
     enVuelo = false;
     log.info("appstate.resync_ok", {
@@ -643,7 +653,47 @@ export function createAppStateSync(deps: AppStateDeps): AppStateSync {
     }, ESPERA_TRAS_ABRIR_MS);
   }
 
+  function cerrarConexion(): void {
+    conectado = false;
+    conexion++;
+    cancelarActualizacion?.();
+    cancelarActualizacion = null;
+    cancelar?.();
+    cancelar = null;
+  }
+
+  function agendarActualizacion(epoch: number, demora: number): void {
+    cancelarActualizacion = agendar(() => {
+      cancelarActualizacion = null;
+      if (detenido || !conectado || epoch !== conexion) return;
+      // Comparte la exclusión con reparación y Ctrl-N; nunca dos resync propios.
+      if (enVuelo) { agendarActualizacion(epoch, ESPERA_TRAS_ABRIR_MS); return; }
+      ultimaActualizacion = ahora();
+      deps.toast?.("actualizando chats y contactos…");
+      void correr(COLECCIONES, "apertura").then(siguen => {
+        if (detenido || !conectado || epoch !== conexion) return;
+        deps.toast?.(siguen === null
+          ? "no se pudo actualizar chats y contactos — mirá el log"
+          : siguen.todas.length > 0
+            ? "actualización parcial: quedan datos de WhatsApp pendientes"
+            : "chats y contactos actualizados");
+        if (siguen && siguen.todas.length > 0) { listo = false; agendarChequeo(); }
+      }).catch(e => log.error("appstate.apertura_fallida", { motivo: motivo(e) }));
+    }, demora);
+  }
+
   return {
+    onConnectionOpen() {
+      if (detenido || conectado) return;
+      conectado = true;
+      const epoch = ++conexion;
+      // Deja terminar el bootstrap de Baileys y limita reconexiones rápidas.
+      const cooldown = ultimaActualizacion === null ? 0 : ultimaActualizacion + ESPERA_MANUAL_MS - ahora();
+      agendarActualizacion(epoch, Math.max(ESPERA_TRAS_ABRIR_MS, cooldown));
+    },
+
+    onConnectionClose: cerrarConexion,
+
     onOpen() {
       agendarChequeo();
     },
@@ -731,8 +781,7 @@ export function createAppStateSync(deps: AppStateDeps): AppStateSync {
 
     stop() {
       detenido = true;
-      cancelar?.();
-      cancelar = null;
+      cerrarConexion();
     },
   };
 }

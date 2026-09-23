@@ -135,6 +135,7 @@ export type UiSnapshot = {
    * en el arranque siguiente sin preguntarle nada a WhatsApp.
    */
   avatars: Record<string, string | null>;
+  avatarPhotos: Record<string, string | null>;
 };
 
 /** El mapa slice → snapshot. De acá salen `Slice` y `SnapshotOf`. */
@@ -220,6 +221,7 @@ export type Store = {
    * cada segundo y cada uno es un flush de todo el slice `ui` (D3).
    */
   setAvatar(jid: string, color: string | null): void;
+  setAvatarPhoto(jid: string, path: string | null): void;
   /** Guarda (o borra, con `""`) el borrador de un chat (CA-8.6). */
   setDraft(jid: string | null, text: string): void;
   /**
@@ -282,6 +284,7 @@ export function createStore(opts: StoreOpts = {}): Store {
     drafts: {},
     lockedRevealed: false,
     avatars: {},
+    avatarPhotos: {},
   };
   let abierto: string | null = null;
   let ancla: number | null = null;
@@ -500,6 +503,14 @@ export function createStore(opts: StoreOpts = {}): Store {
 
     lockedRevealed() {
       return ui.lockedRevealed;
+    },
+
+    setAvatarPhoto(jid, path) {
+      if (!jid || ui.avatarPhotos[jid] === path) return;
+      const photos = { ...ui.avatarPhotos, [jid]: path };
+      while (Object.keys(photos).length > 128) delete photos[Object.keys(photos)[0]!];
+      ui.avatarPhotos = photos;
+      markDirty("ui");
     },
 
     setAvatar(jid, color) {

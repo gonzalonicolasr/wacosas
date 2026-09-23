@@ -1,35 +1,7 @@
-// Bajar UNA imagen recibida, cuando el usuario la pide (`^O`).
-//
-// ⚠️ **Este archivo enmienda CA-7.4, que decía que wacosas no descarga el
-// contenido de ningún adjunto ni escribe archivos multimedia en disco.** La
-// enmienda es acotada y conviene tenerla escrita, porque el criterio existía por
-// buenos motivos (un directorio que crece solo, contenido de terceros en tu
-// máquina sin haberlo pedido, permisos que cuidar):
-//
-//   1. **Sólo imágenes, y sólo a demanda.** Nada se baja solo. Lo que llega
-//      sigue viéndose `📷 imagen` y no cuesta ni un byte de red hasta que alguien
-//      aprieta una tecla sobre esa imagen en particular. No hay prefetch, no hay
-//      "bajá las últimas N", no hay descarga en el sync de historial.
-//   2. **Los archivos van a `<dataDir>/media/`**, que nace `0700`, con permisos
-//      `0600` cada uno. Nunca a `/tmp` —ahí los ve cualquier usuario de la
-//      máquina— y nunca al directorio actual.
-//   3. **Es un caché descartable.** Borrar `media/` entero no pierde nada: la
-//      próxima vez que se pida la imagen se vuelve a bajar. Y lo que ya está no
-//      se vuelve a bajar nunca (es lo que hace que mirar dos veces la misma foto
-//      no sea tráfico dos veces).
-//   4. **Un fallo no puede voltear la aplicación.** Igual que en
-//      `boot/clipboard.ts`: nada de acá lanza, hay tope de tamaño y tope de
-//      tiempo, y el tope de tiempo **destruye el stream** en vez de sólo
-//      resolver —una promesa abandonada sobre un socket abierto queda viva hasta
-//      que el proceso muera—.
-//
-// Lo que este módulo NO hace, a propósito: no toca el socket. `downloadContent-
-// FromMessage` es un `fetch` al CDN de WhatsApp con la clave del mensaje, sin
-// sesión ni autenticación, así que una imagen se puede mirar incluso con la
-// conexión caída (lo único que hace falta es internet). Tampoco pide el
-// **reenvío** (`reuploadRequest`) de una imagen que el CDN ya borró: eso sí
-// necesitaría el socket y una stanza, y el caso —una foto vieja que WhatsApp ya
-// no sirve— se resuelve avisando, que es lo honesto.
+// Images are downloaded only for visible inline slots or explicit enlargement.
+// Embedded JPEG previews avoid original downloads. Cache stays private (0700/0600),
+// discarding a viewport request never publishes into a different chat, and streams
+// have bounded acquisition/read time and size. No socket reupload requests are made.
 import { downloadContentFromMessage } from "baileys";
 import { chmodSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -82,6 +54,7 @@ export type MediaStore = {
    * **Nunca lanza y nunca cuelga**: todo error vuelve por el `reason`.
    */
   ensureImage(msg: MessageRow): Promise<ResultadoMedia>;
+  ensurePreview?(msg: MessageRow): Promise<ResultadoMedia>;
   /** ¿Ya está en disco? Lo pregunta la interfaz para no decir "bajando…" de gusto. */
   cached(msg: MessageRow): string | null;
 };
@@ -209,7 +182,7 @@ export function createMediaStore(deps: MediaDeps): MediaStore {
     for (const ext of TODAS) {
       const p = join(dir, `${id}.${ext}`);
       try {
-        if (existsSync(p) && statSync(p).size > 0) return p;
+        if (existsSync(p) && statSync(p).size > 0) { chmodSync(p, 0o600); return p; }
       } catch {
         // Un `stat` que falla es un archivo que no sirve: se sigue buscando.
       }
@@ -227,11 +200,20 @@ export function createMediaStore(deps: MediaDeps): MediaStore {
 
     let bytes: Uint8Array;
     try {
-      const stream = await bajar({
+      let expired = false;
+      let timer: ReturnType<typeof setTimeout>;
+      const pending = bajar({
         mediaKey: Uint8Array.from(Buffer.from(ref.key, "base64")),
         ...(ref.directPath ? { directPath: ref.directPath } : {}),
         ...(ref.url ? { url: ref.url } : {}),
+      }).then(stream => {
+        if (expired) (stream as NodeJS.ReadableStream & { destroy?(): void }).destroy?.();
+        return stream;
       });
+      const stream = await Promise.race([
+        pending,
+        new Promise<never>((_, reject) => { timer = setTimeout(() => { expired = true; reject(new Error(MOTIVO_TIMEOUT)); }, timeoutMs); }),
+      ]).finally(() => clearTimeout(timer));
       const leido = await leerStream(stream as never, maxBytes, timeoutMs);
       if (!leido.ok) return { ok: false, reason: leido.reason };
       bytes = leido.bytes;
@@ -275,6 +257,23 @@ export function createMediaStore(deps: MediaDeps): MediaStore {
   }
 
   return {
+    async ensurePreview(msg) {
+      if (msg.kind !== "image") return { ok: false, reason: MOTIVO_NO_ES_IMAGEN };
+      const thumbnail = msg.attachment?.thumbnail;
+      if (!thumbnail) return this.ensureImage(msg);
+      if (thumbnail.length > 87384) return { ok: false, reason: "miniatura demasiado grande" };
+      const bytes = Buffer.from(thumbnail, "base64");
+      if (bytes.length > 65536 || mimeDeImagen(bytes) !== "image/jpeg") {
+        return { ok: false, reason: "miniatura inválida" };
+      }
+      try {
+        asegurarDir();
+        const path = join(dir, `${msg.id}.thumb.jpg`);
+        if (!existsSync(path)) writeFileSync(path, bytes, { mode: 0o600 });
+        chmodSync(path, 0o600);
+        return { ok: true, path };
+      } catch { return { ok: false, reason: "no se pudo guardar la miniatura" }; }
+    },
     cached(msg) {
       return msg?.id ? rutaCacheada(msg.id) : null;
     },

@@ -377,6 +377,8 @@ export type WaDeps = {
    * puede lanzar: corre adentro del camino de error del socket.
    */
   onCredsWiped?: () => void;
+  /** Flancos del socket real, sin depender del flush diferido de la UI. */
+  onConnectionChange?: (open: boolean) => void;
 };
 
 const agendarReal = (fn: () => void, ms: number): Cancelar => {
@@ -459,11 +461,17 @@ export function createWaController(deps: WaDeps): WaController {
    * esto sus eventos ya no llegan y, si llegaran, el guard los descarta igual.
    * Nunca lanza: se llama desde caminos de error.
    */
+  function avisarConexion(open: boolean): void {
+    try { deps.onConnectionChange?.(open); }
+    catch (e) { log.warn("wa.connection_hook_fallido", { motivo: motivo(e) }); }
+  }
+
   function descartar(s: WASocket | null): void {
     if (!s) return;
     if (actual === s) {
       actual = null;
       abierto = false;
+      avisarConexion(false);
     }
     for (const ev of EVENTOS) {
       try {
@@ -965,6 +973,7 @@ export function createWaController(deps: WaDeps): WaController {
   }
 
   function alAbrir(s: WASocket): void {
+    const yaAbierto = abierto;
     intento = 0;
     abierto = true;
     // Abrir prueba la versión igual (o mejor) que un QR: un 405 posterior ya no
@@ -985,6 +994,7 @@ export function createWaController(deps: WaDeps): WaController {
     log.info("wa.open", { flujo, telefono: telefono ? "sí" : "no" });
     // Después de publicar el estado: es red, y la pantalla no la espera.
     pedirBloqueados(s);
+    if (!yaAbierto) avisarConexion(true);
   }
 
   function alCerrar(s: WASocket, err: unknown): void {

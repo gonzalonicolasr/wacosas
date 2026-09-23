@@ -292,3 +292,36 @@ describe("createMediaStore", () => {
     expect(store.cached(imagen())).toBeNull();
   });
 });
+
+test("inline prefers embedded thumbnail without downloading original; private cache does not masquerade as full image", async () => {
+  const dir = dirNuevo();
+  let downloads = 0;
+  const media = createMediaStore({ dir, log: LOG, descargar: async () => { downloads++; return streamDe(PNG); } });
+  const msg = imagen();
+  msg.attachment!.thumbnail = Buffer.from([255, 216, 255, 224, 0, 0]).toString("base64");
+  const preview = await media.ensurePreview!(msg);
+  expect(preview.ok).toBe(true);
+  expect(downloads).toBe(0);
+  expect(media.cached(msg)).toBeNull();
+  if (preview.ok) expect(statSync(preview.path).mode & 0o777).toBe(0o600);
+  expect(statSync(dir).mode & 0o777).toBe(0o700);
+  expect((await media.ensureImage(msg)).ok).toBe(true);
+  expect(downloads).toBe(1);
+});
+
+test("inline rejects oversized/corrupt embedded preview instead of silently downloading original", async () => {
+  let downloads = 0;
+  const media = createMediaStore({ dir: dirNuevo(), log: LOG, descargar: async () => { downloads++; return streamDe(PNG); } });
+  for (const thumbnail of ["broken", "A".repeat(90000)]) {
+    const msg = imagen(); msg.attachment!.thumbnail = thumbnail;
+    expect((await media.ensurePreview!(msg)).ok).toBe(false);
+  }
+  expect(downloads).toBe(0);
+});
+
+test("inline queue cannot hang while CDN stream acquisition never resolves", async () => {
+  const media = createMediaStore({ dir: dirNuevo(), log: LOG, timeoutMs: 15, descargar: () => new Promise(() => {}) });
+  const result = await media.ensurePreview!(imagen());
+  expect(result.ok).toBe(false);
+  expect(result.reason).toBe(MOTIVO_TIMEOUT);
+});

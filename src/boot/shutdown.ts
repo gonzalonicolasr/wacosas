@@ -59,6 +59,7 @@ export type Maquina = {
   identity?: { stop(): void };
   /** La cola de fotos de perfil de la bandeja (`wa/avatars.ts`). */
   avatars?: { stop(): void };
+  pixels?: { stop(): void };
 };
 
 export type ShutdownDeps = {
@@ -201,6 +202,7 @@ export function createShutdown(deps: ShutdownDeps): Shutdown {
     paso("appstate.stop", () => m.appstate?.stop());
     paso("identity.stop", () => m.identity?.stop());
     paso("avatars.stop", () => m.avatars?.stop());
+    paso("pixels.stop", () => m.pixels?.stop());
 
     let enVuelo: Promise<void> | null = null;
     paso("send.inFlight", () => {

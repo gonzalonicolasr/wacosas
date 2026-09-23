@@ -259,6 +259,7 @@ function Panel({ ancho, cajaRef }: PropsConversacion) {
   const arranque = Math.max(LOTE, altoTerminal + 2);
 
   /** Mensaje señalado por el salto de la búsqueda (CA-12.3). */
+  const [imageIds, setImageIds] = useState<Set<number>>(new Set());
   const [marcado, setMarcado] = useState<number | null>(null);
   /** Cuántos mensajes entraron desde que el usuario dejó de mirar el final. */
   const [nuevos, setNuevos] = useState(0);
@@ -671,6 +672,25 @@ function Panel({ ancho, cajaRef }: PropsConversacion) {
     return () => clearInterval(t);
   }, [jid, revisar]);
 
+  // Geometry is owned by OpenTUI; sample only after layout/batch/anchor settle.
+  // Queued work is unsubscribed when a row leaves the viewport or chat unmounts.
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const c = cajaRef.current;
+      if (!c || !c.viewport.height || desdeRef.current > 0 || saltoPendienteRef.current) return;
+      const top = c.viewport.y, bottom = top + c.viewport.height;
+      const ids = new Set<number>();
+      for (const msg of mensajesRef.current) {
+        if (msg.kind !== "image") continue;
+        const row = c.content.findDescendantById(`pixel-${msg.id}`);
+        if (row && row.height > 0 && row.y < bottom && row.y + row.height > top) ids.add(msg.id);
+      }
+      setImageIds(prev => prev.size === ids.size && [...ids].every(id => prev.has(id)) ? prev : ids);
+    }, MUESTREO_MS);
+    setImageIds(new Set());
+    return () => clearInterval(timer);
+  }, [jid, cajaRef]);
+
   // ── render ────────────────────────────────────────────────────────────────
   //
   // ⚠️ Las dos ramas cuelgan de la MISMA caja raíz y con las MISMAS props, a
@@ -728,6 +748,7 @@ function Panel({ ancho, cajaRef }: PropsConversacion) {
               grupo={grupo}
               nombreChat={nombreChat}
               marcado={m.id === marcado}
+              imageVisible={imageIds.has(m.id)}
             />
           ))
         )}

@@ -1,30 +1,8 @@
-// El color de cada chat en la bandeja: el promedio de su foto de perfil.
-//
-// ⚠️ **Esto es riesgo de ban, no cosmética.** La cuenta real tiene ~890 chats y
-// pedirle a WhatsApp la foto de cada uno es una consulta por chat. Todo el
-// proyecto viene cuidando el ritmo (1 mensaje por segundo, recibos sólo si había
-// no leídos, `groupMetadata` una vez por grupo, `resyncAppState` topeado) y esto
-// no puede ser la excepción. De ahí las cuatro reglas:
-//
-//   1. **Sólo las filas que se VEN.** La bandeja pide el color de los chats que
-//      tiene en pantalla —a 80×24 son 18—, nunca de la lista entera, y recién
-//      cuando aparecen. Abrir la aplicación son 18 consultas, no 890.
-//   2. **Una vez por jid, y para siempre.** Lo que se preguntó una vez queda en
-//      disco (`<dataDir>/avatars/`): el arranque siguiente no consulta nada. Lo
-//      que NO tiene foto —o no la comparte— queda anotado igual, con fecha, y se
-//      vuelve a preguntar recién a los 7 días.
-//   3. **Espaciadas y en serie**: un pedido por vez, con `GAP_MS` entre uno y
-//      otro. Recorrer los 890 chats a mano tardaría ~15 minutos en pintarse del
-//      todo, y eso está BIEN: nadie mira 890 filas de un saque, y el que scrollea
-//      hasta el fondo no genera una ráfaga.
-//   4. **Un fallo no se nota.** Sin foto, sin privacidad para mostrarla, sin
-//      conexión o con `chafa` sin instalar, el glifo se queda del color de
-//      siempre. Nada de acá lanza y nada de acá avisa por el pie: es un adorno.
-//
-// Lo que se guarda en disco es **la foto miniatura** (la que WhatsApp llama
-// `preview`, unos pocos KB) con permisos `0600`, igual que las imágenes de los
-// mensajes. El directorio se puede borrar entero: lo único que pasa es que la
-// próxima vez se vuelve a preguntar.
+// Real profile preview photos, requested only for the current visible rows.
+// One lookup at a time, at least 1s apart; replaced viewports cancel queued work.
+// Private disk cache survives restarts; absent photos have a seven-day TTL.
+// The optional color callback is retained for existing callers; production publishes
+// file paths and the pixel renderer converts only visible photos.
 import { chmodSync, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
@@ -69,6 +47,7 @@ export type AvatarDeps = {
   urlDe(jid: string): Promise<string | null>;
   /** Deja el color a la vista (lo escribe en el store). `null` = no hay foto. */
   publicar(jid: string, color: string | null): void;
+  publicarFoto?: (jid: string, path: string | null) => void;
   /** Baja la miniatura. Default `fetch`; el test le pasa otra. */
   bajar?: (url: string) => Promise<Uint8Array | null>;
   /** Saca el color de un archivo. Default `chafa`. */
@@ -103,8 +82,20 @@ const bajarReal = async (url: string): Promise<Uint8Array | null> => {
     if (!r.ok) return null;
     const largo = Number(r.headers.get("content-length") ?? 0);
     if (Number.isFinite(largo) && largo > TOPE_FOTO_BYTES) return null;
-    const bytes = new Uint8Array(await r.arrayBuffer());
-    return bytes.length > 0 && bytes.length <= TOPE_FOTO_BYTES ? bytes : null;
+    if (!r.body) return null;
+    const reader = r.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.length;
+        if (size > TOPE_FOTO_BYTES) { await reader.cancel(); return null; }
+        chunks.push(value);
+      }
+    } finally { reader.releaseLock(); }
+    return size ? new Uint8Array(Buffer.concat(chunks)) : null;
   } catch {
     // Sin red, DNS caído, timeout: es un adorno, no hay a quién avisarle.
     return null;
@@ -126,6 +117,8 @@ export function createAvatars(deps: AvatarDeps): Avatars {
   let corriendo = false;
   let detenido = false;
   let consultasHechas = 0;
+  let visibles = new Set<string>();
+  let ultimoPedido = 0;
 
   const rutaFoto = (jid: string): string => join(dir, `${nombreDeJid(jid)}.jpg`);
   const rutaSinFoto = (jid: string): string => join(dir, `${nombreDeJid(jid)}.none`);
@@ -147,8 +140,16 @@ export function createAvatars(deps: AvatarDeps): Avatars {
   }
 
   function recordar(jid: string, color: string | null): void {
+    memoria.delete(jid);
     memoria.set(jid, color);
-    publicar(jid, color);
+    while (memoria.size > 128) {
+      const oldest = memoria.keys().next().value!;
+      memoria.delete(oldest); pedidos.delete(oldest);
+    }
+    if (!detenido && visibles.has(jid)) {
+      publicar(jid, color);
+      deps.publicarFoto?.(jid, existsSync(rutaFoto(jid)) ? rutaFoto(jid) : null);
+    }
   }
 
   /**
@@ -159,7 +160,9 @@ export function createAvatars(deps: AvatarDeps): Avatars {
     // 1. ¿Ya está bajada de una corrida anterior? Cero red.
     const foto = rutaFoto(jid);
     if (frescoHasta(foto, Infinity)) {
-      recordar(jid, await sacarColor(foto));
+      asegurarDir();
+      chmodSync(foto, 0o600);
+      recordar(jid, deps.publicarFoto ? null : await sacarColor(foto));
       return false;
     }
     // 2. ¿Ya sabemos que no tiene, y hace poco? Cero red.
@@ -169,6 +172,11 @@ export function createAvatars(deps: AvatarDeps): Avatars {
     }
 
     // 3. Recién acá se le pregunta a WhatsApp.
+    if (ultimoPedido && ahora() - ultimoPedido < GAP_MS) {
+      await new Promise<void>(r => agendar(r, GAP_MS - (ahora() - ultimoPedido)));
+    }
+    if (detenido || !visibles.has(jid)) { pedidos.delete(jid); return false; }
+    ultimoPedido = ahora();
     consultasHechas++;
     let url: string | null = null;
     try {
@@ -179,6 +187,7 @@ export function createAvatars(deps: AvatarDeps): Avatars {
       url = null;
     }
 
+    if (detenido || !visibles.has(jid)) { pedidos.delete(jid); return true; }
     const bytes = url ? await bajar(url) : null;
     try {
       asegurarDir();
@@ -196,7 +205,7 @@ export function createAvatars(deps: AvatarDeps): Avatars {
       log.warn("avatar.cache_fallido", { motivo: motivo(e) });
     }
 
-    recordar(jid, bytes ? await sacarColor(foto) : null);
+    recordar(jid, bytes && !deps.publicarFoto ? await sacarColor(foto) : null);
     return true;
   }
 
@@ -204,6 +213,7 @@ export function createAvatars(deps: AvatarDeps): Avatars {
     try {
       while (!detenido && cola.length > 0) {
         const jid = cola.shift() as string;
+        if (!visibles.has(jid)) { pedidos.delete(jid); continue; }
         let conRed = false;
         try {
           conRed = await resolver(jid);
@@ -238,9 +248,15 @@ export function createAvatars(deps: AvatarDeps): Avatars {
     request(jids) {
       if (detenido) return;
       try {
+        visibles = new Set(jids ?? []);
+        for (let i = cola.length - 1; i >= 0; i--) {
+          if (!visibles.has(cola[i]!)) { pedidos.delete(cola[i]!); cola.splice(i, 1); }
+        }
         for (const j of jids ?? []) {
           const jid = String(j ?? "");
-          if (!jid || pedidos.has(jid)) continue;
+          if (!jid) continue;
+          if (memoria.has(jid)) { recordar(jid, memoria.get(jid) ?? null); continue; }
+          if (pedidos.has(jid)) continue;
           pedidos.add(jid);
           // Lo que ya está en memoria se re-publica sin encolar: pasa cuando el
           // store se re-arma (no ocurre hoy) y es gratis.

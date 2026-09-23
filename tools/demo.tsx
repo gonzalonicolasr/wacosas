@@ -16,7 +16,7 @@
 //   WACOSAS_DEMO_ACK=<código>  WhatsApp RECHAZA el primer mensaje que se mande
 //                              desde el campo: `messages.update` con
 //                              `status: ERROR` y ese código (tarea 15)
-const RAIZ = "/home/gon/projects/wacosas";
+const RAIZ = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 
 const { openDb } = await import(`${RAIZ}/src/db/open.ts`);
 const { createRepo } = await import(`${RAIZ}/src/db/repo.ts`);
@@ -289,6 +289,11 @@ configureCommands({
   read,
   media,
   avatars: avatares,
+  // El renderer REAL: `⏎` sobre una imagen lo SUSPENDE, dibuja con el protocolo
+  // gráfico de la terminal y lo reanuda (`boot/grafica.ts`). Va acá porque es lo
+  // único de esta pantalla que no se puede mirar con `testRender` —depende de
+  // una terminal de verdad—, así que la demo es el arnés donde se verifica.
+  renderer,
   shutdown(code = 0) {
     try {
       renderer.destroy();

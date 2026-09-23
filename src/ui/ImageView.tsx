@@ -22,6 +22,13 @@
 //  3. **El tamaño se recalcula con la terminal.** `chafa` recibe las celdas que
 //     de verdad hay (CA-19.4): al redimensionar se vuelve a convertir, que es
 //     barato porque el archivo ya está en disco.
+//  4. **La calidad real es OTRA pantalla, bajo demanda (`⏎`).** Lo que se pinta
+//     acá son medios bloques —dos píxeles por celda—: alcanza para reconocer una
+//     foto y para caminar las imágenes del chat, pero una captura de pantalla
+//     con texto es ilegible. Para eso está `⏎`, que suspende la TUI entera y
+//     dibuja con el protocolo gráfico de la terminal (`boot/grafica.ts`). No se
+//     hace siempre porque una imagen dibujada por fuera del renderer la pisa el
+//     frame siguiente: mientras se ve a calidad real, la TUI **no existe**.
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import type { FilaImagen } from "../boot/chafa";
@@ -33,7 +40,7 @@ import { autorDe } from "./MessageRow";
 import { BORDER, DANGER, FAINT, MUT, SURFACE, TEXT_DIM } from "./theme";
 
 /** Teclas de esta pantalla para el pie (`App` les agrega las globales). */
-export const HINTS_IMAGEN = "← → cambiar · o visor · Esc cerrar";
+export const HINTS_IMAGEN = "← → cambiar · ⏎ calidad real · o visor · Esc cerrar";
 
 /** Filas que se reserva el renglón de datos (hora, autor, epígrafe). */
 const ALTO_INFO = 1;
@@ -43,7 +50,7 @@ const ALTO_INFO = 1;
  * `ApiComposer`, y por el mismo motivo: el `useKeyboard` es **UNO solo** y vive
  * en `App` (§7.4), así que las teclas llegan allá y bajan por esta ref.
  */
-export type ApiImagen = { mover(delta: number): void; abrirEnVisor(): void };
+export type ApiImagen = { mover(delta: number): void; abrirEnVisor(): void; verEnGrande(): void };
 
 export type PropsImagen = {
   /** Ancho de la terminal. El panel se queda con todo. */
@@ -121,6 +128,14 @@ export function ImageView({ ancho, alto, apiRef }: PropsImagen) {
       mover,
       abrirEnVisor() {
         if (msg) commands.openImageExternally(msg);
+      },
+      // `⏎`: la misma imagen a calidad real, con la TUI suspendida (decisión 4).
+      // No se espera el resultado —mientras dura, esta pantalla no existe: la
+      // dueña de la terminal es `boot/grafica.ts`— y el `catch` es para que un
+      // rechazo inesperado no termine en un `unhandledRejection`, que en esta
+      // aplicación cierra el proceso.
+      verEnGrande() {
+        if (msg) void commands.showImageFullQuality(msg).catch(() => {});
       },
     };
     return () => {

@@ -238,6 +238,58 @@ function banco(opts: Opts = {}) {
   };
 }
 
+test("cada conexión actualiza las cinco colecciones aunque ya tengan estado", async () => {
+  const b = banco({ estados: [TODAS_CON_ESTADO] });
+  b.app.onConnectionOpen();
+  b.app.onConnectionOpen();
+  expect(b.agenda.esperas()).toEqual([ESPERA_TRAS_ABRIR_MS]);
+  b.agenda.correr(); await microtareas(); await microtareas();
+  expect(b.pedidos).toEqual([[...COLECCIONES]]);
+  b.app.onConnectionClose();
+  b.reloj.avanzar(60_000);
+  b.app.onConnectionOpen(); b.agenda.correr();
+  await microtareas(); await microtareas();
+  expect(b.pedidos).toEqual([[...COLECCIONES], [...COLECCIONES]]);
+  expect(b.ceros).toEqual([]);
+  expect(b.fondo.resets).toBe(0);
+  b.app.stop();
+});
+
+test("reconexión rápida espera cooldown y no solapa un resync en vuelo", async () => {
+  let finish!: () => void;
+  const b = banco({ estados: [TODAS_CON_ESTADO], resync: () => new Promise<void>(r => { finish = r; }) });
+  b.app.onConnectionOpen(); b.agenda.correr(); await microtareas();
+  b.app.onConnectionClose(); b.app.onConnectionOpen();
+  expect(b.agenda.esperas()).toEqual([60_000]);
+  b.reloj.avanzar(60_000); b.agenda.correr(); await microtareas();
+  expect(b.pedidos.length).toBe(1);
+  finish(); await microtareas(); await microtareas();
+  b.agenda.correr(); await microtareas();
+  expect(b.pedidos.length).toBe(2);
+  finish(); await microtareas(); b.app.stop();
+});
+
+test("desconectar o cerrar antes del sync cancela el pedido pendiente", async () => {
+  const b = banco();
+  b.app.onConnectionOpen(); b.app.onConnectionClose();
+  b.agenda.correr(); await microtareas();
+  expect(b.pedidos).toEqual([]);
+  b.app.onConnectionOpen(); b.app.stop();
+  b.agenda.correr(); await microtareas();
+  expect(b.pedidos).toEqual([]);
+});
+
+test("una respuesta de conexión vieja no anuncia sincronización en la nueva", async () => {
+  let finish!: () => void;
+  const b = banco({ estados: [TODAS_CON_ESTADO], resync: () => new Promise<void>(r => { finish = r; }) });
+  b.app.onConnectionOpen(); b.agenda.correr(); await microtareas();
+  b.app.onConnectionClose();
+  const before = b.toasts.length;
+  finish(); await microtareas(); await microtareas();
+  expect(b.toasts.length).toBe(before);
+  b.app.stop();
+});
+
 // ── SE DISPARA cuando corresponde ───────────────────────────────────────────
 
 test("con colecciones sin estado local pide EXACTAMENTE esas, y no las que ya están", async () => {

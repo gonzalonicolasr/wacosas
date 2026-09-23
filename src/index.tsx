@@ -390,6 +390,10 @@ wa = createWaController({
   // de la sesión anterior: si la nueva vuelve a caer en el mismo agujero (el
   // timeout de 20 s con muchos chats), la reparación tiene que poder correr.
   onCredsWiped: () => repo.setMeta(META_SYNC_REPARADO, ""),
+  onConnectionChange: (open) => {
+    if (open) appstate?.onConnectionOpen();
+    else appstate?.onConnectionClose();
+  },
 });
 
 // La reparación de app-state: las colecciones de las que salen los NOMBRES de la
@@ -443,7 +447,6 @@ store.subscribe("conn", () => {
   conexionAbierta = abierta;
   if (abierta) {
     identity.sweep();
-    appstate.onOpen();
   }
 });
 
@@ -451,6 +454,8 @@ store.subscribe("conn", () => {
 // es un `fetch` con la clave del mensaje, sin sesión, así que una foto se puede
 // mirar aunque la conexión esté caída (ver `wa/media.ts`).
 const media = createMediaStore({ dir: paths.mediaDir, log });
+const { createPixelTerminal } = await import("./boot/pixels");
+const pixels = createPixelTerminal(renderer);
 
 // El color de cada chat en la bandeja (el promedio de su foto de perfil). ⚠️ Es
 // lo ÚNICO de la aplicación que consulta a WhatsApp sin que el usuario apriete
@@ -470,14 +475,19 @@ const avatars = createAvatars({
     }
   },
   publicar: (jid, color) => store.setAvatar(jid, color),
+  publicarFoto: (jid, path) => store.setAvatarPhoto(jid, path),
 });
 
 // Recién ahora el cierre ordenado tiene a quién pararle la mano (§6.6, paso 2).
 // Hasta esta línea `Ctrl-C` cerraba igual, pero sin drenar ni parar nada: no
 // había nada corriendo.
-Object.assign(maquina, { ingest, send, wa, appstate, identity, avatars });
+Object.assign(maquina, { ingest, send, wa, appstate, identity, avatars, pixels });
 
-configureCommands({ repo, wa, store, log, send, read, appstate, lockCode, media, avatars, shutdown });
+// `renderer` viaja hasta los comandos por UNA sola cosa: `⏎` sobre una imagen la
+// dibuja a calidad real con el protocolo gráfico de la terminal, y para eso hay
+// que SUSPENDER la TUI (`boot/grafica.ts`). Es la única pieza de la interfaz que
+// necesita algo del renderer más allá de pintarse.
+configureCommands({ repo, wa, store, log, send, read, appstate, lockCode, media, avatars, pixels, renderer, shutdown });
 
 log.info("boot.listo", {
   version,

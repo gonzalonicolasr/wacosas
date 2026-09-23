@@ -847,7 +847,7 @@ describe("render de la conversación", () => {
     const iPlaceholder = filas.findIndex((f) => f.includes("📷 imagen"));
     const iCaption = filas.findIndex((f) => f.includes("mirá lo que encontré"));
     expect(iPlaceholder).toBeGreaterThanOrEqual(0);
-    expect(iCaption).toBe(iPlaceholder + 1);
+    expect(iCaption).toBe(iPlaceholder + 9); // ocho filas fijas de foto inline
     // CA-7.5: el tipo desconocido se muestra igual.
     expect(frame).toContain("❔ mensaje no soportado");
     t.renderer.destroy();

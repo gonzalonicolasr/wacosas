@@ -312,6 +312,7 @@ const filasChat = (frame: string): string[] =>
   frame
     .split("\n")
     .slice(1)
+    .filter((_, i) => i % 2 === 0)
     .map((f) => f.trimEnd())
     .filter((f) => f !== "");
 
@@ -355,7 +356,7 @@ describe("render de la bandeja", () => {
   });
 
   test("la fila trae nombre, preview, fecha relativa y badge (CA-4.1, CA-10.2)", async () => {
-    const { t } = await montar(46, 6);
+    const { t } = await montar(60, 14);
     const filas = filasChat(t.captureCharFrame());
     expect(filas.length).toBe(3);
     // Nombre de la AGENDA (no el pushName), preview del adjunto (CA-4.5), hora
@@ -370,14 +371,14 @@ describe("render de la bandeja", () => {
   });
 
   test("un chat sin nombre muestra el número: la fila NUNCA queda en blanco", async () => {
-    const { t } = await montar(46, 6);
+    const { t } = await montar(60, 14);
     const filas = filasChat(t.captureCharFrame());
     expect(filas[1]).toContain("+5491133445566");
     t.renderer.destroy();
   });
 
   test("el grupo se distingue del 1:1 con su propio glifo (CA-4.8)", async () => {
-    const { t } = await montar(46, 6);
+    const { t } = await montar(60, 14);
     const filas = filasChat(t.captureCharFrame());
     expect(filas[2]).toContain("▣");
     expect(filas[0]).toContain("▪");
@@ -385,7 +386,17 @@ describe("render de la bandeja", () => {
     t.renderer.destroy();
   });
 
-  test("ninguna fila crece a dos líneas al pasarle el mouse por encima (CA-19.7)", async () => {
+  test("los avatares compactos dejan tres chats en seis líneas", async () => {
+    const { t } = await montar(60, 7);
+    try {
+      const frame = t.captureCharFrame();
+      expect(frame.split("\n")[1]).toContain("Antonella");
+      expect(frame.split("\n")[3]).toContain("+5491133445566");
+      expect(frame.split("\n")[5]).toContain("Grupo mañana");
+    } finally { t.renderer.destroy(); }
+  });
+
+  test("las filas conservan sus dos líneas al pasarles el mouse por encima (CA-19.7)", async () => {
     // Lo que cubre esto es CA-19.7 tal cual: pasar el mouse no puede cambiar la
     // altura de una fila. Se pasa por las tres, incluida la del preview con
     // emoji, que es la más larga.
@@ -397,9 +408,9 @@ describe("render de la bandeja", () => {
     // que nadie toque el mouse. El test se queda igual —es la garantía del
     // criterio, y sigue siendo cierta— pero no hay que leerlo como prueba de que
     // el mouse re-mide nada.
-    const { t } = await montar(46, 6);
+    const { t } = await montar(60, 14);
     const antes = t.captureCharFrame();
-    for (let y = 1; y <= 3; y++) {
+    for (const y of [1, 3, 5]) {
       await act(async () => {
         await t.mockMouse.moveTo(6, y);
       });
@@ -415,7 +426,7 @@ describe("render de la bandeja", () => {
   test("la fecha y el badge quedan en la MISMA columna aunque el preview traiga emoji", async () => {
     // Un emoji ocupa dos columnas y cuenta como un carácter: si las columnas se
     // alinearan con `padEnd` adentro del texto, esta fila saldría corrida.
-    const { t } = await montar(46, 6);
+    const { t } = await montar(60, 14);
     // Se mide el BORDE DERECHO de la fecha: la columna está alineada a la
     // derecha, así que `ayer` (4) empieza una columna más tarde que `13:08` (5)
     // y termina en el mismo lugar.
@@ -430,10 +441,10 @@ describe("render de la bandeja", () => {
   });
 
   test("doble click abre el chat y un solo click sólo lo selecciona (CA-5.6)", async () => {
-    const { t, repo } = await montar(46, 6);
+    const { t, repo } = await montar(60, 14);
     // Un solo click sobre el grupo: selecciona y NO lo marca leído.
     await act(async () => {
-      await t.mockMouse.click(6, 3);
+      await t.mockMouse.click(16, 5);
     });
     await pintar(t);
     expect(store.inboxUi().selectedJid).toBe("120000999-1600000000@g.us");
@@ -442,7 +453,7 @@ describe("render de la bandeja", () => {
 
     // Doble click: abre (y por CA-11.1 queda leído).
     await act(async () => {
-      await t.mockMouse.doubleClick(6, 3);
+      await t.mockMouse.doubleClick(16, 5);
     });
     await pintar(t);
     expect(store.openChatJid()).toBe("120000999-1600000000@g.us");
@@ -451,7 +462,7 @@ describe("render de la bandeja", () => {
   });
 
   test("la rueda mueve la selección (CA-5.7)", async () => {
-    const { t } = await montar(46, 6);
+    const { t } = await montar(60, 14);
     expect(store.inboxUi().selectedJid).toBeNull(); // = la primera
     await act(async () => {
       await t.mockMouse.scroll(6, 2, "down");

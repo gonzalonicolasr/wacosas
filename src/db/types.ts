@@ -71,9 +71,8 @@ export type ContactRow = {
  * quedaba expuesto, y se aceptó a cambio de que "ver una imagen" funcione con
  * el historial y no sólo con lo que llegue mientras la app está abierta.
  *
- * Lo que NO se guarda: **ningún byte del archivo**. La imagen vive en
- * `<dataDir>/media/` sólo si el usuario pidió verla, y ese directorio se puede
- * borrar entero sin perder nada (se vuelve a bajar).
+ * La referencia no contiene el archivo original. `AttachmentInfo.thumbnail` puede
+ * guardar una miniatura JPEG; los originales visibles se cachean en `media/`.
  */
 export type MediaRef = {
   /** `mediaKey` en base64. */
@@ -94,6 +93,8 @@ export type AttachmentInfo = {
   mimetype?: string;
   /** Sólo en las imágenes RECIBIDAS: con qué bajarlas a demanda (ver `MediaRef`). */
   media?: MediaRef;
+  /** Embedded JPEG preview, base64, at most 64 KiB (no extra network request). */
+  thumbnail?: string;
 };
 
 export type MessageRow = {

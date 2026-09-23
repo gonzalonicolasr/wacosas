@@ -153,9 +153,8 @@ function base64De(v: unknown): string {
  *
  *  · se guarda la **referencia** (clave de descifrado + ruta del CDN + tamaño),
  *    que son unos 90 bytes de texto en la celda `attachment`;
- *  · **no** se guarda ni un byte del archivo, y **no** se baja nada acá: bajar
- *    es una decisión del usuario, una tecla sobre una imagen concreta
- *    (`wa/media.ts`, `^O`).
+ *  · no se baja nada acá. El thumbnail JPEG embebido se conserva aparte,
+ *    acotado a 64 KiB; la UI decide qué foto visible necesita cargar.
  *
  * Sin esto, "ver una imagen" sólo podría funcionar para lo que llegue con la
  * aplicación abierta: el proto crudo no se persiste (§8.6) y WhatsApp no
@@ -206,10 +205,13 @@ function adjuntoDe(kind: MessageKind, nodo: Record<string, unknown> | undefined)
       // mostrar (`^O`). Guardarla para un video de 80 MB sería guardar la llave
       // de algo que no hay cómo abrir.
       const media = mediaDe(nodo);
+      const thumb = nodo?.jpegThumbnail;
+      const thumbnail = thumb instanceof Uint8Array && thumb.length <= 65536 ? base64De(thumb) : undefined;
       return {
         label: placeholderFor(kind),
         ...(mimetype ? { mimetype } : {}),
         ...(media ? { media } : {}),
+        ...(thumbnail ? { thumbnail } : {}),
       };
     }
 

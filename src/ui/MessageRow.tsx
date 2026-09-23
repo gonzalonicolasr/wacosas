@@ -9,10 +9,7 @@
 //     mensaje largo tiene que seguir en la línea de abajo, no recortarse. Lo que
 //     recorta en vertical es el `<scrollbox>` de `Conversation.tsx`, que es el
 //     único contenedor de OpenTUI que de verdad esconde lo que no entra.
-//  2. **De un adjunto no se toca ni un byte** (CA-7.4). Lo único que se pinta es
-//     el `label` que armó `lib/placeholder.ts` cuando el mensaje se persistió: en
-//     todo el camino de un mensaje no hay —ni puede haber— descarga de medios ni
-//     escritura de archivos, y el criterio se verifica con un grep sobre `src/`.
+//  2. Imágenes: slot fijo de píxeles, cargado sólo cuando intersecta el viewport.
 //  3. **El autor se muestra SIEMPRE**, no sólo en los grupos. CA-6.2 lo pide en
 //     todos los mensajes y CA-6.3 agrega que en un grupo tiene que ser QUIEN
 //     ESCRIBIÓ, no el nombre del chat. Es el estilo de cualquier cliente de chat
@@ -23,6 +20,7 @@
 //     monocroma, un `capture-pane` sin `-e`— el mensaje se sigue pudiendo
 //     atribuir.
 import { memo } from "react";
+import { PixelImage } from "./PixelImage";
 
 import type { MessageRow as Mensaje } from "../db/types";
 import { clip, fmtTime } from "../lib/fmt";
@@ -115,9 +113,10 @@ export type PropsMensaje = {
   nombreChat: string;
   /** Señalado por el salto desde la búsqueda global (CA-12.3). */
   marcado?: boolean;
+  imageVisible?: boolean;
 };
 
-function Fila({ msg, ancho, grupo, nombreChat, marcado }: PropsMensaje) {
+function Fila({ msg, ancho, grupo, nombreChat, marcado, imageVisible = false }: PropsMensaje) {
   const propio = msg.fromMe;
   const hora = fmtTime(msg.ts);
   // Precedencia idéntica a la del preview de la bandeja (`previewFor`), pero sin
@@ -173,6 +172,8 @@ function Fila({ msg, ancho, grupo, nombreChat, marcado }: PropsMensaje) {
           ) : null}
         </text>
 
+        {msg.kind === "image" ? <PixelImage source={msg} cols={Math.max(4, Math.min(32, ancho - SANGRIA))} rows={8} visible={imageVisible} /> : null}
+
         {/* CA-7.2: el caption va DEBAJO del placeholder, alineado con él. */}
         {conCaption ? (
           <text wrapMode="word" fg={colorCuerpo}>
@@ -199,12 +200,14 @@ function Fila({ msg, ancho, grupo, nombreChat, marcado }: PropsMensaje) {
  * vuelve a envolver.
  */
 export const MessageRow = memo(Fila, (a, b) => {
-  if (a.ancho !== b.ancho) return false;
+  if (a.ancho !== b.ancho || a.imageVisible !== b.imageVisible) return false;
   if (a.grupo !== b.grupo || a.nombreChat !== b.nombreChat || a.marcado !== b.marcado) return false;
   const x = a.msg;
   const y = b.msg;
   return (
     x.id === y.id &&
+    x.attachment?.thumbnail === y.attachment?.thumbnail &&
+    x.attachment?.media?.key === y.attachment?.media?.key &&
     x.ts === y.ts &&
     x.kind === y.kind &&
     x.body === y.body &&

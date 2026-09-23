@@ -208,6 +208,7 @@ function banco(
      * socket falso NO tiene el método: ver `Falso.fetchBlocklist`.
      */
     bloqueados?: (string | undefined)[] | Error;
+    onConnectionChange?: (open: boolean) => void;
   } = {},
 ) {
   const dir = mkdtempSync(join(tmp, `banco-${nBanco++}-`));
@@ -278,6 +279,7 @@ function banco(
     store,
     log,
     credsDir,
+    onConnectionChange: opts.onConnectionChange,
     onCredsWiped: () => {
       wiped++;
     },
@@ -1504,6 +1506,26 @@ test("si WhatsApp rechaza el pedido de código, el motivo queda en pantalla (CA-
 });
 
 // ── cierre ordenado (CA-17.1) ───────────────────────────────────────────────
+
+test("sync recibe flancos reales al abrir, reconectar y cerrar sin duplicados", async () => {
+  const edges: boolean[] = [];
+  const b = banco({ vinculado: true, onConnectionChange: open => edges.push(open) });
+  const s = await arrancar(b);
+  s.emitir("connection.update", { connection: "open" });
+  s.emitir("connection.update", { connection: "open" });
+  expect(edges).toEqual([true]);
+  b.wa.reconnectNow(); await asentar();
+  expect(edges).toEqual([true, false]);
+  const nuevo = b.creados.at(-1)!;
+  nuevo.emitir("connection.update", { connection: "open" });
+  expect(edges).toEqual([true, false, true]);
+  s.emitir("connection.update", { connection: "open" });
+  expect(edges).toEqual([true, false, true]);
+  await b.wa.stop({ timeoutMs: 2000 });
+  expect(edges).toEqual([true, false, true, false]);
+  expect(existsSync(b.archivoCreds)).toBe(true);
+  b.cerrar();
+});
 
 test("stop cierra el socket sin logout y deja de reconectar", async () => {
   const b = banco({ vinculado: true });

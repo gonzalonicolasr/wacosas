@@ -514,6 +514,14 @@ export function App({
         setModo("browse");
         return;
       }
+      // `⏎`: la misma imagen a CALIDAD REAL, con la TUI suspendida y el
+      // protocolo gráfico de la terminal (`boot/grafica.ts`). Es la tecla de
+      // "abrir/agrandar" de cualquier lista, y acá está libre: en esta pantalla
+      // no hay ningún campo de texto ni ninguna lista que confirmar.
+      if (enter) {
+        imagenRef.current?.verEnGrande();
+        return;
+      }
       // El escape cuando la terminal no alcanza: la foto, en el visor de verdad.
       // Es una letra pelada porque acá no hay ningún campo de texto que pueda
       // recibirla (mismo criterio que los dígitos de la pantalla del candado).
@@ -741,7 +749,7 @@ export function App({
     // llegar distinguibles; sin él, `Ctrl-J` es el mismo byte que un salto de
     // línea y aparece como `linefeed` (medido). Las flechas son el camino
     // portable y funcionan siempre.
-    const pagina = Math.max(1, filasVisibles - 1);
+    const pagina = Math.max(1, Math.floor((filasVisibles - 1) / 4));
     if (es("up") || (key.ctrl && es("k"))) commands.moveSelection(-1);
     else if (es("down") || (key.ctrl && es("j")) || es("linefeed")) commands.moveSelection(1);
     else if (es("pageup")) commands.moveSelection(-pagina);

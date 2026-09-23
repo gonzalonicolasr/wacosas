@@ -457,3 +457,12 @@ test("resolveChatName siempre devuelve un string de una línea", () => {
   expect(resolveChatName({ jid: JID_CONTACTO, pushName: "Ana\nGómez" })).toBe("Ana Gómez");
   expect(resolveChatName({ jid: JID_GRUPO, groupSubject: " Los\tdel asado \n" })).toBe("Los del asado");
 });
+
+test("image mapping keeps only bounded embedded JPEG preview bytes", () => {
+  const original = structuredClone(imagenConCaption);
+  const image = original.message!.imageMessage!;
+  image.jpegThumbnail = new Uint8Array([255, 216, 255, 224]);
+  expect(mapMessage(original, CTX)?.attachment?.thumbnail).toBe("/9j/4A==");
+  image.jpegThumbnail = new Uint8Array(65537);
+  expect(mapMessage(original, CTX)?.attachment?.thumbnail).toBeUndefined();
+});
